@@ -9,6 +9,9 @@ import numpy.typing as npt
 
 __version__: str
 
+def current_isa() -> str: ...
+def host_isa() -> str: ...
+
 class Tokenizer:
     vocab_size: int
     cls_id: int

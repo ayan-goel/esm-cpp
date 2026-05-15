@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "esm_cpp/cpu_features.h"
 #include "esm_cpp/model.h"
 #include "esm_cpp/tokenizer.h"
 #include "esm_cpp/version.h"
@@ -74,6 +75,14 @@ py::array_t<float> ForwardToNumpy(const esm::Model& self,
 PYBIND11_MODULE(_core, m) {
   m.doc() = "esm.cpp internal bindings";
   m.attr("__version__") = esm::kVersionString;
+
+  m.def("current_isa", []() {
+    return std::string(esm::IsaToString(esm::CurrentIsa()));
+  }, "Returns the selected ISA name (ref|neon|avx2|avx512|avx512vnni|amx) "
+     "honoring ESM_FORCE_ISA.");
+  m.def("host_isa", []() {
+    return std::string(esm::IsaToString(esm::HostIsa()));
+  }, "Returns the host's best-available ISA (ignoring ESM_FORCE_ISA).");
 
   py::class_<esm::Tokenizer>(m, "Tokenizer",
                               "ESM-2 tokenizer (33 tokens, UR50 frequency order).")
