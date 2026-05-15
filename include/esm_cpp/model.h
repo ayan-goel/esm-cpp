@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "esm_cpp/observer.h"
 #include "esm_cpp/quant.h"
 #include "esm_cpp/thread_pool.h"
 #include "esm_cpp/workspace.h"
@@ -104,6 +105,18 @@ class Model {
   // projections through LinearInt8 instead of Linear.
   void QuantizeWeights();
 
+  // Phase 2: run the forward pass and feed every Linear-input activation
+  // into the observer at well-known site keys for SmoothQuant calibration:
+  //   layer<i>.attn_ln_output     (input to Q/K/V projections)
+  //   layer<i>.attn_out           (input to out_proj)
+  //   layer<i>.ffn_ln_output      (input to fc1)
+  //   layer<i>.inter_gelu         (input to fc2)
+  // Returns the same logits as Forward().
+  std::vector<float> ForwardWithObserver(
+      std::span<const std::int32_t> input_ids,
+      std::span<const std::int32_t> attention_mask,
+      ActivationObserver* observer) const;
+
  private:
   Model() = default;
   // Forward implementation that lets the caller supply the per-call
@@ -113,7 +126,8 @@ class Model {
       std::span<const std::int32_t> input_ids,
       std::span<const std::int32_t> attention_mask, Workspace& ws,
       std::vector<float>* logits_out,
-      std::vector<std::vector<float>>* hidden_states_out) const;
+      std::vector<std::vector<float>>* hidden_states_out,
+      ActivationObserver* observer = nullptr) const;
 
   Config cfg_{};
   std::vector<float> embed_;            // [vocab_size, hidden_size]

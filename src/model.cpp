@@ -199,7 +199,8 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
                       float* scratch_attn_out, float* scratch_attn_proj,
                       float* scratch_inter, float* scratch_inter_gelu,
                       float* scratch_ffn_out, const int* cu_seqlens,
-                      int batch_size, int L) {
+                      int batch_size, int L, int layer_index,
+                      ActivationObserver* observer) {
   const int d = cfg.hidden_size;
   const int H = cfg.num_attention_heads;
   const int dh = cfg.head_dim;
@@ -208,6 +209,10 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   // Pre-attention LayerNorm on `hidden` -> scratch_ln
   kernels::LayerNorm(hidden, w.attn_ln_w.data(), w.attn_ln_b.data(),
                      cfg.layer_norm_eps, scratch_ln, L, d);
+  if (observer) {
+    observer->Observe("layer" + std::to_string(layer_index) + ".attn_ln_output",
+                      scratch_ln, static_cast<std::size_t>(L) * d);
+  }
 
   // Q, K, V projections write [L, d] = [L, H*dh] = [L, H, dh] directly.
   // Reuse scratch_qkv_flat in three chunks: q | k | v.
@@ -234,6 +239,10 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   // Self-attention. Output is [L, H*dh] = [L, d] (heads concatenated).
   kernels::AttentionVarlen(q_packed, k_packed, v_packed, cu_seqlens, batch_size,
                            H, dh, scratch_attn_out);
+  if (observer) {
+    observer->Observe("layer" + std::to_string(layer_index) + ".attn_out",
+                      scratch_attn_out, static_cast<std::size_t>(L) * d);
+  }
 
   // out_proj
   LinearProj(cfg, scratch_attn_out, w.out_w.data(), w.out_w_int8,
@@ -247,6 +256,10 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   // Pre-FFN LayerNorm on `hidden` -> scratch_ln
   kernels::LayerNorm(hidden, w.ffn_ln_w.data(), w.ffn_ln_b.data(),
                      cfg.layer_norm_eps, scratch_ln, L, d);
+  if (observer) {
+    observer->Observe("layer" + std::to_string(layer_index) + ".ffn_ln_output",
+                      scratch_ln, static_cast<std::size_t>(L) * d);
+  }
 
   // fc1: [L, d] -> [L, 4d]
   LinearProj(cfg, scratch_ln, w.fc1_w.data(), w.fc1_w_int8, w.fc1_b.data(),
@@ -254,6 +267,10 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   // GELU
   kernels::Gelu(scratch_inter, scratch_inter_gelu,
                 static_cast<std::size_t>(L) * ffn);
+  if (observer) {
+    observer->Observe("layer" + std::to_string(layer_index) + ".inter_gelu",
+                      scratch_inter_gelu, static_cast<std::size_t>(L) * ffn);
+  }
   // fc2: [L, 4d] -> [L, d]
   LinearProj(cfg, scratch_inter_gelu, w.fc2_w.data(), w.fc2_w_int8,
              w.fc2_b.data(), scratch_ffn_out, L, d, ffn);
@@ -280,11 +297,21 @@ std::vector<float> Model::ForwardWithHiddenStates(
   return logits;
 }
 
+std::vector<float> Model::ForwardWithObserver(
+    std::span<const std::int32_t> input_ids,
+    std::span<const std::int32_t> attention_mask,
+    ActivationObserver* observer) const {
+  std::vector<float> logits;
+  ForwardInto(input_ids, attention_mask, ws_, &logits, nullptr, observer);
+  return logits;
+}
+
 void Model::ForwardInto(
     std::span<const std::int32_t> input_ids,
     std::span<const std::int32_t> attention_mask, Workspace& ws,
     std::vector<float>* logits_out,
-    std::vector<std::vector<float>>* hidden_states_out) const {
+    std::vector<std::vector<float>>* hidden_states_out,
+    ActivationObserver* observer) const {
   const int L = static_cast<int>(input_ids.size());
   const int d = cfg_.hidden_size;
   const int H = cfg_.num_attention_heads;
@@ -356,7 +383,7 @@ void Model::ForwardInto(
                      scratch_ln, scratch_qkv_flat, scratch_cos, scratch_sin,
                      scratch_attn_out, scratch_attn_proj, scratch_inter,
                      scratch_inter_gelu, scratch_ffn_out, cu_seqlens_b1,
-                     /*batch_size=*/1, L);
+                     /*batch_size=*/1, L, /*layer_index=*/i, observer);
     if (hidden_states_out) {
       hidden_states_out->emplace_back(hidden, hidden + Ld);
     }

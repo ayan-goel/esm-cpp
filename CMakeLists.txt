@@ -101,6 +101,7 @@ add_library(esm_cpp_core STATIC
   src/kernels/cpu_features.cpp
   src/kernels/dispatch.cpp
   src/kernels/rope_tables.cpp
+  src/quant/observer.cpp
   src/quant/pack.cpp
   src/threading/thread_pool.cpp
   src/model.cpp

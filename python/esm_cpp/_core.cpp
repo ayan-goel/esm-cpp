@@ -10,6 +10,7 @@
 
 #include "esm_cpp/cpu_features.h"
 #include "esm_cpp/model.h"
+#include "esm_cpp/observer.h"
 #include "esm_cpp/tokenizer.h"
 #include "esm_cpp/version.h"
 
@@ -84,6 +85,13 @@ PYBIND11_MODULE(_core, m) {
     return std::string(esm::IsaToString(esm::HostIsa()));
   }, "Returns the host's best-available ISA (ignoring ESM_FORCE_ISA).");
 
+  py::class_<esm::ActivationObserver>(m, "ActivationObserver",
+                                       "Per-tensor activation observer for "
+                                       "SmoothQuant calibration.")
+      .def(py::init<>())
+      .def("percentile", &esm::ActivationObserver::Percentile, py::arg("pctile"))
+      .def("clear", &esm::ActivationObserver::Clear);
+
   py::class_<esm::Tokenizer>(m, "Tokenizer",
                               "ESM-2 tokenizer (33 tokens, UR50 frequency order).")
       .def(py::init<>())
@@ -146,6 +154,48 @@ PYBIND11_MODULE(_core, m) {
            "symmetric INT8. lm_head stays FP32 (Slice 5 escape list). After "
            "this call Forward/ForwardBatch route the per-layer projections "
            "through LinearInt8.")
+      .def(
+          "forward_with_observer",
+          [](const esm::Model& self,
+             py::array_t<std::int32_t, py::array::c_style | py::array::forcecast>
+                 input_ids,
+             py::object attention_mask, esm::ActivationObserver& observer) {
+            if (input_ids.ndim() != 1) {
+              throw std::invalid_argument("input_ids must be a 1-D int32 array");
+            }
+            std::span<const std::int32_t> ids(input_ids.data(),
+                                              static_cast<std::size_t>(
+                                                  input_ids.shape(0)));
+            std::vector<std::int32_t> mask_storage;
+            std::span<const std::int32_t> mask_span;
+            if (!attention_mask.is_none()) {
+              auto m_arr = py::cast<py::array_t<
+                  std::int32_t,
+                  py::array::c_style | py::array::forcecast>>(attention_mask);
+              if (m_arr.ndim() != 1 || m_arr.shape(0) != input_ids.shape(0)) {
+                throw std::invalid_argument(
+                    "attention_mask must be a 1-D int32 array of the same "
+                    "length as input_ids");
+              }
+              mask_storage.assign(m_arr.data(), m_arr.data() + m_arr.shape(0));
+              mask_span = mask_storage;
+            }
+            std::vector<float> logits;
+            {
+              py::gil_scoped_release release;
+              logits = self.ForwardWithObserver(ids, mask_span, &observer);
+            }
+            const auto& cfg = self.config();
+            py::array_t<float> arr({static_cast<py::ssize_t>(input_ids.shape(0)),
+                                     static_cast<py::ssize_t>(cfg.vocab_size)});
+            std::memcpy(arr.mutable_data(), logits.data(),
+                        logits.size() * sizeof(float));
+            return arr;
+          },
+          py::arg("input_ids"), py::arg("attention_mask") = py::none(),
+          py::arg("observer"),
+          "Run a forward pass and feed every Linear-input activation into "
+          "the observer at well-known site keys for SmoothQuant calibration.")
       .def_property_readonly("workspace_capacity_bytes",
                               &esm::Model::workspace_capacity_bytes,
                               "Bytes the per-forward scratch arena holds. "
