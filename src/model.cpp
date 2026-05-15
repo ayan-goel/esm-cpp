@@ -193,6 +193,23 @@ inline void LinearProj(const Config& cfg, const float* A, const float* W_fp32,
   }
 }
 
+// Phase 2 Slice 5 sensitivity escape: round an FP32 buffer to FP16
+// precision via __fp16 round-trip (Clang/GCC builtin). The activation
+// keeps FP32 storage; we're simulating "as if the input arrived from
+// an FP16-quantized site" so the downstream INT8 Linear sees lower-
+// precision input (the cheapest outlier mitigation on layer 0).
+inline void RoundToFp16Inplace(float* x, std::size_t n) {
+#if defined(__clang__) || defined(__GNUC__)
+  for (std::size_t i = 0; i < n; ++i) {
+    __fp16 h = static_cast<__fp16>(x[i]);
+    x[i] = static_cast<float>(h);
+  }
+#else
+  (void)x;
+  (void)n;  // No __fp16 -> the escape is a silent no-op.
+#endif
+}
+
 void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
                       // scratch (all pulled from the per-Model arena)
                       float* scratch_ln, float* scratch_qkv_flat,
@@ -260,6 +277,13 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   if (observer) {
     observer->Observe("layer" + std::to_string(layer_index) + ".ffn_ln_output",
                       scratch_ln, static_cast<std::size_t>(L) * d);
+  }
+
+  // Slice 5 escape: on layer 0 only, optionally round the fc1 input to
+  // FP16 precision. Soaks up activation outliers cheaply (10-bit mantissa
+  // instead of 23) without changing the INT8 weight path.
+  if (cfg.first_block_fc1_fp16 && layer_index == 0) {
+    RoundToFp16Inplace(scratch_ln, static_cast<std::size_t>(L) * d);
   }
 
   // fc1: [L, d] -> [L, 4d]

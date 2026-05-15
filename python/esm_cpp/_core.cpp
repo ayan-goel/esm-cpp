@@ -144,12 +144,20 @@ PYBIND11_MODULE(_core, m) {
       .def_readonly("layer_norm_eps", &esm::Config::layer_norm_eps)
       .def_readonly("token_dropout", &esm::Config::token_dropout)
       .def_readonly("mask_token_id", &esm::Config::mask_token_id)
-      .def_readonly("weights_quantized", &esm::Config::weights_quantized);
+      .def_readonly("weights_quantized", &esm::Config::weights_quantized)
+      .def_readonly("first_block_fc1_fp16",
+                     &esm::Config::first_block_fc1_fp16);
 
   py::class_<esm::Model>(m, "Model")
       .def_static("load_from_safetensors", &esm::Model::LoadFromSafetensors,
                   py::arg("path"))
       .def_property_readonly("config", &esm::Model::config)
+      .def("set_first_block_fc1_fp16", &esm::Model::SetFirstBlockFc1Fp16,
+           py::arg("enabled"),
+           "Slice 5 sensitivity escape: round the activation feeding "
+           "layer 0's fc1 to FP16 precision (FP32 -> half -> FP32). "
+           "Used when SmoothQuant + INT8 alone doesn't hit the PPPL gate "
+           "(research-report: layer 0 outliers are the usual culprit).")
       .def("quantize_weights", &esm::Model::QuantizeWeights,
            "Quantize all per-layer Linear weights in place to per-channel "
            "symmetric INT8. lm_head stays FP32 (Slice 5 escape list). After "

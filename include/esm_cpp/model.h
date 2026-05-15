@@ -28,6 +28,12 @@ struct Config {
   // LinearInt8 using the INT8 weight tensors populated on each
   // LayerWeights. Set by Model::QuantizeWeights; default false.
   bool weights_quantized = false;
+  // Phase 2 Slice 5 sensitivity escape: when true, the activation
+  // feeding layer 0's fc1 is rounded to FP16 precision (FP32 -> half
+  // -> FP32 round-trip) before the fc1 Linear. Cheapest outlier
+  // mitigation per research-report §"Recommended INT8 quantization
+  // recipe" when SmoothQuant alone doesn't close the PPPL gap.
+  bool first_block_fc1_fp16 = false;
 };
 
 struct LayerWeights {
@@ -98,6 +104,11 @@ class Model {
   // Number of threads used by ForwardBatch (process-global pool sized
   // from ESM_NUM_THREADS at first Model::load, default physical-core).
   static std::size_t num_threads();
+
+  // Phase 2 Slice 5: toggle the first-block FP16 escape on/off.
+  void SetFirstBlockFc1Fp16(bool enabled) {
+    cfg_.first_block_fc1_fp16 = enabled;
+  }
 
   // Phase 2: quantize every per-layer Linear weight in place to
   // per-channel symmetric INT8 and flag the model as quantized.
