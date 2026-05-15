@@ -131,6 +131,12 @@ PYBIND11_MODULE(_core, m) {
       .def_static("load_from_safetensors", &esm::Model::LoadFromSafetensors,
                   py::arg("path"))
       .def_property_readonly("config", &esm::Model::config)
+      .def_property_readonly("workspace_capacity_bytes",
+                              &esm::Model::workspace_capacity_bytes,
+                              "Bytes the per-forward scratch arena holds. "
+                              "After the first forward at a given seq_len, this "
+                              "should stay constant on subsequent calls at the "
+                              "same length (zero-alloc inner loop).")
       .def(
           "forward",
           [](const esm::Model& self,

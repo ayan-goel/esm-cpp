@@ -289,68 +289,97 @@ std::vector<float> Model::ForwardWithHiddenStates(
     throw std::runtime_error("attention_mask length mismatch");
   }
 
-  std::vector<float> hidden(static_cast<std::size_t>(L) * d);
-  Embed(cfg_, embed_.data(), input_ids, attention_mask, hidden.data());
+  // RAII activation: rewinds the arena cursor at entry and flags the
+  // workspace in-use for the duration of the forward.
+  auto ws_guard = ws_.activate();
+
+  const std::size_t L_sz = static_cast<std::size_t>(L);
+  const std::size_t Ld = L_sz * static_cast<std::size_t>(d);
+  const std::size_t L3d = Ld * 3;
+  const std::size_t HLdh = static_cast<std::size_t>(H) * L_sz *
+                           static_cast<std::size_t>(dh);
+  const std::size_t Ldh = L_sz * static_cast<std::size_t>(dh);
+  const std::size_t Lffn = L_sz * static_cast<std::size_t>(ffn);
+  const std::size_t LV = L_sz * static_cast<std::size_t>(V);
+  (void)LV;
+
+  // Reserve the worst-case workspace size BEFORE the first allocate. Growing
+  // the arena mid-forward would reallocate the backing buffer and invalidate
+  // every pointer we'd already handed out — Workspace::Grow asserts against
+  // that path, but only when we've correctly pre-sized here. Counts:
+  //   hidden + scratch_ln + 3*qkv + 3*q/k/v_heads + 2*cos/sin +
+  //   attn_out + attn_proj + 2*inter/inter_gelu + ffn_out +
+  //   final_ln + lm_dense + lm_gelu + lm_ln
+  // = 17 buffers totalling 23*Ld + 2*Ldh floats. One cache line of slack per
+  // allocation covers Workspace::AlignUp padding (alignof(float) = 4, so
+  // padding is trivial, but the slack future-proofs SIMD-aligned allocs).
+  const std::size_t scratch_floats = 23 * Ld + 2 * Ldh;
+  const std::size_t alignment_slack = 17 * 64;
+  ws_.reserve(scratch_floats * sizeof(float) + alignment_slack);
+
+  float* hidden = ws_.allocate<float>(Ld);
+  Embed(cfg_, embed_.data(), input_ids, attention_mask, hidden);
 
   if (hidden_states_out) {
     hidden_states_out->clear();
     hidden_states_out->reserve(static_cast<std::size_t>(cfg_.num_hidden_layers + 1));
-    hidden_states_out->push_back(hidden);
+    hidden_states_out->emplace_back(hidden, hidden + Ld);
   }
 
-  std::vector<float> scratch_ln(static_cast<std::size_t>(L) * d);
-  // QKV flat output buffer holds q | k | v concatenated along the row axis.
-  std::vector<float> scratch_qkv_flat(static_cast<std::size_t>(L) * d * 3);
-  std::vector<float> scratch_q_heads(static_cast<std::size_t>(H) * L * dh);
-  std::vector<float> scratch_k_heads(static_cast<std::size_t>(H) * L * dh);
-  std::vector<float> scratch_v_heads(static_cast<std::size_t>(H) * L * dh);
-  std::vector<float> scratch_cos(static_cast<std::size_t>(L) * dh);
-  std::vector<float> scratch_sin(static_cast<std::size_t>(L) * dh);
-  std::vector<float> scratch_attn_out(static_cast<std::size_t>(L) * d);
-  std::vector<float> scratch_attn_proj(static_cast<std::size_t>(L) * d);
-  std::vector<float> scratch_inter(static_cast<std::size_t>(L) * ffn);
-  std::vector<float> scratch_inter_gelu(static_cast<std::size_t>(L) * ffn);
-  std::vector<float> scratch_ffn_out(static_cast<std::size_t>(L) * d);
+  float* scratch_ln = ws_.allocate<float>(Ld);
+  float* scratch_qkv_flat = ws_.allocate<float>(L3d);
+  float* scratch_q_heads = ws_.allocate<float>(HLdh);
+  float* scratch_k_heads = ws_.allocate<float>(HLdh);
+  float* scratch_v_heads = ws_.allocate<float>(HLdh);
+  float* scratch_cos = ws_.allocate<float>(Ldh);
+  float* scratch_sin = ws_.allocate<float>(Ldh);
+  float* scratch_attn_out = ws_.allocate<float>(Ld);
+  float* scratch_attn_proj = ws_.allocate<float>(Ld);
+  float* scratch_inter = ws_.allocate<float>(Lffn);
+  float* scratch_inter_gelu = ws_.allocate<float>(Lffn);
+  float* scratch_ffn_out = ws_.allocate<float>(Ld);
 
   for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
     TransformerBlock(cfg_, layers_[static_cast<std::size_t>(i)], attention_mask,
-                     hidden.data(), scratch_ln.data(), scratch_qkv_flat.data(),
-                     scratch_q_heads.data(), scratch_k_heads.data(),
-                     scratch_v_heads.data(), scratch_cos.data(),
-                     scratch_sin.data(), scratch_attn_out.data(),
-                     scratch_attn_proj.data(), scratch_inter.data(),
-                     scratch_inter_gelu.data(), scratch_ffn_out.data(), L);
-    if (hidden_states_out) hidden_states_out->push_back(hidden);
+                     hidden, scratch_ln, scratch_qkv_flat,
+                     scratch_q_heads, scratch_k_heads,
+                     scratch_v_heads, scratch_cos,
+                     scratch_sin, scratch_attn_out,
+                     scratch_attn_proj, scratch_inter,
+                     scratch_inter_gelu, scratch_ffn_out, L);
+    if (hidden_states_out) {
+      hidden_states_out->emplace_back(hidden, hidden + Ld);
+    }
   }
 
   // Final encoder LayerNorm (= HF emb_layer_norm_after); produces the
   // hidden state that lm_head consumes.
-  std::vector<float> final_ln(static_cast<std::size_t>(L) * d);
-  kernels::LayerNorm(hidden.data(), final_ln_w_.data(), final_ln_b_.data(),
-                        cfg_.layer_norm_eps, final_ln.data(), L, d);
+  float* final_ln = ws_.allocate<float>(Ld);
+  kernels::LayerNorm(hidden, final_ln_w_.data(), final_ln_b_.data(),
+                     cfg_.layer_norm_eps, final_ln, L, d);
   if (hidden_states_out) {
     // Replace the last entry (which mirrored the pre-LN output) with the
     // post-final-LN tensor to match HF hidden_states[-1] semantics.
-    hidden_states_out->back() = final_ln;
+    hidden_states_out->back().assign(final_ln, final_ln + Ld);
   }
 
   // lm_head: dense -> gelu -> layer_norm -> tied decoder + bias.
-  std::vector<float> lm_dense(static_cast<std::size_t>(L) * d);
-  kernels::Linear(final_ln.data(), lm_dense_w_.data(), lm_dense_b_.data(),
-                     lm_dense.data(), L, d, d);
-  std::vector<float> lm_gelu(static_cast<std::size_t>(L) * d);
-  kernels::Gelu(lm_dense.data(), lm_gelu.data(),
-                   static_cast<std::size_t>(L) * d);
-  std::vector<float> lm_ln(static_cast<std::size_t>(L) * d);
-  kernels::LayerNorm(lm_gelu.data(), lm_ln_w_.data(), lm_ln_b_.data(),
-                        cfg_.layer_norm_eps, lm_ln.data(), L, d);
+  float* lm_dense = ws_.allocate<float>(Ld);
+  kernels::Linear(final_ln, lm_dense_w_.data(), lm_dense_b_.data(), lm_dense,
+                  L, d, d);
+  float* lm_gelu = ws_.allocate<float>(Ld);
+  kernels::Gelu(lm_dense, lm_gelu, Ld);
+  float* lm_ln = ws_.allocate<float>(Ld);
+  kernels::LayerNorm(lm_gelu, lm_ln_w_.data(), lm_ln_b_.data(),
+                     cfg_.layer_norm_eps, lm_ln, L, d);
 
   // Tied decoder: logits = lm_ln @ embed^T + lm_head.bias.
   // embed_ has shape [V, d] (out=V, in=d), which is exactly the layout
-  // LinearRef expects for W [N=V, K=d].
-  std::vector<float> logits(static_cast<std::size_t>(L) * V);
-  kernels::Linear(lm_ln.data(), embed_.data(), lm_decoder_bias_.data(),
-                     logits.data(), L, V, d);
+  // Linear expects for W [N=V, K=d]. The output vector is the caller-visible
+  // boundary alloc; everything above is in the arena.
+  std::vector<float> logits(LV);
+  kernels::Linear(lm_ln, embed_.data(), lm_decoder_bias_.data(), logits.data(),
+                  L, V, d);
   return logits;
 }
 

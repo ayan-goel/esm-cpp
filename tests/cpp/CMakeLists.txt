@@ -4,6 +4,7 @@ add_executable(esm_cpp_tests
   test_kernels.cpp
   test_cpu_features.cpp
   test_dispatch.cpp
+  test_workspace.cpp
 )
 target_link_libraries(esm_cpp_tests PRIVATE
   esm_cpp_core

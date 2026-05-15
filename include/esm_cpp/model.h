@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "esm_cpp/workspace.h"
+
 namespace esm {
 
 struct Config {
@@ -50,6 +52,10 @@ class Model {
 
   // Run forward. attention_mask uses 1 for real tokens, 0 for pad.
   // Returns logits as a row-major [seq_len, vocab_size] vector.
+  //
+  // NOT thread-safe. A single Model instance owns one Workspace and one
+  // forward may be in flight at a time. Phase 3's scheduler will introduce
+  // per-thread Workspaces for concurrent forwards.
   std::vector<float> Forward(std::span<const int32_t> input_ids,
                              std::span<const int32_t> attention_mask) const;
 
@@ -60,6 +66,11 @@ class Model {
       std::span<const int32_t> input_ids,
       std::span<const int32_t> attention_mask,
       std::vector<std::vector<float>>* hidden_states_out) const;
+
+  // Bytes the per-forward arena currently holds. Useful for the zero-alloc
+  // regression test: after the first forward at a given length, the arena
+  // capacity should stay constant on subsequent calls at the same length.
+  std::size_t workspace_capacity_bytes() const { return ws_.bytes_capacity(); }
 
  private:
   Model() = default;
@@ -73,6 +84,10 @@ class Model {
   std::vector<float> lm_ln_w_, lm_ln_b_;
   std::vector<float> lm_decoder_bias_;  // [vocab_size]
   // lm_head.decoder.weight is tied to embed_ — we reuse embed_ directly.
+
+  // Per-Model scratch arena. Mutable because Forward is logically const
+  // (the model state doesn't change), but the arena bumps and resets.
+  mutable Workspace ws_;
 };
 
 }  // namespace esm
