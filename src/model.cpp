@@ -7,6 +7,10 @@
 #include <stdexcept>
 #include <string>
 
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(__F16C__)
+#include <immintrin.h>
+#endif
+
 #include "esm_cpp/cpu_features.h"
 #include "esm_cpp/io.h"
 #include "esm_cpp/kernels.h"
@@ -193,20 +197,28 @@ inline void LinearProj(const Config& cfg, const float* A, const float* W_fp32,
   }
 }
 
-// Phase 2 Slice 5 sensitivity escape: round an FP32 buffer to FP16
-// precision via __fp16 round-trip (Clang/GCC builtin). The activation
-// keeps FP32 storage; we're simulating "as if the input arrived from
-// an FP16-quantized site" so the downstream INT8 Linear sees lower-
-// precision input (the cheapest outlier mitigation on layer 0).
+// Phase 2 Slice 5 sensitivity escape: round an FP32 buffer to IEEE 754
+// binary16 (FP16) precision and back. The activation keeps FP32 storage;
+// we're simulating "as if the input arrived from an FP16-quantized site"
+// so the downstream INT8 Linear sees lower-precision input (the cheapest
+// outlier mitigation on layer 0).
 inline void RoundToFp16Inplace(float* x, std::size_t n) {
-#if defined(__clang__) || defined(__GNUC__)
+#if defined(__aarch64__) || defined(_M_ARM64)
+  // ARM: __fp16 is the C ABI IEEE 754 binary16 type, default-enabled.
   for (std::size_t i = 0; i < n; ++i) {
     __fp16 h = static_cast<__fp16>(x[i]);
     x[i] = static_cast<float>(h);
   }
+#elif (defined(__x86_64__) || defined(_M_X64)) && defined(__F16C__)
+  // x86 with F16C (part of -march=x86-64-v3): VCVTPS2PH + VCVTPH2PS.
+  for (std::size_t i = 0; i < n; ++i) {
+    unsigned short h =
+        _cvtss_sh(x[i], _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    x[i] = _cvtsh_ss(h);
+  }
 #else
   (void)x;
-  (void)n;  // No __fp16 -> the escape is a silent no-op.
+  (void)n;  // No native FP16 path -> the escape is a silent no-op.
 #endif
 }
 

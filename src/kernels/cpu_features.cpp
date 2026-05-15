@@ -5,15 +5,34 @@
 #include <mutex>
 #include <string_view>
 
+#if (defined(__x86_64__) || defined(_M_X64)) && \
+    (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
+#endif
+
 namespace esm {
 
 namespace {
+
+#if (defined(__x86_64__) || defined(_M_X64)) && \
+    (defined(__GNUC__) || defined(__clang__))
+// Raw CPUID probe for AMX-INT8 (leaf 7, subleaf 0, EDX bit 25). The
+// __builtin_cpu_supports("amx-int8") string isn't recognized by Clang < 15
+// (Ubuntu 22.04 ships Clang 14), so we sidestep the builtin and read the
+// feature bit directly. AMX as a family also requires XSAVE permission via
+// arch_prctl at first tile use; that's gated separately in the kernel.
+bool HasAmxInt8() {
+  unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+  if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) return false;
+  return (edx & (1u << 25)) != 0;
+}
+#endif
 
 Isa DetectHostIsa() {
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(__GNUC__) || defined(__clang__)
   __builtin_cpu_init();
-  if (__builtin_cpu_supports("amx-int8")) return Isa::Amx;
+  if (HasAmxInt8()) return Isa::Amx;
   if (__builtin_cpu_supports("avx512vnni")) return Isa::Avx512Vnni;
   if (__builtin_cpu_supports("avx512f")) return Isa::Avx512;
   if (__builtin_cpu_supports("avx2")) return Isa::Avx2;
