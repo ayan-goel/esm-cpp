@@ -16,3 +16,7 @@ compile_commands.json
 .cache/
 tests/golden/**/*.npz
 !tests/golden/**/manifest.json
+
+# Internal planning and notes — only the top-level README is public.
+*.md
+!/README.md
