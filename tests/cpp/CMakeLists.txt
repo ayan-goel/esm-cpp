@@ -1,5 +1,6 @@
 add_executable(esm_cpp_tests
   test_smoke.cpp
+  test_tokenizer.cpp
 )
 target_link_libraries(esm_cpp_tests PRIVATE
   esm_cpp_core

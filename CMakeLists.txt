@@ -35,6 +35,7 @@ endif()
 
 add_library(esm_cpp_core STATIC
   src/status.cpp
+  src/tokenizer.cpp
 )
 target_include_directories(esm_cpp_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
