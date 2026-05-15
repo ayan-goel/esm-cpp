@@ -176,71 +176,52 @@ void Embed(const Config& cfg, const float* embed_w,
   }
 }
 
-// Reshape [L, num_heads*head_dim] in linear order into [num_heads, L, head_dim].
-void SplitHeads(const float* flat, float* heads, int L, int num_heads,
-                int head_dim) {
-  for (int t = 0; t < L; ++t) {
-    for (int h = 0; h < num_heads; ++h) {
-      const float* src = flat + static_cast<long>(t) * num_heads * head_dim +
-                         static_cast<long>(h) * head_dim;
-      float* dst = heads + (static_cast<long>(h) * L + t) * head_dim;
-      std::memcpy(dst, src, sizeof(float) * static_cast<std::size_t>(head_dim));
-    }
-  }
-}
-
-void TransformerBlock(const Config& cfg, const LayerWeights& w,
-                      std::span<const int32_t> attention_mask, float* hidden,
-                      // scratch
+// Layout helpers: with the cu_seqlens-packed kernels, Q/K/V projections
+// land directly in [L, H, head_dim] (= [L, H*head_dim] in memory). The
+// old SplitHeads memcpy from [L, H*dh] -> [H, L, dh] is gone.
+void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
+                      // scratch (all pulled from the per-Model arena)
                       float* scratch_ln, float* scratch_qkv_flat,
-                      float* scratch_q_heads, float* scratch_k_heads,
-                      float* scratch_v_heads, float* scratch_cos,
-                      float* scratch_sin, float* scratch_attn_out,
-                      float* scratch_attn_proj, float* scratch_inter,
-                      float* scratch_inter_gelu, float* scratch_ffn_out,
-                      int L) {
+                      float* scratch_cos, float* scratch_sin,
+                      float* scratch_attn_out, float* scratch_attn_proj,
+                      float* scratch_inter, float* scratch_inter_gelu,
+                      float* scratch_ffn_out, const int* cu_seqlens,
+                      int batch_size, int L) {
   const int d = cfg.hidden_size;
   const int H = cfg.num_attention_heads;
   const int dh = cfg.head_dim;
   const int ffn = cfg.intermediate_size;
-  const int* mask_ptr = attention_mask.empty() ? nullptr : attention_mask.data();
 
   // Pre-attention LayerNorm on `hidden` -> scratch_ln
   kernels::LayerNorm(hidden, w.attn_ln_w.data(), w.attn_ln_b.data(),
-                        cfg.layer_norm_eps, scratch_ln, L, d);
+                     cfg.layer_norm_eps, scratch_ln, L, d);
 
-  // Q, K, V projections: each is a Linear from [L, d] to [L, d].
-  // Reuse scratch_qkv_flat in three chunks back-to-back: q | k | v.
-  kernels::Linear(scratch_ln, w.q_w.data(), w.q_b.data(),
-                     scratch_qkv_flat, L, d, d);
-  kernels::Linear(scratch_ln, w.k_w.data(), w.k_b.data(),
-                     scratch_qkv_flat + static_cast<long>(L) * d, L, d, d);
-  kernels::Linear(scratch_ln, w.v_w.data(), w.v_b.data(),
-                     scratch_qkv_flat + 2L * L * d, L, d, d);
-
-  // Reshape into [H, L, head_dim].
-  SplitHeads(scratch_qkv_flat, scratch_q_heads, L, H, dh);
-  SplitHeads(scratch_qkv_flat + static_cast<long>(L) * d, scratch_k_heads,
-             L, H, dh);
-  SplitHeads(scratch_qkv_flat + 2L * L * d, scratch_v_heads, L, H, dh);
+  // Q, K, V projections write [L, d] = [L, H*dh] = [L, H, dh] directly.
+  // Reuse scratch_qkv_flat in three chunks: q | k | v.
+  float* q_packed = scratch_qkv_flat;
+  float* k_packed = scratch_qkv_flat + static_cast<long>(L) * d;
+  float* v_packed = scratch_qkv_flat + 2L * L * d;
+  kernels::Linear(scratch_ln, w.q_w.data(), w.q_b.data(), q_packed, L, d, d);
+  kernels::Linear(scratch_ln, w.k_w.data(), w.k_b.data(), k_packed, L, d, d);
+  kernels::Linear(scratch_ln, w.v_w.data(), w.v_b.data(), v_packed, L, d, d);
 
   // Q-scale BEFORE RoPE — ESM's load-bearing quirk; see CLAUDE.md.
   const float q_scale = 1.0f / std::sqrt(static_cast<float>(dh));
-  for (long i = 0; i < static_cast<long>(H) * L * dh; ++i) {
-    scratch_q_heads[i] *= q_scale;
-  }
+  for (long i = 0; i < static_cast<long>(L) * d; ++i) q_packed[i] *= q_scale;
 
   kernels::RopeBuildTables(L, dh, scratch_cos, scratch_sin);
-  kernels::RopeApplyInplace(scratch_q_heads, scratch_cos, scratch_sin, H, L, dh);
-  kernels::RopeApplyInplace(scratch_k_heads, scratch_cos, scratch_sin, H, L, dh);
+  kernels::RopeApplyVarlenRef(q_packed, scratch_cos, scratch_sin, cu_seqlens,
+                              batch_size, H, dh);
+  kernels::RopeApplyVarlenRef(k_packed, scratch_cos, scratch_sin, cu_seqlens,
+                              batch_size, H, dh);
 
-  // Self-attention. Output is [L, H*dh] = [L, d] in heads-concatenated layout.
-  kernels::Attention(scratch_q_heads, scratch_k_heads, scratch_v_heads,
-                        mask_ptr, scratch_attn_out, H, L, dh);
+  // Self-attention. Output is [L, H*dh] = [L, d] (heads concatenated).
+  kernels::AttentionVarlen(q_packed, k_packed, v_packed, cu_seqlens, batch_size,
+                           H, dh, scratch_attn_out);
 
   // out_proj
   kernels::Linear(scratch_attn_out, w.out_w.data(), w.out_b.data(),
-                     scratch_attn_proj, L, d, d);
+                  scratch_attn_proj, L, d, d);
 
   // Residual: hidden += attn_proj
   for (long i = 0; i < static_cast<long>(L) * d; ++i) {
@@ -249,17 +230,17 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w,
 
   // Pre-FFN LayerNorm on `hidden` -> scratch_ln
   kernels::LayerNorm(hidden, w.ffn_ln_w.data(), w.ffn_ln_b.data(),
-                        cfg.layer_norm_eps, scratch_ln, L, d);
+                     cfg.layer_norm_eps, scratch_ln, L, d);
 
   // fc1: [L, d] -> [L, 4d]
-  kernels::Linear(scratch_ln, w.fc1_w.data(), w.fc1_b.data(),
-                     scratch_inter, L, ffn, d);
+  kernels::Linear(scratch_ln, w.fc1_w.data(), w.fc1_b.data(), scratch_inter, L,
+                  ffn, d);
   // GELU
   kernels::Gelu(scratch_inter, scratch_inter_gelu,
-                   static_cast<std::size_t>(L) * ffn);
+                static_cast<std::size_t>(L) * ffn);
   // fc2: [L, 4d] -> [L, d]
   kernels::Linear(scratch_inter_gelu, w.fc2_w.data(), w.fc2_b.data(),
-                     scratch_ffn_out, L, d, ffn);
+                  scratch_ffn_out, L, d, ffn);
 
   // Residual: hidden += ffn_out
   for (long i = 0; i < static_cast<long>(L) * d; ++i) {
@@ -298,25 +279,24 @@ std::vector<float> Model::ForwardWithHiddenStates(
   const std::size_t L_sz = static_cast<std::size_t>(L);
   const std::size_t Ld = L_sz * static_cast<std::size_t>(d);
   const std::size_t L3d = Ld * 3;
-  const std::size_t HLdh = static_cast<std::size_t>(H) * L_sz *
-                           static_cast<std::size_t>(dh);
   const std::size_t Ldh = L_sz * static_cast<std::size_t>(dh);
   const std::size_t Lffn = L_sz * static_cast<std::size_t>(ffn);
   const std::size_t LV = L_sz * static_cast<std::size_t>(V);
+  (void)H;
   (void)LV;
 
   // Reserve the worst-case workspace size BEFORE the first allocate. Growing
   // the arena mid-forward would reallocate the backing buffer and invalidate
   // every pointer we'd already handed out — Workspace::Grow asserts against
-  // that path, but only when we've correctly pre-sized here. Counts:
-  //   hidden + scratch_ln + 3*qkv + 3*q/k/v_heads + 2*cos/sin +
-  //   attn_out + attn_proj + 2*inter/inter_gelu + ffn_out +
-  //   final_ln + lm_dense + lm_gelu + lm_ln
-  // = 17 buffers totalling 23*Ld + 2*Ldh floats. One cache line of slack per
-  // allocation covers Workspace::AlignUp padding (alignof(float) = 4, so
-  // padding is trivial, but the slack future-proofs SIMD-aligned allocs).
-  const std::size_t scratch_floats = 23 * Ld + 2 * Ldh;
-  const std::size_t alignment_slack = 17 * 64;
+  // that path, but only when we've correctly pre-sized here.
+  // Slice 4: cu_seqlens layout drops the 3 head-major QKV reshape buffers.
+  // Counts: hidden + scratch_ln + 3*qkv + 2*cos/sin +
+  //         attn_out + attn_proj + 2*inter/inter_gelu + ffn_out +
+  //         final_ln + lm_dense + lm_gelu + lm_ln
+  //       = 14 buffers totalling 20*Ld + 2*Ldh floats. One cache line of
+  //         slack per allocation covers Workspace::AlignUp padding.
+  const std::size_t scratch_floats = 20 * Ld + 2 * Ldh;
+  const std::size_t alignment_slack = 14 * 64;
   ws_.reserve(scratch_floats * sizeof(float) + alignment_slack);
 
   float* hidden = ws_.allocate<float>(Ld);
@@ -330,9 +310,6 @@ std::vector<float> Model::ForwardWithHiddenStates(
 
   float* scratch_ln = ws_.allocate<float>(Ld);
   float* scratch_qkv_flat = ws_.allocate<float>(L3d);
-  float* scratch_q_heads = ws_.allocate<float>(HLdh);
-  float* scratch_k_heads = ws_.allocate<float>(HLdh);
-  float* scratch_v_heads = ws_.allocate<float>(HLdh);
   float* scratch_cos = ws_.allocate<float>(Ldh);
   float* scratch_sin = ws_.allocate<float>(Ldh);
   float* scratch_attn_out = ws_.allocate<float>(Ld);
@@ -341,14 +318,16 @@ std::vector<float> Model::ForwardWithHiddenStates(
   float* scratch_inter_gelu = ws_.allocate<float>(Lffn);
   float* scratch_ffn_out = ws_.allocate<float>(Ld);
 
+  // B=1 cu_seqlens for the Phase 1 single-sequence path. Phase 3 scheduler
+  // will pack multiple sequences with cu_seqlens = {0, L_0, L_0+L_1, ...}.
+  const int cu_seqlens_b1[2] = {0, L};
+
   for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
-    TransformerBlock(cfg_, layers_[static_cast<std::size_t>(i)], attention_mask,
-                     hidden, scratch_ln, scratch_qkv_flat,
-                     scratch_q_heads, scratch_k_heads,
-                     scratch_v_heads, scratch_cos,
-                     scratch_sin, scratch_attn_out,
-                     scratch_attn_proj, scratch_inter,
-                     scratch_inter_gelu, scratch_ffn_out, L);
+    TransformerBlock(cfg_, layers_[static_cast<std::size_t>(i)], hidden,
+                     scratch_ln, scratch_qkv_flat, scratch_cos, scratch_sin,
+                     scratch_attn_out, scratch_attn_proj, scratch_inter,
+                     scratch_inter_gelu, scratch_ffn_out, cu_seqlens_b1,
+                     /*batch_size=*/1, L);
     if (hidden_states_out) {
       hidden_states_out->emplace_back(hidden, hidden + Ld);
     }

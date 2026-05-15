@@ -58,6 +58,16 @@ void RopeBuildTables(int seq_len, int head_dim, float* cos, float* sin);
 void RopeApplyInplaceRef(float* x, const float* cos, const float* sin,
                          int num_heads, int seq_len, int head_dim);
 
+// Packed-varlen RoPE in [T, H, head_dim] layout. Each sequence b in
+// [0, batch_size) uses positions 0..seq_len_b - 1 against the shared
+// cos/sin tables — positions restart at every cu_seqlens boundary.
+//   x: [T, num_heads, head_dim]  (token-major; head inner)
+//   cos/sin: [max_seqlen, head_dim] (max_seqlen >= max sequence length)
+//   cu_seqlens: [batch_size + 1]
+void RopeApplyVarlenRef(float* x, const float* cos, const float* sin,
+                        const int* cu_seqlens, int batch_size, int num_heads,
+                        int head_dim);
+
 // Scaled-dot self-attention (no Q-scale here; caller scales Q ahead of
 // RoPE per the ESM convention). Mask: -inf for padded positions, 0 for
 // real positions. Softmax accumulator is FP32.
@@ -67,5 +77,24 @@ void RopeApplyInplaceRef(float* x, const float* cos, const float* sin,
 void AttentionRef(const float* Q, const float* K, const float* V,
                   const int* attention_mask, float* out, int num_heads,
                   int seq_len, int head_dim);
+
+// Packed-varlen scaled-dot attention. Q must already be scaled (ESM-2
+// scales Q by 1/sqrt(head_dim) before RoPE). Sequences are packed back-
+// to-back along the T axis; cu_seqlens[b+1] - cu_seqlens[b] is the b-th
+// sequence's length, with cu_seqlens[0] = 0 and cu_seqlens[B] = T total.
+// Attention is per-sequence — KV from sequence j never attends to queries
+// from sequence i.
+//   q, k, v: [T, num_heads, head_dim] (token-major; head inner)
+//   cu_seqlens: [batch_size + 1]
+//   out: [T, num_heads * head_dim] (heads concatenated along last dim,
+//        matches AttentionRef's output for cross-validation)
+// Softmax accumulator is FP32. This is the interface the Phase 3
+// cu_seqlens scheduler will consume.
+void AttentionVarlenRef(const float* q, const float* k, const float* v,
+                        const int* cu_seqlens, int batch_size, int num_heads,
+                        int head_dim, float* out);
+void AttentionVarlen(const float* q, const float* k, const float* v,
+                     const int* cu_seqlens, int batch_size, int num_heads,
+                     int head_dim, float* out);
 
 }  // namespace esm::kernels

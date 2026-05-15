@@ -72,4 +72,14 @@ void Attention(const float* Q, const float* K, const float* V,
   }
 }
 
+void AttentionVarlen(const float* q, const float* k, const float* v,
+                     const int* cu_seqlens, int batch_size, int num_heads,
+                     int head_dim, float* out) {
+  switch (esm::CurrentIsa()) {
+    default:
+      return AttentionVarlenRef(q, k, v, cu_seqlens, batch_size, num_heads,
+                                head_dim, out);
+  }
+}
+
 }  // namespace esm::kernels
