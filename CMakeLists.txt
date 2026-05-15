@@ -40,26 +40,70 @@ FetchContent_Declare(nlohmann_json
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 FetchContent_MakeAvailable(nlohmann_json)
 
+# Per-ISA kernel OBJECT libraries (Slice 1.4). The same kernel .cpp files are
+# compiled multiple times, once per ISA. Each pass defines exactly one of
+# ESM_KERNEL_{REFERENCE,AVX512,NEON} so only that ISA's impl emits symbols;
+# everything else is #ifdef'd out. Per CLAUDE.md: target-attribute sprinkling
+# is forbidden — flag isolation lives at the TU level, here.
+set(ESM_KERNEL_SOURCES
+  src/kernels/gemm_fp32.cpp
+  src/kernels/layernorm.cpp
+  src/kernels/gelu.cpp
+  src/kernels/rope.cpp
+  src/kernels/attention.cpp
+)
+
+add_library(esm_cpp_kernels_ref OBJECT ${ESM_KERNEL_SOURCES})
+target_include_directories(esm_cpp_kernels_ref PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_compile_definitions(esm_cpp_kernels_ref PRIVATE ESM_KERNEL_REFERENCE)
+target_link_libraries(esm_cpp_kernels_ref PRIVATE esm_warnings)
+target_compile_features(esm_cpp_kernels_ref PUBLIC cxx_std_20)
+
+set(ESM_KERNEL_OBJECT_LIBS esm_cpp_kernels_ref)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  add_library(esm_cpp_kernels_avx512 OBJECT ${ESM_KERNEL_SOURCES})
+  target_include_directories(esm_cpp_kernels_avx512 PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_compile_definitions(esm_cpp_kernels_avx512 PRIVATE ESM_KERNEL_AVX512)
+  target_compile_options(esm_cpp_kernels_avx512 PRIVATE
+    -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma)
+  target_link_libraries(esm_cpp_kernels_avx512 PRIVATE esm_warnings)
+  target_compile_features(esm_cpp_kernels_avx512 PUBLIC cxx_std_20)
+  list(APPEND ESM_KERNEL_OBJECT_LIBS esm_cpp_kernels_avx512)
+endif()
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+  add_library(esm_cpp_kernels_neon OBJECT ${ESM_KERNEL_SOURCES})
+  target_include_directories(esm_cpp_kernels_neon PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_compile_definitions(esm_cpp_kernels_neon PRIVATE ESM_KERNEL_NEON)
+  target_link_libraries(esm_cpp_kernels_neon PRIVATE esm_warnings)
+  target_compile_features(esm_cpp_kernels_neon PUBLIC cxx_std_20)
+  list(APPEND ESM_KERNEL_OBJECT_LIBS esm_cpp_kernels_neon)
+endif()
+
 add_library(esm_cpp_core STATIC
   src/status.cpp
   src/tokenizer.cpp
   src/io/safetensors.cpp
   src/kernels/cpu_features.cpp
   src/kernels/dispatch.cpp
-  src/kernels/gemm_fp32.cpp
-  src/kernels/layernorm.cpp
-  src/kernels/gelu.cpp
-  src/kernels/rope.cpp
-  src/kernels/attention.cpp
+  src/kernels/rope_tables.cpp
   src/model.cpp
 )
 target_include_directories(esm_cpp_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_link_libraries(esm_cpp_core PRIVATE esm_warnings nlohmann_json::nlohmann_json)
 target_compile_features(esm_cpp_core PUBLIC cxx_std_20)
-# Slice 1.3: the *Ref scalar impls live behind ESM_KERNEL_REFERENCE so the
-# same .cpp can be re-compiled as a SIMD TU later (Slice 1.4 splits TUs).
-target_compile_definitions(esm_cpp_core PRIVATE ESM_KERNEL_REFERENCE)
+
+# Link the per-ISA kernel TUs into the static lib. The Ref TU is always
+# present; SIMD TUs contribute symbols only once Slice 3 fills the
+# corresponding ESM_KERNEL_AVX512 / ESM_KERNEL_NEON blocks.
+foreach(t ${ESM_KERNEL_OBJECT_LIBS})
+  target_link_libraries(esm_cpp_core PUBLIC ${t})
+endforeach()
 
 if(ESM_BUILD_TESTS)
   include(FetchContent)
