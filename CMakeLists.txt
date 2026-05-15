@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(ESM_BUILD_TESTS "Build C++ tests" ON)
 option(ESM_BUILD_PYTHON "Build pybind11 Python module" OFF)
+option(ESM_BUILD_BENCH "Build Google Benchmark microbenchmarks" OFF)
 option(ESM_SANITIZERS "Enable ASan+UBSan on Debug" OFF)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -132,4 +133,16 @@ if(ESM_BUILD_PYTHON)
   pybind11_add_module(_core python/esm_cpp/_core.cpp)
   target_link_libraries(_core PRIVATE esm_cpp_core esm_warnings)
   install(TARGETS _core LIBRARY DESTINATION esm_cpp)
+endif()
+
+if(ESM_BUILD_BENCH)
+  include(FetchContent)
+  FetchContent_Declare(benchmark
+    GIT_REPOSITORY https://github.com/google/benchmark.git
+    GIT_TAG v1.8.5)
+  set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(benchmark)
+  add_subdirectory(bench)
 endif()
