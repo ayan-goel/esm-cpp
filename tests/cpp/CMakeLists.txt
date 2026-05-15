@@ -11,6 +11,7 @@ add_executable(esm_cpp_tests
   test_quant.cpp
   test_observer.cpp
   test_smoothquant.cpp
+  test_act_quant.cpp
 )
 target_link_libraries(esm_cpp_tests PRIVATE
   esm_cpp_core

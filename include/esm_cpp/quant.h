@@ -28,4 +28,15 @@ struct QuantizedTensor {
 // packed=0 (the dequant matmul handles this correctly).
 void Quantize(const float* W_fp32, int N, int K, QuantizedTensor* out);
 
+// Per-tensor symmetric activation quantizer (FP32 -> u8 with zero-point 128).
+//   q[i] = clamp(round(x[i] / scale), -127, 127) + 128
+// scale == 0 produces all-zero-point output. The activation scale is a
+// single FP32 number per tensor, typically derived from a 99.9-percentile
+// observer (see ActivationObserver) and SmoothQuant migration. The VNNI
+// VPDPBUSD path consumes the u8 output; the s32 accumulator is later
+// rescaled by (act_scale * weight_scale[n]) at C-write-out. Slice 6
+// AVX-512 version is x86 hand-off.
+void QuantizeActivationRef(const float* x, std::size_t n, float scale,
+                            std::uint8_t* q);
+
 }  // namespace esm::quant

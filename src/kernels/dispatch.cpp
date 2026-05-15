@@ -39,10 +39,19 @@ void Linear(const float* A, const float* W, const float* bias, float* C,
   }
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
+                const float* bias, float* C, int M, int N, int K);
+#endif
+
 void LinearInt8(const float* A, const esm::quant::QuantizedTensor& W,
                 const float* bias, float* C, int M, int N, int K) {
   switch (esm::CurrentIsa()) {
-    // Slice 6 hand-off: AVX-512 VNNI and AMX paths register here.
+#if defined(__x86_64__) || defined(_M_X64)
+    case Isa::Avx512Vnni:
+    case Isa::Amx:
+      return LinearVnni(A, W, bias, C, M, N, K);
+#endif
     default:
       return LinearInt8Ref(A, W, bias, C, M, N, K);
   }
