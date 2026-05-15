@@ -20,6 +20,15 @@ jobs:
             compiler: gcc
     steps:
       - uses: actions/checkout@v4
+      - name: Install GCC 13 (Ubuntu)
+        if: matrix.os == 'ubuntu-22.04' && matrix.compiler == 'gcc'
+        run: |
+          # gcc-13 isn't in the stock Ubuntu 22.04 apt sources; pull from
+          # the ubuntu-toolchain-r/test PPA. The `|| true` keeps it idempotent
+          # in case the runner image gains gcc-13 by default later.
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test || true
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13
       - name: Configure compilers
         shell: bash
         run: |
