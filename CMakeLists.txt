@@ -103,6 +103,7 @@ add_library(esm_cpp_core STATIC
   src/kernels/rope_tables.cpp
   src/quant/observer.cpp
   src/quant/pack.cpp
+  src/quant/smoothquant.cpp
   src/threading/thread_pool.cpp
   src/model.cpp
 )

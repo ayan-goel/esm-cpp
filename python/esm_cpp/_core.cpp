@@ -11,6 +11,7 @@
 #include "esm_cpp/cpu_features.h"
 #include "esm_cpp/model.h"
 #include "esm_cpp/observer.h"
+#include "esm_cpp/smoothquant.h"
 #include "esm_cpp/tokenizer.h"
 #include "esm_cpp/version.h"
 
@@ -154,6 +155,12 @@ PYBIND11_MODULE(_core, m) {
            "symmetric INT8. lm_head stays FP32 (Slice 5 escape list). After "
            "this call Forward/ForwardBatch route the per-layer projections "
            "through LinearInt8.")
+      .def("apply_smoothquant", &esm::Model::ApplySmoothQuant,
+           py::arg("act_stats"), py::arg("alpha"),
+           "Migrate activation outliers into per-channel weight scales "
+           "(SmoothQuant). Identity-preserving for the FP32 forward to "
+           "round-off; quantization-friendly because activation channels "
+           "now have smoother dynamic range.")
       .def(
           "forward_with_observer",
           [](const esm::Model& self,

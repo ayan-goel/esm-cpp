@@ -4,6 +4,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "esm_cpp/observer.h"
@@ -104,6 +105,13 @@ class Model {
   // After this call, Forward / ForwardBatch route the per-layer
   // projections through LinearInt8 instead of Linear.
   void QuantizeWeights();
+
+  // Phase 2: apply the SmoothQuant migration in place using the per-site
+  // activation stats from a calibration run. Identity-preserving to FP32
+  // round-off; the load-bearing checkpoint for Phase 2 is verifying
+  // forward(post-migration) ≈ forward(pre-migration).
+  void ApplySmoothQuant(
+      const std::unordered_map<std::string, float>& act_stats, float alpha);
 
   // Phase 2: run the forward pass and feed every Linear-input activation
   // into the observer at well-known site keys for SmoothQuant calibration:

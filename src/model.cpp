@@ -10,6 +10,7 @@
 #include "esm_cpp/cpu_features.h"
 #include "esm_cpp/io.h"
 #include "esm_cpp/kernels.h"
+#include "esm_cpp/smoothquant.h"
 #include "esm_cpp/tokenizer.h"
 
 namespace esm {
@@ -467,6 +468,14 @@ void QuantizeLinear(const std::vector<float>& w_fp32, int out_features,
 }
 
 }  // namespace
+
+void Model::ApplySmoothQuant(
+    const std::unordered_map<std::string, float>& act_stats, float alpha) {
+  for (int i = 0; i < static_cast<int>(layers_.size()); ++i) {
+    esm::quant::MigrateSmoothQuant(layers_[static_cast<std::size_t>(i)],
+                                    act_stats, i, alpha);
+  }
+}
 
 void Model::QuantizeWeights() {
   const int d = cfg_.hidden_size;
