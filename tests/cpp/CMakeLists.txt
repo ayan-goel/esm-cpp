@@ -5,6 +5,7 @@ add_executable(esm_cpp_tests
   test_cpu_features.cpp
   test_dispatch.cpp
   test_workspace.cpp
+  test_gemm_shapes.cpp
 )
 target_link_libraries(esm_cpp_tests PRIVATE
   esm_cpp_core

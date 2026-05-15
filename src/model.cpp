@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "esm_cpp/cpu_features.h"
 #include "esm_cpp/io.h"
 #include "esm_cpp/kernels.h"
 #include "esm_cpp/tokenizer.h"
@@ -49,6 +50,7 @@ void LoadLayerNorm(const io::SafetensorsFile& f, const std::string& prefix,
 }  // namespace
 
 std::unique_ptr<Model> Model::LoadFromSafetensors(const std::string& path) {
+  esm::MaybeLogIsaOnce();
   auto file = io::SafetensorsFile::Open(path);
   auto out = std::unique_ptr<Model>(new Model());
 
