@@ -1,74 +1,76 @@
-# Phase 0 — Task List
+# Phase 1 — Task List
 
 Companion to [plan.md](plan.md). Tick tasks as they land. Acceptance criteria and verification steps live in plan.md; this file is the running ledger.
 
-## Slice 1 — Scaffolding
+## Slice 1 — Kernel dispatch + CPU feature detect
 
-- [ ] **1.1** Create directory tree per [SPEC §4](../SPEC.md)
-- [ ] **1.2** Top-level `CMakeLists.txt` (C++20, Release/Debug flags, FetchContent for pybind11 + GoogleTest, clang-format/clang-tidy targets)
-- [ ] **1.3** `pyproject.toml` with scikit-build-core, dev extras (`pytest`, `numpy`, `torch`, `transformers`, `ruff`, `mypy`)
-- [ ] **1.4** `include/esm_cpp/version.h` and `include/esm_cpp/status.h`
-- [ ] **1.5** Placeholder smoke tests (`tests/cpp/test_smoke.cpp`, `tests/python/test_smoke.py`)
-- [ ] **1.6** `.github/workflows/ci.yml` (Ubuntu + macOS × GCC + Clang × Debug + Release)
-- [ ] **1.7** Pin HF `transformers` version in `pyproject.toml` and `tools/capture_golden.py`
-- [ ] **Checkpoint A** — push branch, confirm matrix green
+- [ ] **1.1** `src/kernels/cpu_features.cpp` + `include/esm_cpp/cpu_features.h` (`Isa` enum, `DetectIsa()`, `ESM_FORCE_ISA` / `ESM_LOG_ISA` env vars)
+- [ ] **1.2** Kernel dispatch facade in `include/esm_cpp/kernels.h` (`Linear`, `LayerNorm`, `Gelu`, `RopeApplyInplace`, `Attention` entry points pick reference/AVX-512/NEON at first use)
+- [ ] **1.3** Reorganize `src/kernels/*.cpp`: scalar reference behind `#ifdef ESM_KERNEL_REFERENCE` in same file as dispatched entry point
+- [ ] **1.4** CMake per-ISA `OBJECT` libraries (`esm_cpp_kernels_ref`, `esm_cpp_kernels_avx512`, `esm_cpp_kernels_neon`) with TU-specific flags; arch-gated by `CMAKE_SYSTEM_PROCESSOR`
+- [ ] **1.5** CI matrix: Linux/x86 runner with AVX-512 (real or SDE-emulated); `ESM_FORCE_ISA=ref` and `ESM_FORCE_ISA=avx512` both green
+- [ ] **1.6** `tests/cpp/test_dispatch.cpp` cross-checks every registered ISA against the scalar reference
 
-## Slice 2 — Tokenizer
+## Slice 2 — Arena allocator + Workspace
 
-- [ ] **2.1** `esm::Tokenizer` in `include/esm_cpp/tokenizer.h` + `src/tokenizer.cpp` with hardcoded 33-token vocab in UR50 frequency order
-- [ ] **2.2** `prepend_bos=True`, `append_eos=True`, max length 1024
-- [ ] **2.3** GoogleTest unit tests (canonical aa, rare aa, unknowns, `<null_1>`, truncation)
-- [ ] **2.4** `tests/python/test_tokenizer.py` — 10K random sequences byte-exact vs HF `EsmTokenizer`
+- [ ] **2.1** `include/esm_cpp/workspace.h` declares `esm::Workspace` (bump allocator, `allocate<T>(n, align)`, `reset()`)
+- [ ] **2.2** `Model` gains `mutable Workspace ws_`; sized at construction from `cfg` + max_seqlen=1024 estimate
+- [ ] **2.3** Refactor `Model::ForwardWithHiddenStates` to pull every scratch buffer from `ws_`; `ws_.reset()` at entry
+- [ ] **2.4** Document non-reentrancy; debug `assert(!ws_.in_use_)` flag (RAII-managed)
+- [ ] **2.5** `tests/cpp/test_arena.cpp` — 10 forwards at varying L, no arena growth after first
+- [ ] **2.6** Phase 0 parity tests re-run; expect bit-identical numerics (no summation order change)
+- [ ] **Checkpoint A** — dispatch + arena live, CI matrix green on both arch families
 
-## Slice 3 — Golden tensor capture
+## Slice 3 — Goto-packed SGEMM (AVX-512 + NEON dev fallback)
 
-- [ ] **3.1** `tools/capture_golden.py` with `--model`, `--num-seqs`, `--seed`, `--out` args; uniform length distribution [50, 300]
-- [ ] **3.2** Capture per sequence: `input_ids`, `attention_mask`, `hidden_states[0..N]`, `logits`
-- [ ] **3.3** Capture layer-0 debug intermediates: `pre_attn_ln_input/output`, `qkv_raw`, `q_after_rope`, `k_after_rope`, `attn_output`, `post_attn_residual`, `pre_ffn_ln_output`, `ffn_output`, `post_ffn_residual`
-- [ ] **3.4** Write npz files + `manifest.json` with HF version + commit + date + seed
-- [ ] **3.5** Capture for both `esm2_t6_8M` and `esm2_t12_35M`
-- [ ] **Checkpoint B** — review file sizes, decide Git LFS vs CI-time regeneration
+- [ ] **3.1** Lock register block size (recommend 16×32 for AVX-512) and macrokernel tile params (M_C≈256, K_C≈512, N_C≈4096)
+- [ ] **3.2** Goto packing routines: `pack_a_16` (M-major, K-fast), `pack_b_32` (N-major, K-fast); reference `salykova.github.io/matmul-cpu`
+- [ ] **3.3** `src/kernels/gemm_fp32_avx512.cpp` — microkernel `gemm_kernel_16x32` in `_mm512_*` intrinsics; macrokernel walks tiles; bias applied at C-init
+- [ ] **3.4** `src/kernels/gemm_fp32_neon.cpp` — Accelerate `cblas_sgemm` wrapper (dev fallback)
+- [ ] **3.5** Register both with the S1 dispatch facade; dispatch picks per `current_isa()`
+- [ ] **3.6** `libxsmm` FetchContent at pinned tag; `libxsmm_smmdispatch` at `Model::load` for the four critical shapes; small-shape fallback
+- [ ] **3.7** `bench/bench_gemm.cpp` (Google Benchmark) on the four shapes × `d ∈ {320, 640, 1280, 2560}` × `B·L ∈ {300, 4800, 8192}`
+- [ ] **3.8** Correctness shape sweep against `LinearRef` (`allclose(rtol=1e-6, atol=1e-5)`); tail-handling at non-block-multiple dims
+- [ ] **3.9** Re-run HF parity on 8M / 35M; tighten `final_logits_tol` if FMA + Goto closes toward `< 1e-4`
+- [ ] **Checkpoint B** — SGEMM SIMD lands; bisect any numeric regression vs scalar; decide `< 1e-4` gate recoverability
 
-## Slice 4 — FP32 forward graph (ESM-2-8M passes the gate)
+## Slice 4 — FlashAttention varlen with `cu_seqlens`
 
-- [ ] **4.1** Safetensors weight loader (`src/io/safetensors.cpp`); validates shapes against `EsmConfig`
-- [ ] **4.2** Scalar reference `matmul_ref` (`src/kernels/gemm_fp32.cpp`)
-- [ ] **4.3** Scalar reference `layernorm_ref` (`src/kernels/layernorm.cpp`); verify against `pre_attn_ln_output` layer-0 golden
-- [ ] **4.4** Embed lookup + `token_dropout` 0.88 rescale; verify against `hidden_states[0]` golden — **bug trap: 0.88 multiplier**
-- [ ] **4.5** RoPE half-then-half (`rotate_half`) + Q-scale-BEFORE-RoPE; verify against `q_after_rope` and `k_after_rope` goldens — **bug trap: half-then-half vs interleaved**
-- [ ] **4.6** Scaled-dot attention (FP32 softmax accumulator, scalar reference); verify against `attn_output` golden
-- [ ] **4.7** Out-projection + residual; verify against `post_attn_residual` golden
-- [ ] **4.8** FFN with GELU **tanh approximation**; verify against `post_ffn_residual` golden — **bug trap: GELU variant**
-- [ ] **4.9** Transformer block + N-layer stack; verify against `hidden_states[1..N]` for seq 0
-- [ ] **4.10** Final LN + tied `lm_head` (dense → gelu → layernorm → tied-decoder + bias); verify against `logits` golden across all 100 sequences
-- [ ] **Slice gate** — `pytest tests/python/test_against_hf.py::test_8m_parity` green, `max_abs_diff < 1e-4` across 100 sequences
-- [ ] **Checkpoint C** — Phase 0 de-risking complete; do NOT widen tolerances if you see drift, diagnose
+- [ ] **4.1** Declare `AttentionVarlen` in `include/esm_cpp/kernels.h` (`q/k/v: [T, H, dh]`, `cu_seqlens: [B+1]`, `out: [T, H*dh]`)
+- [ ] **4.2** `src/kernels/attention_varlen_ref.cpp` — scalar reference (tile size 1, FP32 softmax); HF golden cross-check
+- [ ] **4.3** `src/kernels/attention_varlen_avx512.cpp` — FA-2-style block streaming (`B_C = B_R = 64`); FP32 `m, l, O`; reuses S3 packing primitives
+- [ ] **4.4** `src/kernels/attention_varlen_neon.cpp` — dev fallback NEON
+- [ ] **4.5** `src/model.cpp` refactor: Q/K/V projections in `[L, H, dh]` layout (kill `SplitHeads`), B=1 `cu_seqlens`, dispatch to `AttentionVarlen`, arena for per-block scratch
+- [ ] **4.6** `tests/cpp/test_attention_varlen.cpp` — B=1, B=2 packed, padding isolation, vs scalar reference
+- [ ] **4.7** `bench/bench_attention.cpp` — single-seq + varlen at L ∈ {64, 128, 256, 512, 1024}
+- [ ] **Checkpoint C** — varlen attention lands; review `cu_seqlens` signature with Phase 3 scheduler in mind
 
-## Slice 5 — ESM-2-35M
+## Slice 5 — Thread pool + parallelism
 
-- [ ] **5.1** Run `test_against_hf` with `model=esm2_t12_35M`; capture failures
-- [ ] **5.2** Fix any non-generic code paths (hardcoded dims, layer counts, mask broadcasting)
-- [ ] **5.3** Add `test_35m_parity` to CI
-- [ ] **Slice gate** — 100-sequence final-logits gate passes for 35M; layer-by-layer parity holds across 12 layers
+- [ ] **5.1** `src/threading/thread_pool.cpp` + `include/esm_cpp/thread_pool.h` (hand-rolled, ~200 LOC, `parallel_for(begin, end, grain, fn)`)
+- [ ] **5.2** Process-global pool initialized at first `Model::load`; size from `ESM_NUM_THREADS`, default physical-core count (llama.cpp `cpu_get_num_physical_cores` recipe)
+- [ ] **5.3** FFN-4d parallelism (fc1 and fc2 split along the 4d axis with a fixed partition for determinism)
+- [ ] **5.4** Batch parallelism via new `Model::ForwardBatch`; dispatch axis selection (`B * grain >= num_threads` → batch; else FFN)
+- [ ] **5.5** Per-thread `Workspace` in `ForwardBatch` (thread-local arena, sized at pool init)
+- [ ] **5.6** Parity tests at thread counts {1, 2, 4, physical_cores} — must remain bit-identical given the fixed FFN-4d partition
+- [ ] **5.7** TSan/ASan stress test: 1000 forwards from a multi-producer pool against one `Model`
+- [ ] **Checkpoint D** — thread pool lands; non-determinism (if observed) is a pool bug, not a math bug
 
-## Slice 6 — Python bindings + e2e
+## Slice 6 — Microbench, x86 gate measurement, retrospective
 
-- [ ] **6.1** `python/esm_cpp/_core.cpp` (pybind11): bind `Tokenizer` and `Model.{load, forward}`
-- [ ] **6.2** `py::call_guard<py::gil_scoped_release>()` on `forward`
-- [ ] **6.3** `python/esm_cpp/__init__.py` + `_core.pyi` type stubs
-- [ ] **6.4** `tests/python/test_e2e.py` — load via our loader, forward, compare against HF `EsmForMaskedLM`
-- [ ] **Slice gate** — `import esm_cpp` works; e2e test green; `mypy --strict` clean
-- [ ] **Checkpoint D** — Phase 0 gate met end-to-end from Python
+- [ ] **6.1** Stand up gate machine (recommend AWS `c7i.4xlarge` Sapphire Rapids; document exact SKU, kernel, glibc, compiler in `docs/benchmarks.md`)
+- [ ] **6.2** Install Intel oneAPI MKL on the gate machine; record MKL `sgemm` numbers on the four shapes; pin MKL version
+- [ ] **6.3** `python/esm_cpp/bench/compare.py` — HF `EsmModel(attn_implementation="eager")` vs esm.cpp; p50/p99 latency, warm-up, deterministic seeds, threads pinned
+- [ ] **6.4** Run the gate (three configs: perf, microkernel %-of-MKL, correctness on 8M/35M/650M)
+- [ ] **6.5** `notes/phase1.md` retrospective (what shipped, surprises, deviations, carry-forward to Phase 2)
+- [ ] **6.6** Update README with Phase 1 status and reproduction commands; commit Phase 1 tolerances to `test_against_hf.py`
+- [ ] **6.7** Decide `< 1e-4` logits gate landing — one of: closed and restored; model-size-aware; documented floor
 
-## Slice 7 — Retrospective
-
-- [ ] **7.1** `notes/phase0.md` (one screen of prose covering what shipped, surprises, deviations, carry-forward)
-- [ ] **7.2** Update README with Phase 0 status + reproduction command
-
-## Phase 0 done
+## Phase 1 done
 
 - [ ] All slice gates green
-- [ ] All 4 checkpoints (A, B, C, D) cleared
-- [ ] `notes/phase0.md` committed
-- [ ] CI matrix green on `main`
-- [ ] Ready to start Phase 1 planning
+- [ ] All checkpoints (A, B, C, D) cleared
+- [ ] `notes/phase1.md` committed
+- [ ] CI matrix green on `main` (Linux + macOS, x86 + ARM, AVX-512-on, AVX-512-off)
+- [ ] Gate met on the x86 instance: ≥2× HF on 650M batch-16 300aa, SGEMM ≥80% of comparator on the four shapes
+- [ ] Ready to start Phase 2 planning (INT8 + AMX)
