@@ -4,7 +4,7 @@ Companion to [plan.md](plan.md). Tick tasks as they land. Acceptance criteria an
 
 ## Slice 1 — Kernel dispatch + CPU feature detect
 
-- [ ] **1.1** `src/kernels/cpu_features.cpp` + `include/esm_cpp/cpu_features.h` (`Isa` enum, `DetectIsa()`, `ESM_FORCE_ISA` / `ESM_LOG_ISA` env vars)
+- [x] **1.1** `src/kernels/cpu_features.cpp` + `include/esm_cpp/cpu_features.h` (`Isa` enum, `DetectIsa()`, `ESM_FORCE_ISA` / `ESM_LOG_ISA` env vars)
 - [ ] **1.2** Kernel dispatch facade in `include/esm_cpp/kernels.h` (`Linear`, `LayerNorm`, `Gelu`, `RopeApplyInplace`, `Attention` entry points pick reference/AVX-512/NEON at first use)
 - [ ] **1.3** Reorganize `src/kernels/*.cpp`: scalar reference behind `#ifdef ESM_KERNEL_REFERENCE` in same file as dispatched entry point
 - [ ] **1.4** CMake per-ISA `OBJECT` libraries (`esm_cpp_kernels_ref`, `esm_cpp_kernels_avx512`, `esm_cpp_kernels_neon`) with TU-specific flags; arch-gated by `CMAKE_SYSTEM_PROCESSOR`

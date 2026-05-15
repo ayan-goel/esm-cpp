@@ -1,0 +1,83 @@
+#include "esm_cpp/cpu_features.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <string_view>
+
+namespace esm {
+
+namespace {
+
+Isa DetectHostIsa() {
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) || defined(__clang__)
+  __builtin_cpu_init();
+  if (__builtin_cpu_supports("amx-int8")) return Isa::Amx;
+  if (__builtin_cpu_supports("avx512vnni")) return Isa::Avx512Vnni;
+  if (__builtin_cpu_supports("avx512f")) return Isa::Avx512;
+  if (__builtin_cpu_supports("avx2")) return Isa::Avx2;
+#endif
+  return Isa::Ref;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  return Isa::Neon;
+#else
+  return Isa::Ref;
+#endif
+}
+
+}  // namespace
+
+Isa HostIsa() {
+  static const Isa cached = DetectHostIsa();
+  return cached;
+}
+
+std::string_view IsaToString(Isa isa) {
+  switch (isa) {
+    case Isa::Ref:
+      return "ref";
+    case Isa::Neon:
+      return "neon";
+    case Isa::Avx2:
+      return "avx2";
+    case Isa::Avx512:
+      return "avx512";
+    case Isa::Avx512Vnni:
+      return "avx512vnni";
+    case Isa::Amx:
+      return "amx";
+  }
+  return "ref";
+}
+
+std::optional<Isa> StringToIsa(std::string_view s) {
+  if (s == "ref") return Isa::Ref;
+  if (s == "neon") return Isa::Neon;
+  if (s == "avx2") return Isa::Avx2;
+  if (s == "avx512") return Isa::Avx512;
+  if (s == "avx512vnni") return Isa::Avx512Vnni;
+  if (s == "amx") return Isa::Amx;
+  return std::nullopt;
+}
+
+Isa CurrentIsa() {
+  if (const char* env = std::getenv("ESM_FORCE_ISA"); env && *env != '\0') {
+    if (auto parsed = StringToIsa(env)) return *parsed;
+  }
+  return HostIsa();
+}
+
+void MaybeLogIsaOnce() {
+  static std::once_flag flag;
+  std::call_once(flag, [] {
+    const char* env = std::getenv("ESM_LOG_ISA");
+    if (env == nullptr) return;
+    if (std::string_view(env) != "1") return;
+    const auto name = IsaToString(CurrentIsa());
+    std::fprintf(stderr, "esm.cpp: ISA = %.*s\n", static_cast<int>(name.size()),
+                 name.data());
+  });
+}
+
+}  // namespace esm

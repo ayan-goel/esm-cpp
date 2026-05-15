@@ -44,6 +44,7 @@ add_library(esm_cpp_core STATIC
   src/status.cpp
   src/tokenizer.cpp
   src/io/safetensors.cpp
+  src/kernels/cpu_features.cpp
   src/kernels/gemm_fp32.cpp
   src/kernels/layernorm.cpp
   src/kernels/gelu.cpp
