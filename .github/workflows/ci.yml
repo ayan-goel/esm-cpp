@@ -37,8 +37,21 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} $SANITIZER_FLAG
       - name: Build
         run: cmake --build build -j
-      - name: Test
+      - name: Test (host ISA)
+        env:
+          ESM_LOG_ISA: "1"
         run: ctest --test-dir build --output-on-failure
+      - name: Test (forced ref ISA)
+        env:
+          ESM_FORCE_ISA: ref
+          ESM_LOG_ISA: "1"
+        run: ctest --test-dir build --output-on-failure -R "Dispatch|CpuFeatures|LinearRef|LayerNormRef|GeluRef|RopeApply|AttentionRef"
+      - name: Test (forced avx512 ISA, x86 only)
+        if: runner.os == 'Linux'
+        env:
+          ESM_FORCE_ISA: avx512
+          ESM_LOG_ISA: "1"
+        run: ctest --test-dir build --output-on-failure -R "Dispatch|CpuFeatures"
 
   python:
     name: Python ${{ matrix.os }}
