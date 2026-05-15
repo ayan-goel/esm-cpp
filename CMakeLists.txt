@@ -33,13 +33,27 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND ESM_SANITIZERS)
   add_link_options(-fsanitize=address,undefined)
 endif()
 
+include(FetchContent)
+FetchContent_Declare(nlohmann_json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG v3.11.3)
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+FetchContent_MakeAvailable(nlohmann_json)
+
 add_library(esm_cpp_core STATIC
   src/status.cpp
   src/tokenizer.cpp
+  src/io/safetensors.cpp
+  src/kernels/gemm_fp32.cpp
+  src/kernels/layernorm.cpp
+  src/kernels/gelu.cpp
+  src/kernels/rope.cpp
+  src/kernels/attention.cpp
+  src/model.cpp
 )
 target_include_directories(esm_cpp_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-target_link_libraries(esm_cpp_core PRIVATE esm_warnings)
+target_link_libraries(esm_cpp_core PRIVATE esm_warnings nlohmann_json::nlohmann_json)
 target_compile_features(esm_cpp_core PUBLIC cxx_std_20)
 
 if(ESM_BUILD_TESTS)

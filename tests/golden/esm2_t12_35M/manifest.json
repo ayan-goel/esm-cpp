@@ -1,0 +1,34 @@
+{
+  "model_short": "esm2_t12_35M",
+  "model_hf_id": "facebook/esm2_t12_35M_UR50D",
+  "num_sequences": 100,
+  "seed": 0,
+  "sequence_length_range": [
+    50,
+    300
+  ],
+  "transformers_version": "4.57.6",
+  "torch_version": "2.2.2",
+  "numpy_version": "1.26.4",
+  "captured_at_utc": "2026-05-15T19:37:36.112204Z",
+  "config": {
+    "num_hidden_layers": 12,
+    "hidden_size": 480,
+    "num_attention_heads": 20,
+    "intermediate_size": 1920,
+    "vocab_size": 33,
+    "layer_norm_eps": 1e-05,
+    "token_dropout": true,
+    "mask_token_id": 32,
+    "emb_layer_norm_before": false,
+    "position_embedding_type": "rotary"
+  },
+  "fields": {
+    "sequence": "str",
+    "input_ids": "int32 [L]",
+    "attention_mask": "int32 [L]",
+    "hidden_state_<i>": "float32 [L, 480] for i in [0, 12]; 0=post-embed, num_layers=post-final-LN",
+    "logits": "float32 [L, 33]",
+    "layer0_*": "layer-0 debug intermediates for bisecting forward-graph bugs"
+  }
+}
