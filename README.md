@@ -46,7 +46,3 @@ Batched scoring on mixed-length inputs uses a `cu_seqlens` packed layout to avoi
 ```python
 logits, cu_seqlens = model.forward_batch(sequences)
 ```
-
-## License
-
-Apache-2.0.

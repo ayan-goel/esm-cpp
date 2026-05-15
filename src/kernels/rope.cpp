@@ -4,6 +4,9 @@
 
 namespace esm::kernels {
 
+// Table builder is pure scalar and always linked (not behind ESM_KERNEL_REFERENCE).
+// SIMD impls reuse the same cos/sin tables.
+//
 // inv_freq[i] = 1 / 10000^(2i/head_dim) for i in [0, head_dim/2)
 // Tables are duplicated half/half so cos[t, j] = cos[t, j + half] for
 // j < half. This matches HF's torch.cat((freqs, freqs), dim=-1).
@@ -24,11 +27,13 @@ void RopeBuildTables(int seq_len, int head_dim, float* cos, float* sin) {
   }
 }
 
+#ifdef ESM_KERNEL_REFERENCE
+
 // rotate_half(x) = cat(-x_second_half, x_first_half) along the last dim.
 // apply_rotary_pos_emb(x, cos, sin) = x * cos + rotate_half(x) * sin
 // We do this in-place on x for all heads.
-void RopeApplyInplace(float* x, const float* cos, const float* sin,
-                      int num_heads, int seq_len, int head_dim) {
+void RopeApplyInplaceRef(float* x, const float* cos, const float* sin,
+                         int num_heads, int seq_len, int head_dim) {
   const int half = head_dim / 2;
   for (int h = 0; h < num_heads; ++h) {
     for (int t = 0; t < seq_len; ++t) {
@@ -44,5 +49,7 @@ void RopeApplyInplace(float* x, const float* cos, const float* sin,
     }
   }
 }
+
+#endif  // ESM_KERNEL_REFERENCE
 
 }  // namespace esm::kernels

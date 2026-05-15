@@ -45,6 +45,7 @@ add_library(esm_cpp_core STATIC
   src/tokenizer.cpp
   src/io/safetensors.cpp
   src/kernels/cpu_features.cpp
+  src/kernels/dispatch.cpp
   src/kernels/gemm_fp32.cpp
   src/kernels/layernorm.cpp
   src/kernels/gelu.cpp
@@ -56,6 +57,9 @@ target_include_directories(esm_cpp_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_link_libraries(esm_cpp_core PRIVATE esm_warnings nlohmann_json::nlohmann_json)
 target_compile_features(esm_cpp_core PUBLIC cxx_std_20)
+# Slice 1.3: the *Ref scalar impls live behind ESM_KERNEL_REFERENCE so the
+# same .cpp can be re-compiled as a SIMD TU later (Slice 1.4 splits TUs).
+target_compile_definitions(esm_cpp_core PRIVATE ESM_KERNEL_REFERENCE)
 
 if(ESM_BUILD_TESTS)
   include(FetchContent)

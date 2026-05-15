@@ -8,6 +8,8 @@
 
 namespace esm::kernels {
 
+#ifdef ESM_KERNEL_REFERENCE
+
 // Scaled-dot self-attention; Q must already be scaled by 1/sqrt(head_dim)
 // per the ESM convention (scale before RoPE, not the score after).
 //   Q, K, V: [num_heads, seq_len, head_dim]
@@ -58,5 +60,7 @@ void AttentionRef(const float* Q, const float* K, const float* V,
     }
   }
 }
+
+#endif  // ESM_KERNEL_REFERENCE
 
 }  // namespace esm::kernels

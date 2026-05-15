@@ -2,6 +2,8 @@
 
 namespace esm::kernels {
 
+#ifdef ESM_KERNEL_REFERENCE
+
 void LinearRef(const float* A, const float* W, const float* bias, float* C,
                int M, int N, int K) {
   for (int m = 0; m < M; ++m) {
@@ -16,5 +18,7 @@ void LinearRef(const float* A, const float* W, const float* bias, float* C,
     }
   }
 }
+
+#endif  // ESM_KERNEL_REFERENCE
 
 }  // namespace esm::kernels

@@ -107,7 +107,7 @@ TEST(RopeApplyInplace, IdentityAtPositionZero) {
   std::vector<float> x = {1.0f, 2.0f, 3.0f, 4.0f};
   std::vector<float> cos(L * dh), sin(L * dh);
   esm::kernels::RopeBuildTables(L, dh, cos.data(), sin.data());
-  esm::kernels::RopeApplyInplace(x.data(), cos.data(), sin.data(), H, L, dh);
+  esm::kernels::RopeApplyInplaceRef(x.data(), cos.data(), sin.data(), H, L, dh);
   EXPECT_NEAR(x[0], 1.0f, 1e-6f);
   EXPECT_NEAR(x[1], 2.0f, 1e-6f);
   EXPECT_NEAR(x[2], 3.0f, 1e-6f);
@@ -130,7 +130,7 @@ TEST(RopeApplyInplace, HalfThenHalfRotation) {
   std::vector<float> x = {0, 0, 0, 0, 1, 2, 3, 4};  // pos 0 untouched, pos 1 = [1,2,3,4]
   std::vector<float> cos(L * dh), sin(L * dh);
   esm::kernels::RopeBuildTables(L, dh, cos.data(), sin.data());
-  esm::kernels::RopeApplyInplace(x.data(), cos.data(), sin.data(), H, L, dh);
+  esm::kernels::RopeApplyInplaceRef(x.data(), cos.data(), sin.data(), H, L, dh);
   float c1 = std::cos(1.0f), s1 = std::sin(1.0f);
   float c01 = std::cos(0.01f), s01 = std::sin(0.01f);
   EXPECT_NEAR(x[4], 1.0f * c1 + (-3.0f) * s1, 1e-5f);

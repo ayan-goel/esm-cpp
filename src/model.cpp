@@ -204,16 +204,16 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w,
   const int* mask_ptr = attention_mask.empty() ? nullptr : attention_mask.data();
 
   // Pre-attention LayerNorm on `hidden` -> scratch_ln
-  kernels::LayerNormRef(hidden, w.attn_ln_w.data(), w.attn_ln_b.data(),
+  kernels::LayerNorm(hidden, w.attn_ln_w.data(), w.attn_ln_b.data(),
                         cfg.layer_norm_eps, scratch_ln, L, d);
 
   // Q, K, V projections: each is a Linear from [L, d] to [L, d].
   // Reuse scratch_qkv_flat in three chunks back-to-back: q | k | v.
-  kernels::LinearRef(scratch_ln, w.q_w.data(), w.q_b.data(),
+  kernels::Linear(scratch_ln, w.q_w.data(), w.q_b.data(),
                      scratch_qkv_flat, L, d, d);
-  kernels::LinearRef(scratch_ln, w.k_w.data(), w.k_b.data(),
+  kernels::Linear(scratch_ln, w.k_w.data(), w.k_b.data(),
                      scratch_qkv_flat + static_cast<long>(L) * d, L, d, d);
-  kernels::LinearRef(scratch_ln, w.v_w.data(), w.v_b.data(),
+  kernels::Linear(scratch_ln, w.v_w.data(), w.v_b.data(),
                      scratch_qkv_flat + 2L * L * d, L, d, d);
 
   // Reshape into [H, L, head_dim].
@@ -233,11 +233,11 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w,
   kernels::RopeApplyInplace(scratch_k_heads, scratch_cos, scratch_sin, H, L, dh);
 
   // Self-attention. Output is [L, H*dh] = [L, d] in heads-concatenated layout.
-  kernels::AttentionRef(scratch_q_heads, scratch_k_heads, scratch_v_heads,
+  kernels::Attention(scratch_q_heads, scratch_k_heads, scratch_v_heads,
                         mask_ptr, scratch_attn_out, H, L, dh);
 
   // out_proj
-  kernels::LinearRef(scratch_attn_out, w.out_w.data(), w.out_b.data(),
+  kernels::Linear(scratch_attn_out, w.out_w.data(), w.out_b.data(),
                      scratch_attn_proj, L, d, d);
 
   // Residual: hidden += attn_proj
@@ -246,17 +246,17 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w,
   }
 
   // Pre-FFN LayerNorm on `hidden` -> scratch_ln
-  kernels::LayerNormRef(hidden, w.ffn_ln_w.data(), w.ffn_ln_b.data(),
+  kernels::LayerNorm(hidden, w.ffn_ln_w.data(), w.ffn_ln_b.data(),
                         cfg.layer_norm_eps, scratch_ln, L, d);
 
   // fc1: [L, d] -> [L, 4d]
-  kernels::LinearRef(scratch_ln, w.fc1_w.data(), w.fc1_b.data(),
+  kernels::Linear(scratch_ln, w.fc1_w.data(), w.fc1_b.data(),
                      scratch_inter, L, ffn, d);
   // GELU
-  kernels::GeluRef(scratch_inter, scratch_inter_gelu,
+  kernels::Gelu(scratch_inter, scratch_inter_gelu,
                    static_cast<std::size_t>(L) * ffn);
   // fc2: [L, 4d] -> [L, d]
-  kernels::LinearRef(scratch_inter_gelu, w.fc2_w.data(), w.fc2_b.data(),
+  kernels::Linear(scratch_inter_gelu, w.fc2_w.data(), w.fc2_b.data(),
                      scratch_ffn_out, L, d, ffn);
 
   // Residual: hidden += ffn_out
@@ -326,7 +326,7 @@ std::vector<float> Model::ForwardWithHiddenStates(
   // Final encoder LayerNorm (= HF emb_layer_norm_after); produces the
   // hidden state that lm_head consumes.
   std::vector<float> final_ln(static_cast<std::size_t>(L) * d);
-  kernels::LayerNormRef(hidden.data(), final_ln_w_.data(), final_ln_b_.data(),
+  kernels::LayerNorm(hidden.data(), final_ln_w_.data(), final_ln_b_.data(),
                         cfg_.layer_norm_eps, final_ln.data(), L, d);
   if (hidden_states_out) {
     // Replace the last entry (which mirrored the pre-LN output) with the
@@ -336,20 +336,20 @@ std::vector<float> Model::ForwardWithHiddenStates(
 
   // lm_head: dense -> gelu -> layer_norm -> tied decoder + bias.
   std::vector<float> lm_dense(static_cast<std::size_t>(L) * d);
-  kernels::LinearRef(final_ln.data(), lm_dense_w_.data(), lm_dense_b_.data(),
+  kernels::Linear(final_ln.data(), lm_dense_w_.data(), lm_dense_b_.data(),
                      lm_dense.data(), L, d, d);
   std::vector<float> lm_gelu(static_cast<std::size_t>(L) * d);
-  kernels::GeluRef(lm_dense.data(), lm_gelu.data(),
+  kernels::Gelu(lm_dense.data(), lm_gelu.data(),
                    static_cast<std::size_t>(L) * d);
   std::vector<float> lm_ln(static_cast<std::size_t>(L) * d);
-  kernels::LayerNormRef(lm_gelu.data(), lm_ln_w_.data(), lm_ln_b_.data(),
+  kernels::LayerNorm(lm_gelu.data(), lm_ln_w_.data(), lm_ln_b_.data(),
                         cfg_.layer_norm_eps, lm_ln.data(), L, d);
 
   // Tied decoder: logits = lm_ln @ embed^T + lm_head.bias.
   // embed_ has shape [V, d] (out=V, in=d), which is exactly the layout
   // LinearRef expects for W [N=V, K=d].
   std::vector<float> logits(static_cast<std::size_t>(L) * V);
-  kernels::LinearRef(lm_ln.data(), embed_.data(), lm_decoder_bias_.data(),
+  kernels::Linear(lm_ln.data(), embed_.data(), lm_decoder_bias_.data(),
                      logits.data(), L, V, d);
   return logits;
 }

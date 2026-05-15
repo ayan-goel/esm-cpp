@@ -4,6 +4,8 @@
 
 namespace esm::kernels {
 
+#ifdef ESM_KERNEL_REFERENCE
+
 void LayerNormRef(const float* x, const float* gamma, const float* beta,
                   float eps, float* out, int num_rows, int d) {
   for (int r = 0; r < num_rows; ++r) {
@@ -25,5 +27,7 @@ void LayerNormRef(const float* x, const float* gamma, const float* beta,
     }
   }
 }
+
+#endif  // ESM_KERNEL_REFERENCE
 
 }  // namespace esm::kernels
