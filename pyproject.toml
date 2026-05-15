@@ -1,0 +1,46 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.13"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "esm-cpp"
+version = "0.1.0"
+description = "CPU-first C++ inference engine for ESM-2 protein language models"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "esm.cpp contributors" }]
+dependencies = [
+  "numpy>=1.24,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "torch>=2.2",
+  # HF transformers pin for golden capture; bump in lockstep with regenerated goldens.
+  "transformers>=4.49,<5",
+  "safetensors>=0.4",
+  "ruff",
+  "mypy",
+  "pybind11>=2.13",
+]
+
+[tool.scikit-build]
+cmake.version = ">=3.20"
+cmake.args = ["-DESM_BUILD_PYTHON=ON", "-DESM_BUILD_TESTS=OFF"]
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["python/esm_cpp"]
+minimum-version = "build-system.requires"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+files = ["python/esm_cpp"]
