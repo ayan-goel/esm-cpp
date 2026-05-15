@@ -100,6 +100,7 @@ add_library(esm_cpp_core STATIC
   src/kernels/cpu_features.cpp
   src/kernels/dispatch.cpp
   src/kernels/rope_tables.cpp
+  src/threading/thread_pool.cpp
   src/model.cpp
 )
 target_include_directories(esm_cpp_core PUBLIC

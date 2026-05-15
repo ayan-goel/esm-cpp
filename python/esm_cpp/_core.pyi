@@ -37,6 +37,7 @@ class Config:
     mask_token_id: int
 
 class Model:
+    num_threads: int
     @property
     def config(self) -> Config: ...
     @property
@@ -53,3 +54,8 @@ class Model:
         input_ids: npt.NDArray[np.int32],
         attention_mask: npt.NDArray[np.int32] | None = None,
     ) -> tuple[npt.NDArray[np.float32], list[npt.NDArray[np.float32]]]: ...
+    def forward_batch(
+        self,
+        input_ids: list[npt.NDArray[np.int32]],
+        attention_masks: list[npt.NDArray[np.int32]] | None = None,
+    ) -> list[npt.NDArray[np.float32]]: ...

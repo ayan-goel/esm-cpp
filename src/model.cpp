@@ -259,13 +259,26 @@ std::vector<float> Model::ForwardWithHiddenStates(
     std::span<const int32_t> input_ids,
     std::span<const int32_t> attention_mask,
     std::vector<std::vector<float>>* hidden_states_out) const {
+  std::vector<float> logits;
+  ForwardInto(input_ids, attention_mask, ws_, &logits, hidden_states_out);
+  return logits;
+}
+
+void Model::ForwardInto(
+    std::span<const std::int32_t> input_ids,
+    std::span<const std::int32_t> attention_mask, Workspace& ws,
+    std::vector<float>* logits_out,
+    std::vector<std::vector<float>>* hidden_states_out) const {
   const int L = static_cast<int>(input_ids.size());
   const int d = cfg_.hidden_size;
   const int H = cfg_.num_attention_heads;
   const int dh = cfg_.head_dim;
   const int ffn = cfg_.intermediate_size;
   const int V = cfg_.vocab_size;
-  if (L == 0) return {};
+  if (L == 0) {
+    if (logits_out) logits_out->clear();
+    return;
+  }
 
   if (!attention_mask.empty() &&
       attention_mask.size() != input_ids.size()) {
@@ -274,7 +287,7 @@ std::vector<float> Model::ForwardWithHiddenStates(
 
   // RAII activation: rewinds the arena cursor at entry and flags the
   // workspace in-use for the duration of the forward.
-  auto ws_guard = ws_.activate();
+  auto ws_guard = ws.activate();
 
   const std::size_t L_sz = static_cast<std::size_t>(L);
   const std::size_t Ld = L_sz * static_cast<std::size_t>(d);
@@ -297,9 +310,9 @@ std::vector<float> Model::ForwardWithHiddenStates(
   //         slack per allocation covers Workspace::AlignUp padding.
   const std::size_t scratch_floats = 20 * Ld + 2 * Ldh;
   const std::size_t alignment_slack = 14 * 64;
-  ws_.reserve(scratch_floats * sizeof(float) + alignment_slack);
+  ws.reserve(scratch_floats * sizeof(float) + alignment_slack);
 
-  float* hidden = ws_.allocate<float>(Ld);
+  float* hidden = ws.allocate<float>(Ld);
   Embed(cfg_, embed_.data(), input_ids, attention_mask, hidden);
 
   if (hidden_states_out) {
@@ -308,15 +321,15 @@ std::vector<float> Model::ForwardWithHiddenStates(
     hidden_states_out->emplace_back(hidden, hidden + Ld);
   }
 
-  float* scratch_ln = ws_.allocate<float>(Ld);
-  float* scratch_qkv_flat = ws_.allocate<float>(L3d);
-  float* scratch_cos = ws_.allocate<float>(Ldh);
-  float* scratch_sin = ws_.allocate<float>(Ldh);
-  float* scratch_attn_out = ws_.allocate<float>(Ld);
-  float* scratch_attn_proj = ws_.allocate<float>(Ld);
-  float* scratch_inter = ws_.allocate<float>(Lffn);
-  float* scratch_inter_gelu = ws_.allocate<float>(Lffn);
-  float* scratch_ffn_out = ws_.allocate<float>(Ld);
+  float* scratch_ln = ws.allocate<float>(Ld);
+  float* scratch_qkv_flat = ws.allocate<float>(L3d);
+  float* scratch_cos = ws.allocate<float>(Ldh);
+  float* scratch_sin = ws.allocate<float>(Ldh);
+  float* scratch_attn_out = ws.allocate<float>(Ld);
+  float* scratch_attn_proj = ws.allocate<float>(Ld);
+  float* scratch_inter = ws.allocate<float>(Lffn);
+  float* scratch_inter_gelu = ws.allocate<float>(Lffn);
+  float* scratch_ffn_out = ws.allocate<float>(Ld);
 
   // B=1 cu_seqlens for the Phase 1 single-sequence path. Phase 3 scheduler
   // will pack multiple sequences with cu_seqlens = {0, L_0, L_0+L_1, ...}.
@@ -335,7 +348,7 @@ std::vector<float> Model::ForwardWithHiddenStates(
 
   // Final encoder LayerNorm (= HF emb_layer_norm_after); produces the
   // hidden state that lm_head consumes.
-  float* final_ln = ws_.allocate<float>(Ld);
+  float* final_ln = ws.allocate<float>(Ld);
   kernels::LayerNorm(hidden, final_ln_w_.data(), final_ln_b_.data(),
                      cfg_.layer_norm_eps, final_ln, L, d);
   if (hidden_states_out) {
@@ -345,12 +358,12 @@ std::vector<float> Model::ForwardWithHiddenStates(
   }
 
   // lm_head: dense -> gelu -> layer_norm -> tied decoder + bias.
-  float* lm_dense = ws_.allocate<float>(Ld);
+  float* lm_dense = ws.allocate<float>(Ld);
   kernels::Linear(final_ln, lm_dense_w_.data(), lm_dense_b_.data(), lm_dense,
                   L, d, d);
-  float* lm_gelu = ws_.allocate<float>(Ld);
+  float* lm_gelu = ws.allocate<float>(Ld);
   kernels::Gelu(lm_dense, lm_gelu, Ld);
-  float* lm_ln = ws_.allocate<float>(Ld);
+  float* lm_ln = ws.allocate<float>(Ld);
   kernels::LayerNorm(lm_gelu, lm_ln_w_.data(), lm_ln_b_.data(),
                      cfg_.layer_norm_eps, lm_ln, L, d);
 
@@ -358,10 +371,49 @@ std::vector<float> Model::ForwardWithHiddenStates(
   // embed_ has shape [V, d] (out=V, in=d), which is exactly the layout
   // Linear expects for W [N=V, K=d]. The output vector is the caller-visible
   // boundary alloc; everything above is in the arena.
-  std::vector<float> logits(LV);
-  kernels::Linear(lm_ln, embed_.data(), lm_decoder_bias_.data(), logits.data(),
-                  L, V, d);
-  return logits;
+  if (logits_out) {
+    logits_out->resize(LV);
+    kernels::Linear(lm_ln, embed_.data(), lm_decoder_bias_.data(),
+                    logits_out->data(), L, V, d);
+  }
 }
+
+// Process-global thread pool. Lazy-init on first call (Model::load
+// triggers it). Sized from ESM_NUM_THREADS at first construction; later
+// env-var changes are not honored.
+ThreadPool& GlobalPool() {
+  static ThreadPool pool = ThreadPool::FromEnv();
+  return pool;
+}
+
+namespace {
+// Thread-local Workspace owned by each pool worker. Re-used across
+// every ForwardInto call from the same worker; sized on first call.
+thread_local Workspace tls_batch_workspace;
+}  // namespace
+
+std::vector<std::vector<float>> Model::ForwardBatch(
+    const std::vector<std::vector<std::int32_t>>& input_ids,
+    const std::vector<std::vector<std::int32_t>>& attention_masks) const {
+  const int B = static_cast<int>(input_ids.size());
+  if (B == 0) return {};
+  if (!attention_masks.empty() && attention_masks.size() != input_ids.size()) {
+    throw std::runtime_error("attention_masks/input_ids batch size mismatch");
+  }
+  std::vector<std::vector<float>> outputs(static_cast<std::size_t>(B));
+  GlobalPool().parallel_for(0, B, /*grain=*/1, [&](int begin, int end) {
+    for (int b = begin; b < end; ++b) {
+      std::span<const std::int32_t> ids(input_ids[b]);
+      std::span<const std::int32_t> mask =
+          attention_masks.empty()
+              ? std::span<const std::int32_t>{}
+              : std::span<const std::int32_t>(attention_masks[b]);
+      ForwardInto(ids, mask, tls_batch_workspace, &outputs[b], nullptr);
+    }
+  });
+  return outputs;
+}
+
+std::size_t Model::num_threads() { return GlobalPool().size(); }
 
 }  // namespace esm

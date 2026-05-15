@@ -137,6 +137,68 @@ PYBIND11_MODULE(_core, m) {
                               "After the first forward at a given seq_len, this "
                               "should stay constant on subsequent calls at the "
                               "same length (zero-alloc inner loop).")
+      .def_property_readonly_static(
+          "num_threads",
+          [](const py::object&) { return esm::Model::num_threads(); },
+          "Size of the process-global thread pool, sized from "
+          "ESM_NUM_THREADS at first model load (default physical-core count).")
+      .def(
+          "forward_batch",
+          [](const esm::Model& self, const std::vector<py::array_t<
+                                          std::int32_t,
+                                          py::array::c_style |
+                                              py::array::forcecast>>& batch_ids,
+             py::object batch_masks) {
+            std::vector<std::vector<std::int32_t>> ids_vec;
+            ids_vec.reserve(batch_ids.size());
+            for (const auto& arr : batch_ids) {
+              if (arr.ndim() != 1) {
+                throw std::invalid_argument(
+                    "each input_ids entry must be a 1-D int32 array");
+              }
+              ids_vec.emplace_back(arr.data(), arr.data() + arr.shape(0));
+            }
+            std::vector<std::vector<std::int32_t>> masks_vec;
+            if (!batch_masks.is_none()) {
+              auto py_masks = py::cast<std::vector<py::array_t<
+                  std::int32_t,
+                  py::array::c_style | py::array::forcecast>>>(batch_masks);
+              if (py_masks.size() != batch_ids.size()) {
+                throw std::invalid_argument(
+                    "attention_masks length must match input_ids length");
+              }
+              masks_vec.reserve(py_masks.size());
+              for (std::size_t i = 0; i < py_masks.size(); ++i) {
+                if (py_masks[i].ndim() != 1 ||
+                    py_masks[i].shape(0) != batch_ids[i].shape(0)) {
+                  throw std::invalid_argument(
+                      "attention_mask[i] must be a 1-D int32 array of the "
+                      "same length as input_ids[i]");
+                }
+                masks_vec.emplace_back(py_masks[i].data(),
+                                       py_masks[i].data() + py_masks[i].shape(0));
+              }
+            }
+            std::vector<std::vector<float>> outputs;
+            {
+              py::gil_scoped_release release;
+              outputs = self.ForwardBatch(ids_vec, masks_vec);
+            }
+            const auto V = static_cast<py::ssize_t>(self.config().vocab_size);
+            py::list result;
+            for (std::size_t b = 0; b < outputs.size(); ++b) {
+              const auto L = static_cast<py::ssize_t>(ids_vec[b].size());
+              py::array_t<float> arr({L, V});
+              std::memcpy(arr.mutable_data(), outputs[b].data(),
+                          outputs[b].size() * sizeof(float));
+              result.append(std::move(arr));
+            }
+            return result;
+          },
+          py::arg("input_ids"), py::arg("attention_masks") = py::none(),
+          "Run a batch of sequences in parallel across the process-global "
+          "thread pool. Returns a list of [seq_len, vocab_size] logit "
+          "arrays. Each sequence may have a different length.")
       .def(
           "forward",
           [](const esm::Model& self,

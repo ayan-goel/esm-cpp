@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "esm_cpp/thread_pool.h"
 #include "esm_cpp/workspace.h"
 
 namespace esm {
@@ -72,8 +73,29 @@ class Model {
   // capacity should stay constant on subsequent calls at the same length.
   std::size_t workspace_capacity_bytes() const { return ws_.bytes_capacity(); }
 
+  // Run a batch of independent sequences in parallel. Each sequence runs
+  // through its own Workspace from a per-thread pool; the dispatch axis
+  // is the batch dimension. Phase 3's cu_seqlens scheduler will replace
+  // this with packed-batch attention; until then each sequence pays its
+  // own arena setup but multiple sequences run concurrently.
+  std::vector<std::vector<float>> ForwardBatch(
+      const std::vector<std::vector<std::int32_t>>& input_ids,
+      const std::vector<std::vector<std::int32_t>>& attention_masks) const;
+
+  // Number of threads used by ForwardBatch (process-global pool sized
+  // from ESM_NUM_THREADS at first Model::load, default physical-core).
+  static std::size_t num_threads();
+
  private:
   Model() = default;
+  // Forward implementation that lets the caller supply the per-call
+  // workspace and logits buffer. Forward() / ForwardWithHiddenStates()
+  // are the public single-sequence wrappers around this.
+  void ForwardInto(
+      std::span<const std::int32_t> input_ids,
+      std::span<const std::int32_t> attention_mask, Workspace& ws,
+      std::vector<float>* logits_out,
+      std::vector<std::vector<float>>* hidden_states_out) const;
 
   Config cfg_{};
   std::vector<float> embed_;            // [vocab_size, hidden_size]
