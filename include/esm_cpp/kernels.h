@@ -2,6 +2,8 @@
 
 #include <cstddef>
 
+#include "esm_cpp/quant.h"
+
 namespace esm::kernels {
 
 // Public entry points dispatch on esm::CurrentIsa() to the registered
@@ -35,6 +37,14 @@ void Attention(const float* Q, const float* K, const float* V,
 
 void LinearRef(const float* A, const float* W, const float* bias, float* C,
                int M, int N, int K);
+
+// W8A16 Linear with per-channel symmetric INT8 weights and FP32
+// activations. Slice 6 will add LinearVnni (W8A8) on top of this
+// using the same per-channel scale convention.
+void LinearInt8Ref(const float* A, const esm::quant::QuantizedTensor& W,
+                   const float* bias, float* C, int M, int N, int K);
+void LinearInt8(const float* A, const esm::quant::QuantizedTensor& W,
+                const float* bias, float* C, int M, int N, int K);
 
 void LayerNormRef(const float* x, const float* gamma, const float* beta,
                   float eps, float* out, int num_rows, int d);

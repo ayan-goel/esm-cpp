@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "esm_cpp/quant.h"
 #include "esm_cpp/thread_pool.h"
 #include "esm_cpp/workspace.h"
 
@@ -21,6 +22,10 @@ struct Config {
   float layer_norm_eps;
   bool token_dropout;
   int mask_token_id;
+  // Phase 2: when true, the per-layer Linear projections route through
+  // LinearInt8 using the INT8 weight tensors populated on each
+  // LayerWeights. Set by Model::QuantizeWeights; default false.
+  bool weights_quantized = false;
 };
 
 struct LayerWeights {
@@ -36,6 +41,12 @@ struct LayerWeights {
   // FFN: fc1 [4d, d], fc2 [d, 4d].
   std::vector<float> fc1_w, fc1_b;
   std::vector<float> fc2_w, fc2_b;
+
+  // Phase 2: per-channel INT8 versions, populated by Model::QuantizeWeights.
+  // When the parent Config's weights_quantized is true, the forward path
+  // reads these instead of the FP32 vectors above. Biases stay FP32.
+  esm::quant::QuantizedTensor q_w_int8, k_w_int8, v_w_int8;
+  esm::quant::QuantizedTensor out_w_int8, fc1_w_int8, fc2_w_int8;
 };
 
 // Forward output. `hidden_states` semantics match HF EsmModel:
@@ -85,6 +96,13 @@ class Model {
   // Number of threads used by ForwardBatch (process-global pool sized
   // from ESM_NUM_THREADS at first Model::load, default physical-core).
   static std::size_t num_threads();
+
+  // Phase 2: quantize every per-layer Linear weight in place to
+  // per-channel symmetric INT8 and flag the model as quantized.
+  // Biases stay FP32; lm_head stays FP32 (Slice 5 escape list).
+  // After this call, Forward / ForwardBatch route the per-layer
+  // projections through LinearInt8 instead of Linear.
+  void QuantizeWeights();
 
  private:
   Model() = default;

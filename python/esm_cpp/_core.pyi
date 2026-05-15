@@ -38,6 +38,7 @@ class Config:
     layer_norm_eps: float
     token_dropout: bool
     mask_token_id: int
+    weights_quantized: bool
 
 class Model:
     num_threads: int
@@ -47,6 +48,7 @@ class Model:
     def workspace_capacity_bytes(self) -> int: ...
     @staticmethod
     def load_from_safetensors(path: str) -> Model: ...
+    def quantize_weights(self) -> None: ...
     def forward(
         self,
         input_ids: npt.NDArray[np.int32],

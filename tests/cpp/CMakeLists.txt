@@ -8,6 +8,7 @@ add_executable(esm_cpp_tests
   test_gemm_shapes.cpp
   test_attention_varlen.cpp
   test_thread_pool.cpp
+  test_quant.cpp
 )
 target_link_libraries(esm_cpp_tests PRIVATE
   esm_cpp_core

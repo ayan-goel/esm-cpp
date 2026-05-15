@@ -48,6 +48,7 @@ FetchContent_MakeAvailable(nlohmann_json)
 # is forbidden — flag isolation lives at the TU level, here.
 set(ESM_KERNEL_SOURCES
   src/kernels/gemm_fp32.cpp
+  src/kernels/gemm_int8.cpp
   src/kernels/layernorm.cpp
   src/kernels/gelu.cpp
   src/kernels/rope.cpp
@@ -100,6 +101,7 @@ add_library(esm_cpp_core STATIC
   src/kernels/cpu_features.cpp
   src/kernels/dispatch.cpp
   src/kernels/rope_tables.cpp
+  src/quant/pack.cpp
   src/threading/thread_pool.cpp
   src/model.cpp
 )

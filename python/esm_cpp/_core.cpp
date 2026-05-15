@@ -134,12 +134,18 @@ PYBIND11_MODULE(_core, m) {
       .def_readonly("vocab_size", &esm::Config::vocab_size)
       .def_readonly("layer_norm_eps", &esm::Config::layer_norm_eps)
       .def_readonly("token_dropout", &esm::Config::token_dropout)
-      .def_readonly("mask_token_id", &esm::Config::mask_token_id);
+      .def_readonly("mask_token_id", &esm::Config::mask_token_id)
+      .def_readonly("weights_quantized", &esm::Config::weights_quantized);
 
   py::class_<esm::Model>(m, "Model")
       .def_static("load_from_safetensors", &esm::Model::LoadFromSafetensors,
                   py::arg("path"))
       .def_property_readonly("config", &esm::Model::config)
+      .def("quantize_weights", &esm::Model::QuantizeWeights,
+           "Quantize all per-layer Linear weights in place to per-channel "
+           "symmetric INT8. lm_head stays FP32 (Slice 5 escape list). After "
+           "this call Forward/ForwardBatch route the per-layer projections "
+           "through LinearInt8.")
       .def_property_readonly("workspace_capacity_bytes",
                               &esm::Model::workspace_capacity_bytes,
                               "Bytes the per-forward scratch arena holds. "

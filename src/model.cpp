@@ -179,6 +179,19 @@ void Embed(const Config& cfg, const float* embed_w,
 // Layout helpers: with the cu_seqlens-packed kernels, Q/K/V projections
 // land directly in [L, H, head_dim] (= [L, H*head_dim] in memory). The
 // old SplitHeads memcpy from [L, H*dh] -> [H, L, dh] is gone.
+// Branch helper: route through LinearInt8 when the model is quantized,
+// else the FP32 Linear facade. Centralized so the routing logic lives
+// in one place instead of being duplicated at every projection site.
+inline void LinearProj(const Config& cfg, const float* A, const float* W_fp32,
+                       const esm::quant::QuantizedTensor& W_int8,
+                       const float* bias, float* C, int M, int N, int K) {
+  if (cfg.weights_quantized) {
+    kernels::LinearInt8(A, W_int8, bias, C, M, N, K);
+  } else {
+    kernels::Linear(A, W_fp32, bias, C, M, N, K);
+  }
+}
+
 void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
                       // scratch (all pulled from the per-Model arena)
                       float* scratch_ln, float* scratch_qkv_flat,
@@ -201,9 +214,12 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   float* q_packed = scratch_qkv_flat;
   float* k_packed = scratch_qkv_flat + static_cast<long>(L) * d;
   float* v_packed = scratch_qkv_flat + 2L * L * d;
-  kernels::Linear(scratch_ln, w.q_w.data(), w.q_b.data(), q_packed, L, d, d);
-  kernels::Linear(scratch_ln, w.k_w.data(), w.k_b.data(), k_packed, L, d, d);
-  kernels::Linear(scratch_ln, w.v_w.data(), w.v_b.data(), v_packed, L, d, d);
+  LinearProj(cfg, scratch_ln, w.q_w.data(), w.q_w_int8, w.q_b.data(),
+             q_packed, L, d, d);
+  LinearProj(cfg, scratch_ln, w.k_w.data(), w.k_w_int8, w.k_b.data(),
+             k_packed, L, d, d);
+  LinearProj(cfg, scratch_ln, w.v_w.data(), w.v_w_int8, w.v_b.data(),
+             v_packed, L, d, d);
 
   // Q-scale BEFORE RoPE — ESM's load-bearing quirk; see CLAUDE.md.
   const float q_scale = 1.0f / std::sqrt(static_cast<float>(dh));
@@ -220,8 +236,8 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
                            H, dh, scratch_attn_out);
 
   // out_proj
-  kernels::Linear(scratch_attn_out, w.out_w.data(), w.out_b.data(),
-                  scratch_attn_proj, L, d, d);
+  LinearProj(cfg, scratch_attn_out, w.out_w.data(), w.out_w_int8,
+             w.out_b.data(), scratch_attn_proj, L, d, d);
 
   // Residual: hidden += attn_proj
   for (long i = 0; i < static_cast<long>(L) * d; ++i) {
@@ -233,14 +249,14 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
                      cfg.layer_norm_eps, scratch_ln, L, d);
 
   // fc1: [L, d] -> [L, 4d]
-  kernels::Linear(scratch_ln, w.fc1_w.data(), w.fc1_b.data(), scratch_inter, L,
-                  ffn, d);
+  LinearProj(cfg, scratch_ln, w.fc1_w.data(), w.fc1_w_int8, w.fc1_b.data(),
+             scratch_inter, L, ffn, d);
   // GELU
   kernels::Gelu(scratch_inter, scratch_inter_gelu,
                 static_cast<std::size_t>(L) * ffn);
   // fc2: [L, 4d] -> [L, d]
-  kernels::Linear(scratch_inter_gelu, w.fc2_w.data(), w.fc2_b.data(),
-                  scratch_ffn_out, L, d, ffn);
+  LinearProj(cfg, scratch_inter_gelu, w.fc2_w.data(), w.fc2_w_int8,
+             w.fc2_b.data(), scratch_ffn_out, L, d, ffn);
 
   // Residual: hidden += ffn_out
   for (long i = 0; i < static_cast<long>(L) * d; ++i) {
@@ -415,5 +431,30 @@ std::vector<std::vector<float>> Model::ForwardBatch(
 }
 
 std::size_t Model::num_threads() { return GlobalPool().size(); }
+
+namespace {
+
+void QuantizeLinear(const std::vector<float>& w_fp32, int out_features,
+                    int in_features, esm::quant::QuantizedTensor* out) {
+  esm::quant::Quantize(w_fp32.data(), out_features, in_features, out);
+}
+
+}  // namespace
+
+void Model::QuantizeWeights() {
+  const int d = cfg_.hidden_size;
+  const int ffn = cfg_.intermediate_size;
+  for (auto& w : layers_) {
+    QuantizeLinear(w.q_w, d, d, &w.q_w_int8);
+    QuantizeLinear(w.k_w, d, d, &w.k_w_int8);
+    QuantizeLinear(w.v_w, d, d, &w.v_w_int8);
+    QuantizeLinear(w.out_w, d, d, &w.out_w_int8);
+    QuantizeLinear(w.fc1_w, ffn, d, &w.fc1_w_int8);
+    QuantizeLinear(w.fc2_w, d, ffn, &w.fc2_w_int8);
+  }
+  // lm_head.dense / lm_head.layer_norm stay FP32 (Slice 5 escape list).
+  // The tied lm_head decoder uses embed_, which also stays FP32.
+  cfg_.weights_quantized = true;
+}
 
 }  // namespace esm

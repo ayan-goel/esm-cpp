@@ -39,6 +39,15 @@ void Linear(const float* A, const float* W, const float* bias, float* C,
   }
 }
 
+void LinearInt8(const float* A, const esm::quant::QuantizedTensor& W,
+                const float* bias, float* C, int M, int N, int K) {
+  switch (esm::CurrentIsa()) {
+    // Slice 6 hand-off: AVX-512 VNNI and AMX paths register here.
+    default:
+      return LinearInt8Ref(A, W, bias, C, M, N, K);
+  }
+}
+
 void LayerNorm(const float* x, const float* gamma, const float* beta,
                float eps, float* out, int num_rows, int d) {
   switch (esm::CurrentIsa()) {
