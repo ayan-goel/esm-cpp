@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include <vector>
 
 #include "esm_cpp/thread_pool.h"
@@ -202,6 +204,166 @@ void ComputeRows(const std::uint8_t* a_u8, const std::int8_t* w_packed,
   }
 }
 
+// Goto-style 6 rows × 32 N microkernel. 12 independent zmm s32
+// accumulators (6 rows × 2 N-tiles of 16 lanes each). Two weight loads +
+// 6 broadcasts feed 12 VPDPBUSDs per K=4 step. Sapphire Rapids issues
+// 2 VPDPBUSDs/cycle, so 12 deps spread across 6 cycles fills the FMA
+// pipe — roughly 2× the single-accumulator kernel's throughput on the
+// 650M shapes.
+//
+// M-tail (rows past the last full 6-block) and N-tail (cols past the
+// last full 32-block, including any 16-N remainder) fall through to the
+// 1-row × 16-N kernel above. The 16-N tile layout in packed_vnni is
+// shared between both kernels — we just process two adjacent panels per
+// microkernel invocation.
+inline void Kernel6x32(const std::uint8_t* a_block, const std::int8_t* w_panel0,
+                       const std::int8_t* w_panel1, const float* w_scale,
+                       const std::int32_t* col_sum, const float* bias,
+                       float act_scale, int K, int K_main, float* c_base,
+                       int N) {
+  __m512i a00 = _mm512_setzero_si512(), a01 = _mm512_setzero_si512();
+  __m512i a10 = _mm512_setzero_si512(), a11 = _mm512_setzero_si512();
+  __m512i a20 = _mm512_setzero_si512(), a21 = _mm512_setzero_si512();
+  __m512i a30 = _mm512_setzero_si512(), a31 = _mm512_setzero_si512();
+  __m512i a40 = _mm512_setzero_si512(), a41 = _mm512_setzero_si512();
+  __m512i a50 = _mm512_setzero_si512(), a51 = _mm512_setzero_si512();
+  for (int kb = 0; kb < K_main; kb += 4) {
+    const __m512i w0 = _mm512_loadu_si512(
+        reinterpret_cast<const __m512i*>(w_panel0 + kb * 16));
+    const __m512i w1 = _mm512_loadu_si512(
+        reinterpret_cast<const __m512i*>(w_panel1 + kb * 16));
+    std::uint32_t a0w, a1w, a2w, a3w, a4w, a5w;
+    std::memcpy(&a0w, a_block + 0 * K + kb, 4);
+    std::memcpy(&a1w, a_block + 1 * K + kb, 4);
+    std::memcpy(&a2w, a_block + 2 * K + kb, 4);
+    std::memcpy(&a3w, a_block + 3 * K + kb, 4);
+    std::memcpy(&a4w, a_block + 4 * K + kb, 4);
+    std::memcpy(&a5w, a_block + 5 * K + kb, 4);
+    const __m512i a0 = _mm512_set1_epi32(static_cast<int>(a0w));
+    const __m512i a1 = _mm512_set1_epi32(static_cast<int>(a1w));
+    const __m512i a2 = _mm512_set1_epi32(static_cast<int>(a2w));
+    const __m512i a3 = _mm512_set1_epi32(static_cast<int>(a3w));
+    const __m512i a4 = _mm512_set1_epi32(static_cast<int>(a4w));
+    const __m512i a5 = _mm512_set1_epi32(static_cast<int>(a5w));
+    a00 = _mm512_dpbusd_epi32(a00, a0, w0);
+    a01 = _mm512_dpbusd_epi32(a01, a0, w1);
+    a10 = _mm512_dpbusd_epi32(a10, a1, w0);
+    a11 = _mm512_dpbusd_epi32(a11, a1, w1);
+    a20 = _mm512_dpbusd_epi32(a20, a2, w0);
+    a21 = _mm512_dpbusd_epi32(a21, a2, w1);
+    a30 = _mm512_dpbusd_epi32(a30, a3, w0);
+    a31 = _mm512_dpbusd_epi32(a31, a3, w1);
+    a40 = _mm512_dpbusd_epi32(a40, a4, w0);
+    a41 = _mm512_dpbusd_epi32(a41, a4, w1);
+    a50 = _mm512_dpbusd_epi32(a50, a5, w0);
+    a51 = _mm512_dpbusd_epi32(a51, a5, w1);
+  }
+  // K-tail (K % 4 != 0): one extra VPDPBUSD with zero-point-padded A
+  // bytes so the missing positions contribute nothing after the
+  // -128 * col_sum correction at finalize. Weight panel padding bytes
+  // are already zero from BuildVnniCache.
+  if (K_main < K) {
+    const __m512i w0 = _mm512_loadu_si512(
+        reinterpret_cast<const __m512i*>(w_panel0 + K_main * 16));
+    const __m512i w1 = _mm512_loadu_si512(
+        reinterpret_cast<const __m512i*>(w_panel1 + K_main * 16));
+    alignas(4) std::uint8_t tmp[6][4] = {
+        {128, 128, 128, 128}, {128, 128, 128, 128}, {128, 128, 128, 128},
+        {128, 128, 128, 128}, {128, 128, 128, 128}, {128, 128, 128, 128},
+    };
+    const int k_step = K - K_main;
+    for (int r = 0; r < 6; ++r) {
+      for (int kk = 0; kk < k_step; ++kk) {
+        tmp[r][kk] = a_block[r * K + K_main + kk];
+      }
+    }
+    std::uint32_t a0w, a1w, a2w, a3w, a4w, a5w;
+    std::memcpy(&a0w, tmp[0], 4);
+    std::memcpy(&a1w, tmp[1], 4);
+    std::memcpy(&a2w, tmp[2], 4);
+    std::memcpy(&a3w, tmp[3], 4);
+    std::memcpy(&a4w, tmp[4], 4);
+    std::memcpy(&a5w, tmp[5], 4);
+    const __m512i a0 = _mm512_set1_epi32(static_cast<int>(a0w));
+    const __m512i a1 = _mm512_set1_epi32(static_cast<int>(a1w));
+    const __m512i a2 = _mm512_set1_epi32(static_cast<int>(a2w));
+    const __m512i a3 = _mm512_set1_epi32(static_cast<int>(a3w));
+    const __m512i a4 = _mm512_set1_epi32(static_cast<int>(a4w));
+    const __m512i a5 = _mm512_set1_epi32(static_cast<int>(a5w));
+    a00 = _mm512_dpbusd_epi32(a00, a0, w0);
+    a01 = _mm512_dpbusd_epi32(a01, a0, w1);
+    a10 = _mm512_dpbusd_epi32(a10, a1, w0);
+    a11 = _mm512_dpbusd_epi32(a11, a1, w1);
+    a20 = _mm512_dpbusd_epi32(a20, a2, w0);
+    a21 = _mm512_dpbusd_epi32(a21, a2, w1);
+    a30 = _mm512_dpbusd_epi32(a30, a3, w0);
+    a31 = _mm512_dpbusd_epi32(a31, a3, w1);
+    a40 = _mm512_dpbusd_epi32(a40, a4, w0);
+    a41 = _mm512_dpbusd_epi32(a41, a4, w1);
+    a50 = _mm512_dpbusd_epi32(a50, a5, w0);
+    a51 = _mm512_dpbusd_epi32(a51, a5, w1);
+  }
+  alignas(64) static const float kZeroBias[16] = {0};
+  const float* b0 = bias ? bias : kZeroBias;
+  const float* b1 = bias ? bias + 16 : kZeroBias;
+  FinalizeStore16(a00, col_sum, w_scale, b0, act_scale, c_base + 0 * N);
+  FinalizeStore16(a01, col_sum + 16, w_scale + 16, b1, act_scale,
+                   c_base + 0 * N + 16);
+  FinalizeStore16(a10, col_sum, w_scale, b0, act_scale, c_base + 1 * N);
+  FinalizeStore16(a11, col_sum + 16, w_scale + 16, b1, act_scale,
+                   c_base + 1 * N + 16);
+  FinalizeStore16(a20, col_sum, w_scale, b0, act_scale, c_base + 2 * N);
+  FinalizeStore16(a21, col_sum + 16, w_scale + 16, b1, act_scale,
+                   c_base + 2 * N + 16);
+  FinalizeStore16(a30, col_sum, w_scale, b0, act_scale, c_base + 3 * N);
+  FinalizeStore16(a31, col_sum + 16, w_scale + 16, b1, act_scale,
+                   c_base + 3 * N + 16);
+  FinalizeStore16(a40, col_sum, w_scale, b0, act_scale, c_base + 4 * N);
+  FinalizeStore16(a41, col_sum + 16, w_scale + 16, b1, act_scale,
+                   c_base + 4 * N + 16);
+  FinalizeStore16(a50, col_sum, w_scale, b0, act_scale, c_base + 5 * N);
+  FinalizeStore16(a51, col_sum + 16, w_scale + 16, b1, act_scale,
+                   c_base + 5 * N + 16);
+}
+
+// Compute output rows [m_begin, m_end) using the Goto 6×32 microkernel
+// where the row block aligns, falling back to the 1×16 kernel for M-tail
+// (< 6 rows remaining). N is required to be a multiple of 32 for the
+// microkernel path; production ESM dims (320 / 480 / 640 / 1280 / 1920 /
+// 2560 / 5120) are all multiples of 32 so this is always taken at
+// inference time. Test shapes that violate it fall through to the legacy
+// kernel for the whole range.
+void ComputeRowsGoto(const std::uint8_t* a_u8, const std::int8_t* w_packed,
+                     const float* w_scale, const std::int32_t* col_sum,
+                     const float* bias, float act_scale, int K, int K_pad,
+                     int N, float* C, int m_begin, int m_end) {
+  if ((N & 31) != 0) {
+    ComputeRows(a_u8, w_packed, w_scale, col_sum, bias, act_scale, K, K_pad,
+                N, C, m_begin, m_end);
+    return;
+  }
+  const int K_main = K & ~3;
+  int m = m_begin;
+  for (; m + 6 <= m_end; m += 6) {
+    const std::uint8_t* a_block =
+        a_u8 + static_cast<long>(m) * static_cast<long>(K);
+    float* c_row = C + static_cast<long>(m) * static_cast<long>(N);
+    for (int nb = 0; nb < N; nb += 32) {
+      const std::int8_t* w_panel0 =
+          w_packed + static_cast<long>(nb) * static_cast<long>(K_pad);
+      const std::int8_t* w_panel1 =
+          w_packed + static_cast<long>(nb + 16) * static_cast<long>(K_pad);
+      Kernel6x32(a_block, w_panel0, w_panel1, w_scale + nb, col_sum + nb,
+                 bias ? bias + nb : nullptr, act_scale, K, K_main,
+                 c_row + nb, N);
+    }
+  }
+  if (m < m_end) {
+    ComputeRows(a_u8, w_packed, w_scale, col_sum, bias, act_scale, K, K_pad,
+                N, C, m, m_end);
+  }
+}
+
 }  // namespace
 
 void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
@@ -276,18 +438,32 @@ void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
   const std::int8_t* w_packed = W.packed_vnni.data();
   const std::int32_t* col_sum = W.col_sum.data();
 
-  // Step 5: GEMM. Parallelize across M when we're not already inside
-  // a pool worker (would nested-deadlock if we are).
+  // Step 5: GEMM. The Goto 6×32 microkernel is the default (fills the
+  // VPDPBUSD pipe with 12 independent accumulators). ESM_VNNI_KERNEL=
+  // legacy1x16 forces the single-accumulator path — kept for one release
+  // as an A/B escape hatch if a shape regresses; will be removed after
+  // 650M HF parity is re-verified on real workloads.
   const float* w_scale = W.per_channel_scales.data();
-  if (M > 1 && !esm::InGlobalPoolWorker()) {
-    esm::GlobalPool().parallel_for(
-        0, M, /*grain=*/1, [&](int begin, int end) {
-          ComputeRows(a_u8, w_packed, w_scale, col_sum, bias, act_scale, K,
+  const char* kernel_env = std::getenv("ESM_VNNI_KERNEL");
+  const bool use_legacy = kernel_env != nullptr &&
+                           std::string_view(kernel_env) ==
+                               std::string_view("legacy1x16");
+  auto run = [&](int begin, int end) {
+    if (use_legacy) {
+      ComputeRows(a_u8, w_packed, w_scale, col_sum, bias, act_scale, K,
+                  K_pad, N, C, begin, end);
+    } else {
+      ComputeRowsGoto(a_u8, w_packed, w_scale, col_sum, bias, act_scale, K,
                       K_pad, N, C, begin, end);
-        });
+    }
+  };
+  if (M > 1 && !esm::InGlobalPoolWorker()) {
+    // Grain of 6 keeps full 6-row blocks together in each worker's chunk;
+    // M-tail (M % 6) lands in exactly one worker's chunk via the legacy
+    // fallback inside ComputeRowsGoto.
+    esm::GlobalPool().parallel_for(0, M, /*grain=*/6, run);
   } else {
-    ComputeRows(a_u8, w_packed, w_scale, col_sum, bias, act_scale, K, K_pad,
-                N, C, 0, M);
+    run(0, M);
   }
 }
 

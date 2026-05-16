@@ -14,6 +14,7 @@
 
 #include "esm_cpp/cpu_features.h"
 #include "esm_cpp/kernels.h"
+#include "esm_cpp/quant.h"
 
 namespace {
 
@@ -126,3 +127,81 @@ TEST(GemmShapes, NeonDispatchMatchesRefWithinFmaTolerance) {
   }
 }
 #endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+namespace {
+bool HostHasAvx512Vnni() {
+  const esm::Isa isa = esm::HostIsa();
+  return isa == esm::Isa::Avx512Vnni || isa == esm::Isa::Amx;
+}
+
+// Shapes that span the 6×32 multi-accumulator microkernel path:
+//   - Several with M >= 12 so multiple full 6-row blocks run
+//   - Several with M < 6 so the M-tail fallback runs
+//   - N that is a multiple of 32 (production path) and one that isn't
+//     (legacy fallback inside the Goto kernel)
+//   - K-tail (K % 4 != 0)
+const std::vector<Shape>& Int8Shapes() {
+  static const std::vector<Shape> shapes = {
+      // tiny / odd: M < 6 forces the M-tail path
+      {1, 32, 32}, {3, 32, 32}, {5, 32, 64},
+      // M=6 / M=12 / M=18: exactly 1 / 2 / 3 full row-blocks
+      {6, 64, 64}, {12, 96, 128}, {18, 128, 128},
+      // N not multiple of 32 -> Goto routes whole call to legacy
+      {18, 17, 64}, {64, 33, 320}, {64, 320, 17},
+      // K-tail (K % 4 != 0): exercises K-tail in both kernels
+      {64, 32, 13}, {64, 64, 19},
+      // ESM-2-8M shapes (d=320, ffn=1280) — main 6-row blocks
+      {32, 320, 320}, {32, 1280, 320}, {32, 320, 1280},
+      // 650M-shaped (d=1280, ffn=5120) — small M to keep test fast
+      {18, 1280, 1280}, {18, 5120, 1280}, {18, 1280, 5120},
+  };
+  return shapes;
+}
+
+std::vector<float> RandomVecFixed(std::size_t n, std::uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  std::vector<float> v(n);
+  for (auto& x : v) x = dist(rng);
+  return v;
+}
+
+void RunInt8Shape(const Shape& s, bool with_bias) {
+  ForceIsa guard("amx");
+  const std::size_t Msz = static_cast<std::size_t>(s.M);
+  const std::size_t Nsz = static_cast<std::size_t>(s.N);
+  const std::size_t Ksz = static_cast<std::size_t>(s.K);
+  auto A = RandomVecFixed(Msz * Ksz, 0x2468);
+  auto W = RandomVecFixed(Nsz * Ksz, 0x1357);
+  auto bias = with_bias ? RandomVecFixed(Nsz, 0xACE1) : std::vector<float>{};
+  const float* bias_ptr = with_bias ? bias.data() : nullptr;
+  esm::quant::QuantizedTensor qt;
+  esm::quant::Quantize(W.data(), s.N, s.K, &qt);
+  std::vector<float> ref(Msz * Nsz);
+  std::vector<float> got(Msz * Nsz);
+  esm::kernels::LinearInt8Ref(A.data(), qt, bias_ptr, ref.data(),
+                                s.M, s.N, s.K);
+  esm::kernels::LinearInt8(A.data(), qt, bias_ptr, got.data(),
+                             s.M, s.N, s.K);
+  // INT8 cross-check tolerance (per CLAUDE.md): rtol=1e-3 atol=1. Use
+  // atol=1 directly since K may be small and per-element error is bounded
+  // by the per-channel quantization step, not the dynamic range.
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float diff = std::fabs(ref[i] - got[i]);
+    ASSERT_LE(diff, 1.0f + 1e-3f * std::fabs(ref[i]))
+        << "shape=[" << s.M << "," << s.N << "," << s.K << "] bias="
+        << with_bias << " i=" << i << " ref=" << ref[i] << " got=" << got[i];
+  }
+}
+
+}  // namespace
+
+TEST(GemmShapes, Avx512VnniInt8DispatchMatchesRefAcrossGotoMicrokernel) {
+  if (!HostHasAvx512Vnni()) GTEST_SKIP() << "host lacks AVX-512 VNNI";
+  for (const auto& s : Int8Shapes()) {
+    RunInt8Shape(s, /*with_bias=*/false);
+    RunInt8Shape(s, /*with_bias=*/true);
+  }
+}
+#endif  // x86_64
