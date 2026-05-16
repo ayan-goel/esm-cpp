@@ -3,10 +3,23 @@
 #include <cmath>
 #include <vector>
 
+#include "esm_cpp/cpu_features.h"
 #include "esm_cpp/kernels.h"
 
 namespace {
 constexpr float kFp32Tol = 1e-5f;
+
+// Build-time x86 != run-time AVX-512. CI runners are commonly Skylake-
+// client / Haswell-class with only AVX2; the AVX-512 OBJECT lib still
+// compiles into the binary but its instructions trap at run time. Gate
+// each AVX-512 test on actual host capability.
+#if defined(__x86_64__) || defined(_M_X64)
+bool HostHasAvx512() {
+  const esm::Isa isa = esm::HostIsa();
+  return isa == esm::Isa::Avx512 || isa == esm::Isa::Avx512Vnni ||
+         isa == esm::Isa::Amx;
+}
+#endif
 }  // namespace
 
 TEST(LinearRef, MatchesHandComputed_2x3_times_4x3_plus_bias) {
@@ -70,6 +83,7 @@ void LayerNormAvx512(const float* x, const float* gamma, const float* beta,
 }
 
 TEST(LayerNormAvx512, MatchesRefAcrossEsmDims) {
+  if (!HostHasAvx512()) GTEST_SKIP() << "host lacks AVX-512";
   // Sweep d across the ESM-2 dims plus tail-exercising odd sizes.
   for (int d : {17, 47, 320, 480, 640, 1280, 2560, 5120}) {
     constexpr int kRows = 4;
@@ -124,6 +138,7 @@ TEST(GeluRef, MonotonicAndKnownValues) {
 namespace esm::kernels { void GeluAvx512(const float* x, float* out, std::size_t n); }
 
 TEST(GeluAvx512, MatchesRefOnDenseSweep) {
+  if (!HostHasAvx512()) GTEST_SKIP() << "host lacks AVX-512";
   // [-5, 5] is the range GELU actually sees inside ESM-2 (post-LN
   // activations are O(1)). Dense sweep with a non-16-multiple count
   // exercises the masked tail path too.
@@ -143,6 +158,7 @@ TEST(GeluAvx512, MatchesRefOnDenseSweep) {
 }
 
 TEST(GeluAvx512, ZeroAndExtremes) {
+  if (!HostHasAvx512()) GTEST_SKIP() << "host lacks AVX-512";
   // Sign + saturation: GELU(0) == 0, GELU(very negative) ~ 0, GELU(very
   // positive) ~ x. Polynomial erf saturates to ±1 outside ~|x| > 4.
   float x[] = {0.0f, 10.0f, -10.0f, 1.0f, -1.0f};

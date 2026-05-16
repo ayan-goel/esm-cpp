@@ -11,7 +11,14 @@ void BuildVnniCache(QuantizedTensor* out) {
   const int N = out->N;
   const int K = out->K;
   const int K_pad = (K + 3) & ~3;
-  out->packed_vnni.assign(static_cast<std::size_t>(N) *
+  // Each N-panel is laid out as 16 rows × K_pad bytes worth of VPDPBUSD
+  // tiles, regardless of how many real rows the panel covers. Round N up
+  // to a multiple of 16 so the last (possibly partial) panel has the full
+  // 16-row footprint reserved. Production ESM dims (320/480/640/1280/2560)
+  // are already multiples of 16 so this is identity in practice; the
+  // round-up matters for unit-test shapes that exercise tails.
+  const int N_pad = (N + 15) & ~15;
+  out->packed_vnni.assign(static_cast<std::size_t>(N_pad) *
                               static_cast<std::size_t>(K_pad),
                           std::int8_t{0});
   for (int nb = 0; nb < N; nb += 16) {

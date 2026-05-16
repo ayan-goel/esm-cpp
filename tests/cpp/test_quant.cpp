@@ -61,7 +61,8 @@ TEST(QuantPack, BuildVnniCachePopulatesPackedAndColSum) {
   esm::quant::QuantizedTensor qt;
   esm::quant::Quantize(W.data(), N, K, &qt);
   const int K_pad = (K + 3) & ~3;
-  ASSERT_EQ(static_cast<int>(qt.packed_vnni.size()), N * K_pad);
+  const int N_pad = (N + 15) & ~15;
+  ASSERT_EQ(static_cast<int>(qt.packed_vnni.size()), N_pad * K_pad);
   ASSERT_EQ(static_cast<int>(qt.col_sum.size()), N);
   for (int n = 0; n < N; ++n) {
     std::int32_t expect = 0;
