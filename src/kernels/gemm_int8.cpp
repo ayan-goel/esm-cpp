@@ -36,43 +36,262 @@ void LinearInt8Ref(const float* A, const esm::quant::QuantizedTensor& W,
 
 #ifdef ESM_KERNEL_AVX512
 
-// STUB — AVX-512 VNNI INT8 microkernel hand-off. Slice 6 of Phase 2's
-// production INT8 path. Until the intrinsics body lands on the x86
-// gate machine, dispatching to VNNI just routes through LinearInt8Ref.
+// AVX-512 VNNI W8A8 microkernel. Production INT8 GEMM path for x86
+// with AVX-512+VNNI (Ice Lake, Sapphire Rapids, etc.). Inner loop uses
+// VPDPBUSD: u8 (activation) x s8 (weight) -> s32 accumulator, 4 K
+// values per lane, 16 N lanes per zmm register.
 //
-// Target design (locked alongside the FP32 Goto microkernel; see
-// gemm_fp32.cpp's AVX-512 stub for the matching FP32 register block):
+// Layout:
+//   A: row-major [M, K] FP32 input. Quantized on the fly to u8 with
+//      per-tensor scale = max(|A|) / 127 and zero-point 128. Symmetric
+//      INT8 in [-127, 127] then bias-shifted to u8 in [1, 255].
+//   W: per-channel symmetric INT8, range [-127, 127]. Original layout
+//      is row-major [N, K]. We repack into [N/16 panels, K/4 tiles,
+//      16 N x 4 K bytes per tile] = 64-byte VPDPBUSD-friendly chunks.
+//   C: row-major [M, N] FP32 output. Bias is FP32.
 //
-//   Microkernel: 16x16 register block of s32 C accumulators (8 zmm
-//   registers — leaves the other 24 zmm for VPDPBUSD operands plus
-//   prefetch). Each K-step loads 4 INT8 values per channel (4-wide
-//   u8 input chunk via _mm512_set1_epi32 broadcast), 4 INT8 weight
-//   columns via _mm512_loadu_si512 (64 byte block), and issues one
-//   VPDPBUSD per row of C accumulators (16 total per K-step).
+// Zero-point correction: VPDPBUSD computes sum_k(u8[k] * s8[k]) where
+// u8[k] = q[k] + 128. To recover sum_k(q*w) we subtract 128 * sum_k(w)
+// per output column. We precompute col_sum[N] once per call.
 //
-//   Macrokernel: same Goto packing nest as FP32, K_C ~ 512 (so K_C * 4
-//   per dispatch sits in L2), M_C ~ 256. Pack u8 input into K_C / 4
-//   panels of 4-byte rows; pack s8 weights into K_C / 4 transposed
-//   panels of 64-byte columns (4 channels x 16 columns each).
+// Scale folding: final output is
+//   C[m,n] = (raw_acc - 128 * col_sum[n]) * w_scale[n] * act_scale + bias[n]
 //
-//   Scale folding: at C-write-out, multiply the s32 accumulator by
-//   per-output-channel weight_scale[n] x per-tensor act_scale and
-//   add FP32 bias[n]. One vfmadd231ps per output column at write-out.
-//
-// Tail handling: M % 16 / N % 16 via masked stores; K % (K_C * 4)
-// via leftover loop with VPDPBUSD on partial loads.
-//
-// AMX path (Slice 6.2): TDPBSSD with 16-row tiles, K=64 INT8 chunks
-// per dispatch. Requires syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM,
-// XFEATURE_XTILEDATA) at first use — guard behind std::call_once.
-// Tile config (ldtilecfg) sets TILES_DATA to 16 rows x 64 INT8 bytes
-// for inputs and 16 rows x 64 bytes (= 16 s32 cols) for output. AMX
-// gives 4-8x VNNI on Sapphire Rapids + later.
+// Threading: parallel_for across M when called from the main thread.
+// Skips parallel dispatch when InGlobalPoolWorker() to avoid nested
+// parallel_for deadlock (same pattern as AttentionVarlen).
+
+#include <immintrin.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+#include "esm_cpp/thread_pool.h"
+
 void LinearInt8Ref(const float* A, const esm::quant::QuantizedTensor& W,
                    const float* bias, float* C, int M, int N, int K);
+
+namespace {
+
+// Per-thread scratch buffers reused across LinearVnni calls. Sized on
+// demand; never shrunk. Avoids per-call malloc on the hot path.
+thread_local std::vector<std::uint8_t> g_a_u8;
+thread_local std::vector<std::int8_t> g_w_packed;
+thread_local std::vector<std::int32_t> g_col_sum;
+
+// Pack W from row-major [N, K] into VPDPBUSD tile order. Output layout:
+// for each N-block of 16, for each K-block of 4: one 64-byte tile
+// containing [N0:k0,k1,k2,k3, N1:k0,k1,k2,k3, ..., N15:k0,k1,k2,k3].
+// N tail (< 16) zero-padded; K tail (< 4) zero-padded.
+void PackWeight(const std::int8_t* w, int N, int K, int K_pad,
+                std::int8_t* packed) {
+  std::memset(packed,
+              0, static_cast<std::size_t>(N) * static_cast<std::size_t>(K_pad));
+  for (int nb = 0; nb < N; nb += 16) {
+    const int n_block = std::min(16, N - nb);
+    std::int8_t* panel = packed +
+        static_cast<long>(nb) * static_cast<long>(K_pad);
+    for (int kb = 0; kb < K; kb += 4) {
+      std::int8_t* tile = panel + static_cast<long>(kb) * 16;
+      const int k_step = std::min(4, K - kb);
+      for (int nn = 0; nn < n_block; ++nn) {
+        for (int kk = 0; kk < k_step; ++kk) {
+          tile[nn * 4 + kk] =
+              w[(nb + nn) * static_cast<long>(K) + (kb + kk)];
+        }
+      }
+    }
+  }
+}
+
+// One-row finalize: take an s32 accumulator zmm (16 lanes for n..n+15),
+// apply zero-point correction, scale by per-channel + activation scales,
+// add bias, store as FP32.
+inline void FinalizeStore16(__m512i acc_raw, const std::int32_t* col_sum,
+                             const float* w_scale, const float* bias,
+                             float act_scale, float* out_row) {
+  // raw_acc - 128 * col_sum  (all s32)
+  __m512i cs = _mm512_loadu_si512(
+      reinterpret_cast<const __m512i*>(col_sum));
+  __m512i corrected =
+      _mm512_sub_epi32(acc_raw, _mm512_slli_epi32(cs, 7));  // *128
+  // s32 -> f32
+  __m512 fp = _mm512_cvtepi32_ps(corrected);
+  // scale[n] * act_scale
+  __m512 ws = _mm512_loadu_ps(w_scale);
+  __m512 combined = _mm512_mul_ps(ws, _mm512_set1_ps(act_scale));
+  // out = corrected_fp * combined + bias
+  __m512 b = _mm512_loadu_ps(bias);
+  __m512 out = _mm512_fmadd_ps(fp, combined, b);
+  _mm512_storeu_ps(out_row, out);
+}
+
+// One-row, partial-N (n_tail < 16) finalize via masked store.
+inline void FinalizeStoreTail(__m512i acc_raw, const std::int32_t* col_sum,
+                               const float* w_scale, const float* bias,
+                               float act_scale, float* out_row, int n_tail) {
+  __mmask16 mask = static_cast<__mmask16>((1u << n_tail) - 1);
+  __m512i cs = _mm512_maskz_loadu_epi32(mask, col_sum);
+  __m512i corrected =
+      _mm512_sub_epi32(acc_raw, _mm512_slli_epi32(cs, 7));
+  __m512 fp = _mm512_cvtepi32_ps(corrected);
+  __m512 ws = _mm512_maskz_loadu_ps(mask, w_scale);
+  __m512 combined = _mm512_mul_ps(ws, _mm512_set1_ps(act_scale));
+  __m512 b = _mm512_maskz_loadu_ps(mask, bias);
+  __m512 out = _mm512_fmadd_ps(fp, combined, b);
+  _mm512_mask_storeu_ps(out_row, mask, out);
+}
+
+// Process rows [m_begin, m_end) of the output. Activations a_u8 are
+// already quantized [M, K], weights are packed into 64-byte tiles per
+// (N-block, K-block). Each row of C is produced independently.
+void ComputeRows(const std::uint8_t* a_u8, const std::int8_t* w_packed,
+                  const float* w_scale, const std::int32_t* col_sum,
+                  const float* bias, float act_scale, int K, int K_pad,
+                  int N, float* C, int m_begin, int m_end) {
+  // Zero-bias path needs a small zero buffer for the FinalizeStore16 path
+  // since it always loads 16 floats from `bias`. Tiny stack alloc per task.
+  alignas(64) float zero_bias[16] = {0};
+  for (int m = m_begin; m < m_end; ++m) {
+    const std::uint8_t* a_row =
+        a_u8 + static_cast<long>(m) * static_cast<long>(K);
+    float* c_row = C + static_cast<long>(m) * static_cast<long>(N);
+    int nb = 0;
+    for (; nb + 16 <= N; nb += 16) {
+      __m512i acc = _mm512_setzero_si512();
+      const std::int8_t* panel =
+          w_packed + static_cast<long>(nb) * static_cast<long>(K_pad);
+      int kb = 0;
+      for (; kb + 4 <= K; kb += 4) {
+        std::uint32_t a4;
+        std::memcpy(&a4, &a_row[kb], 4);
+        __m512i a_bcast = _mm512_set1_epi32(static_cast<int>(a4));
+        __m512i w_tile = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(panel + kb * 16));
+        acc = _mm512_dpbusd_epi32(acc, a_bcast, w_tile);
+      }
+      if (kb < K) {
+        // K tail: load partial 4-byte chunk with zero-point bytes (128)
+        // for the missing positions so the contribution is zeroed out
+        // after the zero-point correction.
+        alignas(4) std::uint8_t tmp[4] = {128, 128, 128, 128};
+        for (int kk = 0; kk < K - kb; ++kk) tmp[kk] = a_row[kb + kk];
+        std::uint32_t a4;
+        std::memcpy(&a4, tmp, 4);
+        __m512i a_bcast = _mm512_set1_epi32(static_cast<int>(a4));
+        __m512i w_tile = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(panel + kb * 16));
+        acc = _mm512_dpbusd_epi32(acc, a_bcast, w_tile);
+      }
+      FinalizeStore16(acc, col_sum + nb, w_scale + nb,
+                       bias ? (bias + nb) : zero_bias,
+                       act_scale, c_row + nb);
+    }
+    if (nb < N) {
+      const int n_tail = N - nb;
+      __m512i acc = _mm512_setzero_si512();
+      const std::int8_t* panel =
+          w_packed + static_cast<long>(nb) * static_cast<long>(K_pad);
+      int kb = 0;
+      for (; kb + 4 <= K; kb += 4) {
+        std::uint32_t a4;
+        std::memcpy(&a4, &a_row[kb], 4);
+        __m512i a_bcast = _mm512_set1_epi32(static_cast<int>(a4));
+        __m512i w_tile = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(panel + kb * 16));
+        acc = _mm512_dpbusd_epi32(acc, a_bcast, w_tile);
+      }
+      if (kb < K) {
+        alignas(4) std::uint8_t tmp[4] = {128, 128, 128, 128};
+        for (int kk = 0; kk < K - kb; ++kk) tmp[kk] = a_row[kb + kk];
+        std::uint32_t a4;
+        std::memcpy(&a4, tmp, 4);
+        __m512i a_bcast = _mm512_set1_epi32(static_cast<int>(a4));
+        __m512i w_tile = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(panel + kb * 16));
+        acc = _mm512_dpbusd_epi32(acc, a_bcast, w_tile);
+      }
+      FinalizeStoreTail(acc, col_sum + nb, w_scale + nb,
+                         bias ? (bias + nb) : zero_bias,
+                         act_scale, c_row + nb, n_tail);
+    }
+  }
+}
+
+}  // namespace
+
 void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
                 const float* bias, float* C, int M, int N, int K) {
-  LinearInt8Ref(A, W, bias, C, M, N, K);
+  // K must be at least 1; if it's zero just zero the output.
+  if (K <= 0 || M <= 0 || N <= 0) {
+    if (M > 0 && N > 0 && C) {
+      std::memset(C, 0,
+                  static_cast<std::size_t>(M) * static_cast<std::size_t>(N) *
+                      sizeof(float));
+    }
+    return;
+  }
+
+  // Step 1: per-tensor activation scale = max(|A|) / 127.
+  float a_max = 0.0f;
+  const std::size_t MK = static_cast<std::size_t>(M) *
+                          static_cast<std::size_t>(K);
+  for (std::size_t i = 0; i < MK; ++i) {
+    const float v = std::fabs(A[i]);
+    if (v > a_max) a_max = v;
+  }
+  const float act_scale = (a_max > 0.0f) ? (a_max / 127.0f) : 1.0f;
+  const float inv_act_scale = 1.0f / act_scale;
+
+  // Step 2: quantize A to u8 with zero-point 128 (q in [-127, 127] then
+  // shifted by +128 -> u8 in [1, 255]).
+  if (g_a_u8.size() < MK) g_a_u8.resize(MK);
+  std::uint8_t* a_u8 = g_a_u8.data();
+  for (std::size_t i = 0; i < MK; ++i) {
+    int q = static_cast<int>(std::lround(A[i] * inv_act_scale));
+    if (q < -127) q = -127;
+    if (q > 127) q = 127;
+    a_u8[i] = static_cast<std::uint8_t>(q + 128);
+  }
+
+  // Step 3: pack W into 64-byte VPDPBUSD tiles. K_pad rounds K up to a
+  // multiple of 4 (production ESM shapes are always divisible by 4).
+  const int K_pad = (K + 3) & ~3;
+  const std::size_t packed_size =
+      static_cast<std::size_t>(N) * static_cast<std::size_t>(K_pad);
+  if (g_w_packed.size() < packed_size) g_w_packed.resize(packed_size);
+  std::int8_t* w_packed = g_w_packed.data();
+  PackWeight(W.packed.data(), N, K, K_pad, w_packed);
+
+  // Step 4: column sums for zero-point correction.
+  if (g_col_sum.size() < static_cast<std::size_t>(N)) {
+    g_col_sum.resize(static_cast<std::size_t>(N));
+  }
+  std::int32_t* col_sum = g_col_sum.data();
+  for (int n = 0; n < N; ++n) {
+    std::int32_t s = 0;
+    const std::int8_t* w_row =
+        W.packed.data() + static_cast<long>(n) * static_cast<long>(K);
+    for (int k = 0; k < K; ++k) s += w_row[k];
+    col_sum[n] = s;
+  }
+
+  // Step 5: GEMM. Parallelize across M when we're not already inside
+  // a pool worker (would nested-deadlock if we are).
+  const float* w_scale = W.per_channel_scales.data();
+  if (M > 1 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(
+        0, M, /*grain=*/1, [&](int begin, int end) {
+          ComputeRows(a_u8, w_packed, w_scale, col_sum, bias, act_scale, K,
+                      K_pad, N, C, begin, end);
+        });
+  } else {
+    ComputeRows(a_u8, w_packed, w_scale, col_sum, bias, act_scale, K, K_pad,
+                N, C, 0, M);
+  }
 }
 
 #endif  // ESM_KERNEL_AVX512
