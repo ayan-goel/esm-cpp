@@ -81,6 +81,41 @@ TEST(GeluRef, MonotonicAndKnownValues) {
   EXPECT_NEAR(y[2], 1.9544997f, 1e-5f);
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+namespace esm::kernels { void GeluAvx512(const float* x, float* out, std::size_t n); }
+
+TEST(GeluAvx512, MatchesRefOnDenseSweep) {
+  // [-5, 5] is the range GELU actually sees inside ESM-2 (post-LN
+  // activations are O(1)). Dense sweep with a non-16-multiple count
+  // exercises the masked tail path too.
+  constexpr int kN = 8195;  // odd so the tail handler runs
+  std::vector<float> x(kN), ref(kN), got(kN);
+  for (int i = 0; i < kN; ++i) {
+    x[i] = -5.0f + 10.0f * (static_cast<float>(i) / static_cast<float>(kN - 1));
+  }
+  esm::kernels::GeluRef(x.data(), ref.data(), kN);
+  esm::kernels::GeluAvx512(x.data(), got.data(), kN);
+  for (int i = 0; i < kN; ++i) {
+    // Polynomial erf (A&S 7.1.26) is ~1.5e-7; gelu = x * 0.5 * (1+erf),
+    // |x| <= 5, so absolute diff stays well under 1e-5.
+    EXPECT_NEAR(got[i], ref[i], 1e-5f)
+        << "i=" << i << " x=" << x[i] << " ref=" << ref[i] << " got=" << got[i];
+  }
+}
+
+TEST(GeluAvx512, ZeroAndExtremes) {
+  // Sign + saturation: GELU(0) == 0, GELU(very negative) ~ 0, GELU(very
+  // positive) ~ x. Polynomial erf saturates to ±1 outside ~|x| > 4.
+  float x[] = {0.0f, 10.0f, -10.0f, 1.0f, -1.0f};
+  float ref[5], got[5];
+  esm::kernels::GeluRef(x, ref, 5);
+  esm::kernels::GeluAvx512(x, got, 5);
+  for (int i = 0; i < 5; ++i) {
+    EXPECT_NEAR(got[i], ref[i], 1e-5f) << "i=" << i << " x=" << x[i];
+  }
+}
+#endif  // x86_64
+
 TEST(RopeBuildTables, CosSinAreDuplicatedHalfThenHalf) {
   // For head_dim=4, half=2. Position t=1.
   // inv_freq[0] = 10000^(-0/4) = 1

@@ -43,6 +43,7 @@ void Linear(const float* A, const float* W, const float* bias, float* C,
 #if defined(__x86_64__) || defined(_M_X64)
 void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
                 const float* bias, float* C, int M, int N, int K);
+void GeluAvx512(const float* x, float* out, std::size_t n);
 #endif
 
 void LinearInt8(const float* A, const esm::quant::QuantizedTensor& W,
@@ -68,6 +69,12 @@ void LayerNorm(const float* x, const float* gamma, const float* beta,
 
 void Gelu(const float* x, float* out, std::size_t n) {
   switch (esm::CurrentIsa()) {
+#if defined(__x86_64__) || defined(_M_X64)
+    case Isa::Avx512:
+    case Isa::Avx512Vnni:
+    case Isa::Amx:
+      return GeluAvx512(x, out, n);
+#endif
     default:
       return GeluRef(x, out, n);
   }

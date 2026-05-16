@@ -1,6 +1,13 @@
 #include "esm_cpp/kernels.h"
 
 #include <cmath>
+#include <cstddef>
+
+// AVX-512 path needs intrinsics. Per gemm_int8.cpp's hard-learned lesson,
+// keep system headers at file scope — never inside namespace esm::kernels.
+#ifdef ESM_KERNEL_AVX512
+#include <immintrin.h>
+#endif
 
 namespace esm::kernels {
 
@@ -17,5 +24,87 @@ void GeluRef(const float* x, float* out, std::size_t n) {
 }
 
 #endif  // ESM_KERNEL_REFERENCE
+
+#ifdef ESM_KERNEL_AVX512
+
+namespace {
+
+// AVX-512 polynomial exp(x). Standard range-reduction: x = n*ln(2) + r
+// with r in [-ln(2)/2, ln(2)/2], then exp(x) = 2^n * exp(r). The 2^n
+// piece is built via the integer-cast bit-hack on the FP32 exponent; the
+// exp(r) piece is a 5-term Horner of the Taylor series, which fits FP32
+// to ~3e-7 over the reduced range.
+inline __m512 ExpAvx512(__m512 x) {
+  const __m512 log2e = _mm512_set1_ps(1.44269504088896340736f);
+  const __m512 ln2_hi = _mm512_set1_ps(6.93145752e-1f);
+  const __m512 ln2_lo = _mm512_set1_ps(1.42860677e-6f);
+  __m512 n_f = _mm512_roundscale_ps(
+      _mm512_mul_ps(x, log2e),
+      _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+  __m512 r = _mm512_sub_ps(_mm512_sub_ps(x, _mm512_mul_ps(n_f, ln2_hi)),
+                            _mm512_mul_ps(n_f, ln2_lo));
+  __m512 p = _mm512_set1_ps(1.0f / 120.0f);
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f / 24.0f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f / 6.0f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(0.5f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+  __m512i ni = _mm512_cvtps_epi32(n_f);
+  __m512i e_bits = _mm512_slli_epi32(
+      _mm512_add_epi32(ni, _mm512_set1_epi32(127)), 23);
+  return _mm512_mul_ps(p, _mm512_castsi512_ps(e_bits));
+}
+
+// AVX-512 polynomial erf(x) via Abramowitz–Stegun 7.1.26. Max error
+// ~1.5e-7 across all x; tight enough that gelu(x) lands inside FP32
+// round-off for the [-5, 5] range we actually feed in. The reference
+// gelu uses std::erf which is libm-precision (~1e-9); the cross-check
+// test in tests/cpp/test_kernels.cpp asserts agreement to 1e-5.
+inline __m512 ErfAvx512(__m512 x) {
+  const __m512 sign_mask =
+      _mm512_castsi512_ps(_mm512_set1_epi32(static_cast<int>(0x80000000)));
+  const __m512 abs_mask =
+      _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
+  const __m512 one = _mm512_set1_ps(1.0f);
+  __m512 sign = _mm512_and_ps(x, sign_mask);
+  __m512 ax = _mm512_and_ps(x, abs_mask);
+  __m512 t = _mm512_div_ps(
+      one, _mm512_fmadd_ps(_mm512_set1_ps(0.3275911f), ax, one));
+  __m512 poly = _mm512_set1_ps(1.061405429f);
+  poly = _mm512_fmadd_ps(poly, t, _mm512_set1_ps(-1.453152027f));
+  poly = _mm512_fmadd_ps(poly, t, _mm512_set1_ps(1.421413741f));
+  poly = _mm512_fmadd_ps(poly, t, _mm512_set1_ps(-0.284496736f));
+  poly = _mm512_fmadd_ps(poly, t, _mm512_set1_ps(0.254829592f));
+  poly = _mm512_mul_ps(poly, t);
+  __m512 neg_x2 = _mm512_sub_ps(_mm512_setzero_ps(), _mm512_mul_ps(x, x));
+  __m512 e = ExpAvx512(neg_x2);
+  __m512 abs_erf = _mm512_fnmadd_ps(poly, e, one);  // 1 - poly * e
+  return _mm512_or_ps(abs_erf, sign);
+}
+
+}  // namespace
+
+void GeluAvx512(const float* x, float* out, std::size_t n) {
+  const __m512 half = _mm512_set1_ps(0.5f);
+  const __m512 inv_sqrt2 = _mm512_set1_ps(0.70710678118654752440f);
+  const __m512 one = _mm512_set1_ps(1.0f);
+  std::size_t i = 0;
+  for (; i + 16 <= n; i += 16) {
+    __m512 v = _mm512_loadu_ps(x + i);
+    __m512 e = ErfAvx512(_mm512_mul_ps(v, inv_sqrt2));
+    __m512 y = _mm512_mul_ps(_mm512_mul_ps(v, half), _mm512_add_ps(one, e));
+    _mm512_storeu_ps(out + i, y);
+  }
+  if (i < n) {
+    const std::size_t tail = n - i;
+    const __mmask16 mask = static_cast<__mmask16>((1u << tail) - 1u);
+    __m512 v = _mm512_maskz_loadu_ps(mask, x + i);
+    __m512 e = ErfAvx512(_mm512_mul_ps(v, inv_sqrt2));
+    __m512 y = _mm512_mul_ps(_mm512_mul_ps(v, half), _mm512_add_ps(one, e));
+    _mm512_mask_storeu_ps(out + i, mask, y);
+  }
+}
+
+#endif  // ESM_KERNEL_AVX512
 
 }  // namespace esm::kernels
