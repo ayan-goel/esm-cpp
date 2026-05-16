@@ -63,6 +63,45 @@ TEST(LayerNormRef, GammaBetaApplied) {
     EXPECT_NEAR(out[i], 2.0f * base[i] + 1.0f, 1e-5f);
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+namespace esm::kernels {
+void LayerNormAvx512(const float* x, const float* gamma, const float* beta,
+                     float eps, float* out, int num_rows, int d);
+}
+
+TEST(LayerNormAvx512, MatchesRefAcrossEsmDims) {
+  // Sweep d across the ESM-2 dims plus tail-exercising odd sizes.
+  for (int d : {17, 47, 320, 480, 640, 1280, 2560, 5120}) {
+    constexpr int kRows = 4;
+    std::vector<float> x(static_cast<std::size_t>(kRows) * d);
+    std::vector<float> gamma(d), beta(d);
+    for (int i = 0; i < d * kRows; ++i) {
+      // Mix of magnitudes so mean and variance are non-trivial.
+      x[static_cast<std::size_t>(i)] =
+          0.5f * std::sin(static_cast<float>(i) * 0.013f) +
+          0.2f * std::cos(static_cast<float>(i) * 0.007f);
+    }
+    for (int j = 0; j < d; ++j) {
+      gamma[static_cast<std::size_t>(j)] = 1.0f + 0.1f * std::sin(static_cast<float>(j) * 0.31f);
+      beta[static_cast<std::size_t>(j)] = 0.05f * std::cos(static_cast<float>(j) * 0.17f);
+    }
+    std::vector<float> ref(static_cast<std::size_t>(kRows) * d);
+    std::vector<float> got(static_cast<std::size_t>(kRows) * d);
+    esm::kernels::LayerNormRef(x.data(), gamma.data(), beta.data(), 1e-5f,
+                                ref.data(), kRows, d);
+    esm::kernels::LayerNormAvx512(x.data(), gamma.data(), beta.data(), 1e-5f,
+                                   got.data(), kRows, d);
+    for (int i = 0; i < kRows * d; ++i) {
+      // FP32-reduction drift vs the Ref FP64 accumulator. Multi-accumulator
+      // pattern bounds it well below 1e-5 for d <= 5120.
+      EXPECT_NEAR(got[static_cast<std::size_t>(i)],
+                  ref[static_cast<std::size_t>(i)], 1e-5f)
+          << "d=" << d << " i=" << i;
+    }
+  }
+}
+#endif  // x86_64
+
 TEST(GeluRef, ZeroAtZero) {
   float x[] = {0.0f};
   float y[1];
