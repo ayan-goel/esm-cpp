@@ -14,6 +14,7 @@ add_executable(esm_cpp_tests
   test_act_quant.cpp
   test_batch.cpp
   test_scheduler.cpp
+  test_gguf.cpp
 )
 target_link_libraries(esm_cpp_tests PRIVATE
   esm_cpp_core

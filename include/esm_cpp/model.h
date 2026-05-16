@@ -70,6 +70,19 @@ class Model {
   // config.json required.
   static std::unique_ptr<Model> LoadFromSafetensors(const std::string& path);
 
+  // Phase 3 Slice 4: load ESM-2 weights from a GGUF v3 file produced by
+  // SaveToGguf or the convert tool. Tensor layout (row-major [out, in])
+  // matches HF; GGUF metadata carries architecture hyperparams.
+  static std::unique_ptr<Model> LoadFromGguf(const std::string& path);
+
+  // Auto-detect by magic byte: GGUF if the first four bytes are "GGUF",
+  // safetensors otherwise.
+  static std::unique_ptr<Model> Load(const std::string& path);
+
+  // Phase 3 Slice 4: serialize the current model state to GGUF v3.
+  // Writes FP32 weights; Slice 5 adds Q8_ESM for quantized state.
+  void SaveToGguf(const std::string& path) const;
+
   const Config& config() const { return cfg_; }
 
   // Run forward. attention_mask uses 1 for real tokens, 0 for pad.

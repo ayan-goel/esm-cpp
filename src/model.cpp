@@ -140,6 +140,236 @@ std::unique_ptr<Model> Model::LoadFromSafetensors(const std::string& path) {
 
 namespace {
 
+// HF safetensors <-> GGUF tensor name map. GGUF names mirror llama.cpp's
+// convention where possible; ESM-specific tensors (lm_head dense + LN +
+// per-vocab decoder bias) get descriptive names rather than llama.cpp's
+// generic "output.*".
+std::string GgufLayerName(int i, const std::string& suffix) {
+  return "blk." + std::to_string(i) + "." + suffix;
+}
+
+void GgufLoadVector(const io::GgufFile& gf, const std::string& name,
+                    std::vector<float>& dst) {
+  auto info = gf.Get(name);
+  if (!info) throw std::runtime_error("gguf: missing tensor " + name);
+  if (info->dtype != io::GgufFile::GgmlType::F32) {
+    throw std::runtime_error("gguf: expected F32 for " + name);
+  }
+  const std::size_t n = info->size_bytes / sizeof(float);
+  dst.resize(n);
+  std::memcpy(dst.data(), info->data, info->size_bytes);
+}
+
+std::int64_t GgufMetaInt(const io::GgufFile& gf, const std::string& key) {
+  auto v = gf.Metadata(key);
+  if (!v) throw std::runtime_error("gguf: missing metadata " + key);
+  if (auto* i = std::get_if<std::int64_t>(&*v)) return *i;
+  throw std::runtime_error("gguf: metadata " + key + " is not int");
+}
+
+}  // namespace
+
+std::unique_ptr<Model> Model::LoadFromGguf(const std::string& path) {
+  esm::MaybeLogIsaOnce();
+  auto file = io::GgufFile::Open(path);
+  auto arch = file->Metadata("general.architecture");
+  if (!arch || std::get<std::string>(*arch) != "esm") {
+    throw std::runtime_error(
+        "gguf: not an esm-arch file (general.architecture must be 'esm')");
+  }
+
+  auto out = std::unique_ptr<Model>(new Model());
+  out->cfg_.num_hidden_layers =
+      static_cast<int>(GgufMetaInt(*file, "esm.block_count"));
+  out->cfg_.hidden_size =
+      static_cast<int>(GgufMetaInt(*file, "esm.embedding_length"));
+  out->cfg_.intermediate_size =
+      static_cast<int>(GgufMetaInt(*file, "esm.feed_forward_length"));
+  out->cfg_.num_attention_heads =
+      static_cast<int>(GgufMetaInt(*file, "esm.attention.head_count"));
+  out->cfg_.head_dim =
+      static_cast<int>(GgufMetaInt(*file, "esm.rope.dimension_count"));
+  out->cfg_.vocab_size = Tokenizer::kVocabSize;
+  out->cfg_.token_dropout = true;
+  out->cfg_.mask_token_id = Tokenizer::kMaskId;
+  // layer_norm_epsilon stored as float; fall back to the ESM default if
+  // a writer forgot to include it.
+  if (auto eps = file->Metadata("esm.attention.layer_norm_epsilon")) {
+    if (auto* d = std::get_if<double>(&*eps)) {
+      out->cfg_.layer_norm_eps = static_cast<float>(*d);
+    } else {
+      out->cfg_.layer_norm_eps = 1e-5f;
+    }
+  } else {
+    out->cfg_.layer_norm_eps = 1e-5f;
+  }
+
+  GgufLoadVector(*file, "token_embd.weight", out->embed_);
+  out->layers_.resize(static_cast<std::size_t>(out->cfg_.num_hidden_layers));
+  for (int i = 0; i < out->cfg_.num_hidden_layers; ++i) {
+    auto& lw = out->layers_[static_cast<std::size_t>(i)];
+    GgufLoadVector(*file, GgufLayerName(i, "attn_norm.weight"), lw.attn_ln_w);
+    GgufLoadVector(*file, GgufLayerName(i, "attn_norm.bias"), lw.attn_ln_b);
+    GgufLoadVector(*file, GgufLayerName(i, "attn_q.weight"), lw.q_w);
+    GgufLoadVector(*file, GgufLayerName(i, "attn_q.bias"), lw.q_b);
+    GgufLoadVector(*file, GgufLayerName(i, "attn_k.weight"), lw.k_w);
+    GgufLoadVector(*file, GgufLayerName(i, "attn_k.bias"), lw.k_b);
+    GgufLoadVector(*file, GgufLayerName(i, "attn_v.weight"), lw.v_w);
+    GgufLoadVector(*file, GgufLayerName(i, "attn_v.bias"), lw.v_b);
+    GgufLoadVector(*file, GgufLayerName(i, "attn_output.weight"), lw.out_w);
+    GgufLoadVector(*file, GgufLayerName(i, "attn_output.bias"), lw.out_b);
+    GgufLoadVector(*file, GgufLayerName(i, "ffn_norm.weight"), lw.ffn_ln_w);
+    GgufLoadVector(*file, GgufLayerName(i, "ffn_norm.bias"), lw.ffn_ln_b);
+    GgufLoadVector(*file, GgufLayerName(i, "ffn_up.weight"), lw.fc1_w);
+    GgufLoadVector(*file, GgufLayerName(i, "ffn_up.bias"), lw.fc1_b);
+    GgufLoadVector(*file, GgufLayerName(i, "ffn_down.weight"), lw.fc2_w);
+    GgufLoadVector(*file, GgufLayerName(i, "ffn_down.bias"), lw.fc2_b);
+  }
+  GgufLoadVector(*file, "enc_norm.weight", out->final_ln_w_);
+  GgufLoadVector(*file, "enc_norm.bias", out->final_ln_b_);
+  GgufLoadVector(*file, "lm_head.weight", out->lm_dense_w_);
+  GgufLoadVector(*file, "lm_head.bias", out->lm_dense_b_);
+  GgufLoadVector(*file, "lm_head_norm.weight", out->lm_ln_w_);
+  GgufLoadVector(*file, "lm_head_norm.bias", out->lm_ln_b_);
+  GgufLoadVector(*file, "output.bias", out->lm_decoder_bias_);
+
+  return out;
+}
+
+std::unique_ptr<Model> Model::Load(const std::string& path) {
+  if (io::GgufFile::LooksLikeGguf(path)) return LoadFromGguf(path);
+  return LoadFromSafetensors(path);
+}
+
+void Model::SaveToGguf(const std::string& path) const {
+  const int d = cfg_.hidden_size;
+  const int ffn = cfg_.intermediate_size;
+  const int L = cfg_.num_hidden_layers;
+  const int V = cfg_.vocab_size;
+
+  std::unordered_map<std::string, io::GgufFile::MetadataValue> meta;
+  meta.emplace("general.architecture", std::string("esm"));
+  meta.emplace("general.alignment", static_cast<std::int64_t>(32));
+  meta.emplace("general.file_type", static_cast<std::int64_t>(1));  // 1 = F32
+  meta.emplace("esm.block_count", static_cast<std::int64_t>(L));
+  meta.emplace("esm.embedding_length", static_cast<std::int64_t>(d));
+  meta.emplace("esm.feed_forward_length", static_cast<std::int64_t>(ffn));
+  meta.emplace("esm.attention.head_count",
+                static_cast<std::int64_t>(cfg_.num_attention_heads));
+  meta.emplace("esm.attention.head_count_kv",
+                static_cast<std::int64_t>(cfg_.num_attention_heads));
+  meta.emplace("esm.attention.layer_norm_epsilon",
+                static_cast<double>(cfg_.layer_norm_eps));
+  meta.emplace("esm.rope.dimension_count",
+                static_cast<std::int64_t>(cfg_.head_dim));
+  meta.emplace("esm.context_length",
+                static_cast<std::int64_t>(Tokenizer::kModelMaxLength));
+  meta.emplace("esm.gguf_writer", std::string("esm-cpp 0.1.0"));
+
+  // Helper: build a WriteTensor for an FP32 vector with the given
+  // logical [out, in] (or [N] for bias / LN params) shape.
+  auto make_f32 = [](const std::vector<float>& w,
+                      std::vector<std::uint64_t> shape)
+      -> io::GgufFile::WriteTensor {
+    io::GgufFile::WriteTensor t;
+    t.dtype = io::GgufFile::GgmlType::F32;
+    t.shape = std::move(shape);
+    t.data = w.data();
+    t.size_bytes = w.size() * sizeof(float);
+    return t;
+  };
+
+  std::vector<std::pair<std::string, io::GgufFile::WriteTensor>> tensors;
+  tensors.reserve(
+      static_cast<std::size_t>(L) * 16 + 8);
+
+  tensors.emplace_back(
+      "token_embd.weight",
+      make_f32(embed_,
+                {static_cast<std::uint64_t>(d),
+                 static_cast<std::uint64_t>(V)}));
+  for (int i = 0; i < L; ++i) {
+    const auto& lw = layers_[static_cast<std::size_t>(i)];
+    tensors.emplace_back(
+        GgufLayerName(i, "attn_norm.weight"),
+        make_f32(lw.attn_ln_w, {static_cast<std::uint64_t>(d)}));
+    tensors.emplace_back(
+        GgufLayerName(i, "attn_norm.bias"),
+        make_f32(lw.attn_ln_b, {static_cast<std::uint64_t>(d)}));
+    const std::vector<std::uint64_t> d_by_d = {
+        static_cast<std::uint64_t>(d), static_cast<std::uint64_t>(d)};
+    tensors.emplace_back(GgufLayerName(i, "attn_q.weight"),
+                          make_f32(lw.q_w, d_by_d));
+    tensors.emplace_back(
+        GgufLayerName(i, "attn_q.bias"),
+        make_f32(lw.q_b, {static_cast<std::uint64_t>(d)}));
+    tensors.emplace_back(GgufLayerName(i, "attn_k.weight"),
+                          make_f32(lw.k_w, d_by_d));
+    tensors.emplace_back(
+        GgufLayerName(i, "attn_k.bias"),
+        make_f32(lw.k_b, {static_cast<std::uint64_t>(d)}));
+    tensors.emplace_back(GgufLayerName(i, "attn_v.weight"),
+                          make_f32(lw.v_w, d_by_d));
+    tensors.emplace_back(
+        GgufLayerName(i, "attn_v.bias"),
+        make_f32(lw.v_b, {static_cast<std::uint64_t>(d)}));
+    tensors.emplace_back(GgufLayerName(i, "attn_output.weight"),
+                          make_f32(lw.out_w, d_by_d));
+    tensors.emplace_back(
+        GgufLayerName(i, "attn_output.bias"),
+        make_f32(lw.out_b, {static_cast<std::uint64_t>(d)}));
+    tensors.emplace_back(
+        GgufLayerName(i, "ffn_norm.weight"),
+        make_f32(lw.ffn_ln_w, {static_cast<std::uint64_t>(d)}));
+    tensors.emplace_back(
+        GgufLayerName(i, "ffn_norm.bias"),
+        make_f32(lw.ffn_ln_b, {static_cast<std::uint64_t>(d)}));
+    tensors.emplace_back(
+        GgufLayerName(i, "ffn_up.weight"),
+        make_f32(lw.fc1_w,
+                  {static_cast<std::uint64_t>(d),
+                   static_cast<std::uint64_t>(ffn)}));
+    tensors.emplace_back(
+        GgufLayerName(i, "ffn_up.bias"),
+        make_f32(lw.fc1_b, {static_cast<std::uint64_t>(ffn)}));
+    tensors.emplace_back(
+        GgufLayerName(i, "ffn_down.weight"),
+        make_f32(lw.fc2_w,
+                  {static_cast<std::uint64_t>(ffn),
+                   static_cast<std::uint64_t>(d)}));
+    tensors.emplace_back(
+        GgufLayerName(i, "ffn_down.bias"),
+        make_f32(lw.fc2_b, {static_cast<std::uint64_t>(d)}));
+  }
+  tensors.emplace_back(
+      "enc_norm.weight",
+      make_f32(final_ln_w_, {static_cast<std::uint64_t>(d)}));
+  tensors.emplace_back(
+      "enc_norm.bias",
+      make_f32(final_ln_b_, {static_cast<std::uint64_t>(d)}));
+  tensors.emplace_back(
+      "lm_head.weight",
+      make_f32(lm_dense_w_,
+                {static_cast<std::uint64_t>(d),
+                 static_cast<std::uint64_t>(d)}));
+  tensors.emplace_back(
+      "lm_head.bias",
+      make_f32(lm_dense_b_, {static_cast<std::uint64_t>(d)}));
+  tensors.emplace_back(
+      "lm_head_norm.weight",
+      make_f32(lm_ln_w_, {static_cast<std::uint64_t>(d)}));
+  tensors.emplace_back(
+      "lm_head_norm.bias",
+      make_f32(lm_ln_b_, {static_cast<std::uint64_t>(d)}));
+  tensors.emplace_back(
+      "output.bias",
+      make_f32(lm_decoder_bias_, {static_cast<std::uint64_t>(V)}));
+
+  io::GgufFile::Write(path, meta, tensors);
+}
+
+namespace {
+
 // Embed: gather rows from [vocab_size, d] and apply the inference-time
 // token_dropout rescale. ESM zeroes mask-token embeddings and rescales by
 // (1 - 0.15*0.8) / (1 - observed_mask_fraction) = 0.88 / (1 - omf).

@@ -153,6 +153,16 @@ PYBIND11_MODULE(_core, m) {
   py::class_<esm::Model>(m, "Model")
       .def_static("load_from_safetensors", &esm::Model::LoadFromSafetensors,
                   py::arg("path"))
+      .def_static("load_from_gguf", &esm::Model::LoadFromGguf,
+                  py::arg("path"),
+                  "Load an ESM-2 model from a GGUF v3 file (produced by "
+                  "Model.save_to_gguf or `python -m esm_cpp.convert`).")
+      .def_static("load", &esm::Model::Load, py::arg("path"),
+                  "Auto-detect by magic byte: GGUF if the file starts "
+                  "with the GGUF magic, safetensors otherwise.")
+      .def("save_to_gguf", &esm::Model::SaveToGguf, py::arg("path"),
+           "Serialize the current model state to GGUF v3. FP32 weights "
+           "are stored as-is; Slice 5 adds Q8_ESM for quantized state.")
       .def_property_readonly("config", &esm::Model::config)
       .def("set_first_block_fc1_fp16", &esm::Model::SetFirstBlockFc1Fp16,
            py::arg("enabled"),
