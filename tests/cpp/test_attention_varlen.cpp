@@ -8,13 +8,48 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
+#include "esm_cpp/cpu_features.h"
 #include "esm_cpp/kernels.h"
 
 namespace {
+
+#if defined(__x86_64__) || defined(_M_X64)
+bool HostHasAvx512() {
+  const esm::Isa isa = esm::HostIsa();
+  return isa == esm::Isa::Avx512 || isa == esm::Isa::Avx512Vnni ||
+         isa == esm::Isa::Amx;
+}
+
+class ForceIsa {
+ public:
+  explicit ForceIsa(const char* value) {
+    prev_ = std::getenv("ESM_FORCE_ISA");
+    if (prev_) prev_copy_ = prev_;
+    if (value) {
+      ::setenv("ESM_FORCE_ISA", value, 1);
+    } else {
+      ::unsetenv("ESM_FORCE_ISA");
+    }
+  }
+  ~ForceIsa() {
+    if (prev_) {
+      ::setenv("ESM_FORCE_ISA", prev_copy_.c_str(), 1);
+    } else {
+      ::unsetenv("ESM_FORCE_ISA");
+    }
+  }
+
+ private:
+  const char* prev_;
+  std::string prev_copy_;
+};
+#endif
 
 std::vector<float> RandomVec(std::size_t n, std::uint32_t seed) {
   std::mt19937 rng(seed);
@@ -166,3 +201,57 @@ TEST(AttentionVarlenRef, B2PackedIsolatesSequences) {
         << "first seq leaked at i=" << i;
   }
 }
+
+#if defined(__x86_64__) || defined(_M_X64)
+TEST(AttentionVarlenAvx512, MatchesRefAcrossEsmHeadDims) {
+  if (!HostHasAvx512()) GTEST_SKIP() << "host lacks AVX-512";
+  // ESM head_dim values: 16 (8M), 24 (35M), 32 (150M), 64 (650M / 3B).
+  // Plus 17 (odd, exercises masked tail in the dot product), 3 (tiny).
+  struct Case {
+    int H;     // num_heads
+    int dh;    // head_dim
+    int L1;    // seq 0 length
+    int L2;    // seq 1 length (or 0 for B=1)
+  };
+  const Case cases[] = {
+      // B=1 sanity sweep across head_dim
+      {2, 3, 5, 0}, {4, 16, 32, 0}, {4, 17, 9, 0},
+      {4, 24, 16, 0}, {4, 32, 17, 0}, {4, 64, 33, 0},
+      // B=2 packed — per-sequence isolation under SIMD
+      {4, 16, 17, 23}, {4, 64, 11, 31},
+      // Larger seq to exercise the 16-wide j-stride
+      {4, 32, 48, 0}, {4, 64, 64, 0},
+  };
+  for (const auto& c : cases) {
+    const int T = c.L1 + c.L2;
+    auto Q = RandomVec(static_cast<std::size_t>(T) * c.H * c.dh, 0xA1A2);
+    auto K = RandomVec(static_cast<std::size_t>(T) * c.H * c.dh, 0xB1B2);
+    auto V = RandomVec(static_cast<std::size_t>(T) * c.H * c.dh, 0xC1C2);
+    std::vector<int> cu = c.L2 > 0 ? std::vector<int>{0, c.L1, T}
+                                    : std::vector<int>{0, c.L1};
+    const int batch_size = static_cast<int>(cu.size()) - 1;
+
+    std::vector<float> out_ref(static_cast<std::size_t>(T) * c.H * c.dh);
+    std::vector<float> out_simd(static_cast<std::size_t>(T) * c.H * c.dh);
+    esm::kernels::AttentionVarlenRef(Q.data(), K.data(), V.data(),
+                                       cu.data(), batch_size, c.H, c.dh,
+                                       out_ref.data());
+    {
+      ForceIsa guard("amx");
+      esm::kernels::AttentionVarlen(Q.data(), K.data(), V.data(),
+                                      cu.data(), batch_size, c.H, c.dh,
+                                      out_simd.data());
+    }
+    // FP32 softmax accumulator + polynomial exp introduces ~1e-5 relative
+    // drift vs the FP64-sum reference. ESM's hidden-state HF parity gate
+    // is rtol=1e-3 atol=8e-2 (SPEC Phase 0 amendment), comfortably wider.
+    for (std::size_t i = 0; i < out_ref.size(); ++i) {
+      const float ref_mag = std::fabs(out_ref[i]);
+      EXPECT_NEAR(out_simd[i], out_ref[i],
+                   1e-4f * (1.0f + ref_mag))
+          << "H=" << c.H << " dh=" << c.dh << " L1=" << c.L1
+          << " L2=" << c.L2 << " i=" << i;
+    }
+  }
+}
+#endif  // x86_64

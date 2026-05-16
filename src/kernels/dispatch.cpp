@@ -46,6 +46,9 @@ void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
 void GeluAvx512(const float* x, float* out, std::size_t n);
 void LayerNormAvx512(const float* x, const float* gamma, const float* beta,
                      float eps, float* out, int num_rows, int d);
+void AttentionVarlenAvx512(const float* q, const float* k, const float* v,
+                            const int* cu_seqlens, int batch_size,
+                            int num_heads, int head_dim, float* out);
 #endif
 
 void LinearInt8(const float* A, const esm::quant::QuantizedTensor& W,
@@ -106,6 +109,28 @@ void Attention(const float* Q, const float* K, const float* V,
   }
 }
 
+namespace {
+// ISA-dispatched single-call body. Used both by the parallel_for shim
+// below (one chunk per worker) and by the direct serial path.
+inline void AttentionVarlenBody(const float* q, const float* k,
+                                 const float* v, const int* cu_seqlens,
+                                 int batch_size, int num_heads, int head_dim,
+                                 float* out) {
+  switch (esm::CurrentIsa()) {
+#if defined(__x86_64__) || defined(_M_X64)
+    case Isa::Avx512:
+    case Isa::Avx512Vnni:
+    case Isa::Amx:
+      return AttentionVarlenAvx512(q, k, v, cu_seqlens, batch_size,
+                                    num_heads, head_dim, out);
+#endif
+    default:
+      return AttentionVarlenRef(q, k, v, cu_seqlens, batch_size, num_heads,
+                                head_dim, out);
+  }
+}
+}  // namespace
+
 void AttentionVarlen(const float* q, const float* k, const float* v,
                      const int* cu_seqlens, int batch_size, int num_heads,
                      int head_dim, float* out) {
@@ -116,16 +141,13 @@ void AttentionVarlen(const float* q, const float* k, const float* v,
   if (batch_size > 1 && !esm::InGlobalPoolWorker()) {
     esm::GlobalPool().parallel_for(
         0, batch_size, /*grain=*/1, [&](int begin, int end) {
-          AttentionVarlenRef(q, k, v, cu_seqlens + begin, end - begin,
-                             num_heads, head_dim, out);
+          AttentionVarlenBody(q, k, v, cu_seqlens + begin, end - begin,
+                               num_heads, head_dim, out);
         });
     return;
   }
-  switch (esm::CurrentIsa()) {
-    default:
-      return AttentionVarlenRef(q, k, v, cu_seqlens, batch_size, num_heads,
-                                head_dim, out);
-  }
+  AttentionVarlenBody(q, k, v, cu_seqlens, batch_size, num_heads, head_dim,
+                       out);
 }
 
 }  // namespace esm::kernels
