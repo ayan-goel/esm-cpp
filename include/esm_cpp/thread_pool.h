@@ -59,4 +59,14 @@ class ThreadPool {
   bool stop_ = false;
 };
 
+// Process-global pool, lazily initialized at first call. Sized from
+// ESM_NUM_THREADS (default physical-core count) at first construction.
+// Subsequent env-var changes are not honored.
+ThreadPool& GlobalPool();
+
+// True iff the current thread is a worker inside GlobalPool(). Use this
+// to avoid nested parallel_for calls that would deadlock when every
+// worker is already blocked waiting on its own inner dispatch.
+bool InGlobalPoolWorker();
+
 }  // namespace esm

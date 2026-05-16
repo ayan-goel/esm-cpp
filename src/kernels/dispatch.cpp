@@ -1,5 +1,6 @@
 #include "esm_cpp/cpu_features.h"
 #include "esm_cpp/kernels.h"
+#include "esm_cpp/thread_pool.h"
 
 // Dispatch facade. The *Ref impls are always present (Ref TU); SIMD impls
 // register themselves below via per-arch forward declarations. Any ISA we
@@ -93,6 +94,18 @@ void Attention(const float* Q, const float* K, const float* V,
 void AttentionVarlen(const float* q, const float* k, const float* v,
                      const int* cu_seqlens, int batch_size, int num_heads,
                      int head_dim, float* out) {
+  // Per-sequence attention is fully independent across batches — parallel
+  // dispatch across the batch dim is the natural axis. Skip the dispatch
+  // when already running inside a pool worker (e.g. ForwardBatch's
+  // per-sequence parallelism) to avoid nested-parallel_for deadlock.
+  if (batch_size > 1 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(
+        0, batch_size, /*grain=*/1, [&](int begin, int end) {
+          AttentionVarlenRef(q, k, v, cu_seqlens + begin, end - begin,
+                             num_heads, head_dim, out);
+        });
+    return;
+  }
   switch (esm::CurrentIsa()) {
     default:
       return AttentionVarlenRef(q, k, v, cu_seqlens, batch_size, num_heads,

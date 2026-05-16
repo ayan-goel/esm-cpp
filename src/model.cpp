@@ -11,6 +11,7 @@
 #include <immintrin.h>
 #endif
 
+#include "esm_cpp/batch.h"
 #include "esm_cpp/cpu_features.h"
 #include "esm_cpp/io.h"
 #include "esm_cpp/kernels.h"
@@ -142,41 +143,50 @@ namespace {
 // Embed: gather rows from [vocab_size, d] and apply the inference-time
 // token_dropout rescale. ESM zeroes mask-token embeddings and rescales by
 // (1 - 0.15*0.8) / (1 - observed_mask_fraction) = 0.88 / (1 - omf).
+//
+// Per-sequence rescale: each sequence b in [0, batch_size) computes its
+// own mask_ratio over tokens in [cu_seqlens[b], cu_seqlens[b+1]), so the
+// packed-batch path doesn't average mask densities across sequences. The
+// B=1 path (Forward) collapses to the Phase 0 behavior bit-for-bit.
 void Embed(const Config& cfg, const float* embed_w,
            std::span<const int32_t> ids, std::span<const int32_t> mask,
-           float* out) {
-  const int L = static_cast<int>(ids.size());
+           const int* cu_seqlens, int batch_size, float* out) {
   const int d = cfg.hidden_size;
-  int src_len = 0;
-  int observed_masks = 0;
-  for (int t = 0; t < L; ++t) {
-    if (mask.empty() || mask[static_cast<std::size_t>(t)] != 0) ++src_len;
-    if (ids[static_cast<std::size_t>(t)] == cfg.mask_token_id) ++observed_masks;
-  }
-  const float mask_ratio_observed =
-      (src_len > 0)
-          ? static_cast<float>(observed_masks) / static_cast<float>(src_len)
-          : 0.0f;
-  // (1 - 0.12) / (1 - obs). When obs == 0 this is 0.88 — the well-known
-  // "ESM scales everything by 0.88 at inference" gotcha.
-  const float scale = (1.0f - kTokenDropoutMaskRatioTrain) /
-                      std::max(1.0f - mask_ratio_observed, 1e-12f);
-
-  for (int t = 0; t < L; ++t) {
-    int32_t id = ids[static_cast<std::size_t>(t)];
-    const float* row = embed_w + static_cast<long>(id) * d;
-    float* out_row = out + static_cast<long>(t) * d;
-    bool zero_row = (id == cfg.mask_token_id);
-    bool is_pad = !mask.empty() && mask[static_cast<std::size_t>(t)] == 0;
-    if (zero_row) {
-      for (int i = 0; i < d; ++i) out_row[i] = 0.0f;
-    } else {
-      for (int i = 0; i < d; ++i) out_row[i] = row[i] * scale;
+  for (int b = 0; b < batch_size; ++b) {
+    const int start = cu_seqlens[b];
+    const int end = cu_seqlens[b + 1];
+    int src_len = 0;
+    int observed_masks = 0;
+    for (int t = start; t < end; ++t) {
+      const std::size_t ti = static_cast<std::size_t>(t);
+      if (mask.empty() || mask[ti] != 0) ++src_len;
+      if (ids[ti] == cfg.mask_token_id) ++observed_masks;
     }
-    if (is_pad) {
-      // HF multiplies the post-rescale embedding by attention_mask, which
-      // zeroes pad rows entirely.
-      for (int i = 0; i < d; ++i) out_row[i] = 0.0f;
+    const float mask_ratio_observed =
+        (src_len > 0)
+            ? static_cast<float>(observed_masks) / static_cast<float>(src_len)
+            : 0.0f;
+    // (1 - 0.12) / (1 - obs). When obs == 0 this is 0.88 — the well-known
+    // "ESM scales everything by 0.88 at inference" gotcha.
+    const float scale = (1.0f - kTokenDropoutMaskRatioTrain) /
+                        std::max(1.0f - mask_ratio_observed, 1e-12f);
+    for (int t = start; t < end; ++t) {
+      const std::size_t ti = static_cast<std::size_t>(t);
+      std::int32_t id = ids[ti];
+      const float* row = embed_w + static_cast<long>(id) * d;
+      float* out_row = out + static_cast<long>(t) * d;
+      bool zero_row = (id == cfg.mask_token_id);
+      bool is_pad = !mask.empty() && mask[ti] == 0;
+      if (zero_row) {
+        for (int i = 0; i < d; ++i) out_row[i] = 0.0f;
+      } else {
+        for (int i = 0; i < d; ++i) out_row[i] = row[i] * scale;
+      }
+      if (is_pad) {
+        // HF multiplies the post-rescale embedding by attention_mask,
+        // which zeroes pad rows entirely.
+        for (int i = 0; i < d; ++i) out_row[i] = 0.0f;
+      }
     }
   }
 }
@@ -229,7 +239,7 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
                       float* scratch_attn_out, float* scratch_attn_proj,
                       float* scratch_inter, float* scratch_inter_gelu,
                       float* scratch_ffn_out, const int* cu_seqlens,
-                      int batch_size, int L, int layer_index,
+                      int batch_size, int L, int max_seqlen, int layer_index,
                       ActivationObserver* observer) {
   const int d = cfg.hidden_size;
   const int H = cfg.num_attention_heads;
@@ -260,7 +270,9 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   const float q_scale = 1.0f / std::sqrt(static_cast<float>(dh));
   for (long i = 0; i < static_cast<long>(L) * d; ++i) q_packed[i] *= q_scale;
 
-  kernels::RopeBuildTables(L, dh, scratch_cos, scratch_sin);
+  // RoPE positions reset per sequence — table only needs max_seqlen rows
+  // even when packed T = sum(L_b) is much larger.
+  kernels::RopeBuildTables(max_seqlen, dh, scratch_cos, scratch_sin);
   kernels::RopeApplyVarlenRef(q_packed, scratch_cos, scratch_sin, cu_seqlens,
                               batch_size, H, dh);
   kernels::RopeApplyVarlenRef(k_packed, scratch_cos, scratch_sin, cu_seqlens,
@@ -343,6 +355,130 @@ std::vector<float> Model::ForwardWithObserver(
   return logits;
 }
 
+void Model::ForwardPackedInto(
+    const BatchView& batch, Workspace& ws,
+    std::vector<std::vector<float>>* logits_per_seq_out,
+    std::vector<std::vector<float>>* hidden_packed_out,
+    ActivationObserver* observer) const {
+  const int T = static_cast<int>(batch.total_tokens());
+  const int B = batch.batch_size;
+  const int d = cfg_.hidden_size;
+  const int H = cfg_.num_attention_heads;
+  const int dh = cfg_.head_dim;
+  const int ffn = cfg_.intermediate_size;
+  const int V = cfg_.vocab_size;
+  if (T == 0) {
+    if (logits_per_seq_out) logits_per_seq_out->clear();
+    return;
+  }
+
+  // RAII activation: rewinds the arena cursor at entry and flags the
+  // workspace in-use for the duration of the forward.
+  auto ws_guard = ws.activate();
+
+  const std::size_t T_sz = static_cast<std::size_t>(T);
+  const std::size_t Td = T_sz * static_cast<std::size_t>(d);
+  const std::size_t T3d = Td * 3;
+  const std::size_t Tffn = T_sz * static_cast<std::size_t>(ffn);
+  const std::size_t TV = T_sz * static_cast<std::size_t>(V);
+  (void)H;
+
+  // Max sequence length governs the RoPE table size; varlen RoPE indexes
+  // positions [0, L_b) into the shared cos/sin tables per sequence.
+  int max_seqlen = 0;
+  for (int b = 0; b < B; ++b) {
+    max_seqlen = std::max(max_seqlen, batch.sequence_length(b));
+  }
+  const std::size_t Mdh = static_cast<std::size_t>(max_seqlen) *
+                          static_cast<std::size_t>(dh);
+
+  // Reserve the worst-case workspace size BEFORE the first allocate.
+  // Growing the arena mid-forward would reallocate the backing buffer
+  // and invalidate every pointer we'd already handed out (Workspace::Grow
+  // asserts against that path). Counts: hidden + scratch_ln + 3*qkv +
+  //   2*cos/sin + attn_out + attn_proj + 2*inter/inter_gelu + ffn_out +
+  //   final_ln + lm_dense + lm_gelu + lm_ln + packed_logits
+  // = 15 buffers totalling 20*Td + 2*Mdh + T*V floats. One cache line of
+  // slack per allocation covers Workspace::AlignUp padding.
+  const std::size_t scratch_floats = 20 * Td + 2 * Mdh + TV;
+  const std::size_t alignment_slack = 15 * 64;
+  ws.reserve(scratch_floats * sizeof(float) + alignment_slack);
+
+  float* hidden = ws.allocate<float>(Td);
+  Embed(cfg_, embed_.data(), batch.packed_ids, batch.packed_masks,
+        batch.cu_seqlens.data(), B, hidden);
+
+  if (hidden_packed_out) {
+    hidden_packed_out->clear();
+    hidden_packed_out->reserve(
+        static_cast<std::size_t>(cfg_.num_hidden_layers + 1));
+    hidden_packed_out->emplace_back(hidden, hidden + Td);
+  }
+
+  float* scratch_ln = ws.allocate<float>(Td);
+  float* scratch_qkv_flat = ws.allocate<float>(T3d);
+  float* scratch_cos = ws.allocate<float>(Mdh);
+  float* scratch_sin = ws.allocate<float>(Mdh);
+  float* scratch_attn_out = ws.allocate<float>(Td);
+  float* scratch_attn_proj = ws.allocate<float>(Td);
+  float* scratch_inter = ws.allocate<float>(Tffn);
+  float* scratch_inter_gelu = ws.allocate<float>(Tffn);
+  float* scratch_ffn_out = ws.allocate<float>(Td);
+
+  for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
+    TransformerBlock(cfg_, layers_[static_cast<std::size_t>(i)], hidden,
+                     scratch_ln, scratch_qkv_flat, scratch_cos, scratch_sin,
+                     scratch_attn_out, scratch_attn_proj, scratch_inter,
+                     scratch_inter_gelu, scratch_ffn_out,
+                     batch.cu_seqlens.data(),
+                     /*batch_size=*/B, T, max_seqlen,
+                     /*layer_index=*/i, observer);
+    if (hidden_packed_out) {
+      hidden_packed_out->emplace_back(hidden, hidden + Td);
+    }
+  }
+
+  // Final encoder LayerNorm (= HF emb_layer_norm_after); produces the
+  // hidden state that lm_head consumes.
+  float* final_ln = ws.allocate<float>(Td);
+  kernels::LayerNorm(hidden, final_ln_w_.data(), final_ln_b_.data(),
+                     cfg_.layer_norm_eps, final_ln, T, d);
+  if (hidden_packed_out) {
+    hidden_packed_out->back().assign(final_ln, final_ln + Td);
+  }
+
+  // lm_head: dense -> gelu -> layer_norm -> tied decoder + bias.
+  float* lm_dense = ws.allocate<float>(Td);
+  kernels::Linear(final_ln, lm_dense_w_.data(), lm_dense_b_.data(), lm_dense,
+                  T, d, d);
+  float* lm_gelu = ws.allocate<float>(Td);
+  kernels::Gelu(lm_dense, lm_gelu, Td);
+  float* lm_ln = ws.allocate<float>(Td);
+  kernels::LayerNorm(lm_gelu, lm_ln_w_.data(), lm_ln_b_.data(),
+                     cfg_.layer_norm_eps, lm_ln, T, d);
+
+  // Tied decoder: packed [T, V] logits then split per-sequence. embed_
+  // has shape [V, d] which is exactly the layout Linear expects for
+  // W [N=V, K=d]. The packed logits live in the arena; per-sequence
+  // outputs are the caller-visible boundary allocs.
+  float* packed_logits = ws.allocate<float>(TV);
+  kernels::Linear(lm_ln, embed_.data(), lm_decoder_bias_.data(),
+                  packed_logits, T, V, d);
+  if (logits_per_seq_out) {
+    logits_per_seq_out->resize(static_cast<std::size_t>(B));
+    for (int b = 0; b < B; ++b) {
+      const int start = batch.cu_seqlens[static_cast<std::size_t>(b)];
+      const int L_b = batch.sequence_length(b);
+      auto& dst = (*logits_per_seq_out)[static_cast<std::size_t>(b)];
+      dst.resize(static_cast<std::size_t>(L_b) *
+                 static_cast<std::size_t>(V));
+      std::memcpy(dst.data(), packed_logits + static_cast<long>(start) * V,
+                  static_cast<std::size_t>(L_b) *
+                      static_cast<std::size_t>(V) * sizeof(float));
+    }
+  }
+}
+
 void Model::ForwardInto(
     std::span<const std::int32_t> input_ids,
     std::span<const std::int32_t> attention_mask, Workspace& ws,
@@ -350,120 +486,38 @@ void Model::ForwardInto(
     std::vector<std::vector<float>>* hidden_states_out,
     ActivationObserver* observer) const {
   const int L = static_cast<int>(input_ids.size());
-  const int d = cfg_.hidden_size;
-  const int H = cfg_.num_attention_heads;
-  const int dh = cfg_.head_dim;
-  const int ffn = cfg_.intermediate_size;
-  const int V = cfg_.vocab_size;
   if (L == 0) {
     if (logits_out) logits_out->clear();
+    if (hidden_states_out) hidden_states_out->clear();
     return;
   }
-
   if (!attention_mask.empty() &&
       attention_mask.size() != input_ids.size()) {
     throw std::runtime_error("attention_mask length mismatch");
   }
 
-  // RAII activation: rewinds the arena cursor at entry and flags the
-  // workspace in-use for the duration of the forward.
-  auto ws_guard = ws.activate();
+  // Build a B=1 BatchView over the caller's buffers. cu_seqlens is a
+  // pair of locals; BatchView captures it by span so it must outlive the
+  // call.
+  const std::int32_t cu_arr[2] = {0, L};
+  std::span<const std::int32_t> cu_span(cu_arr, 2);
+  BatchView view(input_ids, attention_mask, cu_span, /*batch=*/1);
 
-  const std::size_t L_sz = static_cast<std::size_t>(L);
-  const std::size_t Ld = L_sz * static_cast<std::size_t>(d);
-  const std::size_t L3d = Ld * 3;
-  const std::size_t Ldh = L_sz * static_cast<std::size_t>(dh);
-  const std::size_t Lffn = L_sz * static_cast<std::size_t>(ffn);
-  const std::size_t LV = L_sz * static_cast<std::size_t>(V);
-  (void)H;
-  (void)LV;
-
-  // Reserve the worst-case workspace size BEFORE the first allocate. Growing
-  // the arena mid-forward would reallocate the backing buffer and invalidate
-  // every pointer we'd already handed out — Workspace::Grow asserts against
-  // that path, but only when we've correctly pre-sized here.
-  // Slice 4: cu_seqlens layout drops the 3 head-major QKV reshape buffers.
-  // Counts: hidden + scratch_ln + 3*qkv + 2*cos/sin +
-  //         attn_out + attn_proj + 2*inter/inter_gelu + ffn_out +
-  //         final_ln + lm_dense + lm_gelu + lm_ln
-  //       = 14 buffers totalling 20*Ld + 2*Ldh floats. One cache line of
-  //         slack per allocation covers Workspace::AlignUp padding.
-  const std::size_t scratch_floats = 20 * Ld + 2 * Ldh;
-  const std::size_t alignment_slack = 14 * 64;
-  ws.reserve(scratch_floats * sizeof(float) + alignment_slack);
-
-  float* hidden = ws.allocate<float>(Ld);
-  Embed(cfg_, embed_.data(), input_ids, attention_mask, hidden);
-
-  if (hidden_states_out) {
-    hidden_states_out->clear();
-    hidden_states_out->reserve(static_cast<std::size_t>(cfg_.num_hidden_layers + 1));
-    hidden_states_out->emplace_back(hidden, hidden + Ld);
-  }
-
-  float* scratch_ln = ws.allocate<float>(Ld);
-  float* scratch_qkv_flat = ws.allocate<float>(L3d);
-  float* scratch_cos = ws.allocate<float>(Ldh);
-  float* scratch_sin = ws.allocate<float>(Ldh);
-  float* scratch_attn_out = ws.allocate<float>(Ld);
-  float* scratch_attn_proj = ws.allocate<float>(Ld);
-  float* scratch_inter = ws.allocate<float>(Lffn);
-  float* scratch_inter_gelu = ws.allocate<float>(Lffn);
-  float* scratch_ffn_out = ws.allocate<float>(Ld);
-
-  // B=1 cu_seqlens for the Phase 1 single-sequence path. Phase 3 scheduler
-  // will pack multiple sequences with cu_seqlens = {0, L_0, L_0+L_1, ...}.
-  const int cu_seqlens_b1[2] = {0, L};
-
-  for (int i = 0; i < cfg_.num_hidden_layers; ++i) {
-    TransformerBlock(cfg_, layers_[static_cast<std::size_t>(i)], hidden,
-                     scratch_ln, scratch_qkv_flat, scratch_cos, scratch_sin,
-                     scratch_attn_out, scratch_attn_proj, scratch_inter,
-                     scratch_inter_gelu, scratch_ffn_out, cu_seqlens_b1,
-                     /*batch_size=*/1, L, /*layer_index=*/i, observer);
-    if (hidden_states_out) {
-      hidden_states_out->emplace_back(hidden, hidden + Ld);
-    }
-  }
-
-  // Final encoder LayerNorm (= HF emb_layer_norm_after); produces the
-  // hidden state that lm_head consumes.
-  float* final_ln = ws.allocate<float>(Ld);
-  kernels::LayerNorm(hidden, final_ln_w_.data(), final_ln_b_.data(),
-                     cfg_.layer_norm_eps, final_ln, L, d);
-  if (hidden_states_out) {
-    // Replace the last entry (which mirrored the pre-LN output) with the
-    // post-final-LN tensor to match HF hidden_states[-1] semantics.
-    hidden_states_out->back().assign(final_ln, final_ln + Ld);
-  }
-
-  // lm_head: dense -> gelu -> layer_norm -> tied decoder + bias.
-  float* lm_dense = ws.allocate<float>(Ld);
-  kernels::Linear(final_ln, lm_dense_w_.data(), lm_dense_b_.data(), lm_dense,
-                  L, d, d);
-  float* lm_gelu = ws.allocate<float>(Ld);
-  kernels::Gelu(lm_dense, lm_gelu, Ld);
-  float* lm_ln = ws.allocate<float>(Ld);
-  kernels::LayerNorm(lm_gelu, lm_ln_w_.data(), lm_ln_b_.data(),
-                     cfg_.layer_norm_eps, lm_ln, L, d);
-
-  // Tied decoder: logits = lm_ln @ embed^T + lm_head.bias.
-  // embed_ has shape [V, d] (out=V, in=d), which is exactly the layout
-  // Linear expects for W [N=V, K=d]. The output vector is the caller-visible
-  // boundary alloc; everything above is in the arena.
-  if (logits_out) {
-    logits_out->resize(LV);
-    kernels::Linear(lm_ln, embed_.data(), lm_decoder_bias_.data(),
-                    logits_out->data(), L, V, d);
+  std::vector<std::vector<float>> per_seq;
+  ForwardPackedInto(view, ws, logits_out ? &per_seq : nullptr,
+                    hidden_states_out, observer);
+  if (logits_out && !per_seq.empty()) {
+    *logits_out = std::move(per_seq[0]);
+  } else if (logits_out) {
+    logits_out->clear();
   }
 }
 
-// Process-global thread pool. Lazy-init on first call (Model::load
-// triggers it). Sized from ESM_NUM_THREADS at first construction; later
-// env-var changes are not honored.
-ThreadPool& GlobalPool() {
-  static ThreadPool pool = ThreadPool::FromEnv();
-  return pool;
+std::vector<std::vector<float>> Model::ForwardPacked(
+    const BatchView& batch) const {
+  std::vector<std::vector<float>> outputs;
+  ForwardPackedInto(batch, ws_, &outputs, nullptr, nullptr);
+  return outputs;
 }
 
 namespace {

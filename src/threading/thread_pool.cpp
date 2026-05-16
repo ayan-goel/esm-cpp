@@ -6,6 +6,14 @@
 
 namespace esm {
 
+namespace {
+// Tagged true while a thread is running inside ThreadPool::WorkerMain
+// off of GlobalPool(). Lets dispatch facades skip nested parallel_for
+// (which would deadlock when every worker is blocked waiting on its own
+// inner dispatch).
+thread_local bool g_in_global_pool_worker = false;
+}  // namespace
+
 ThreadPool::ThreadPool(std::size_t num_threads) {
   if (num_threads == 0) num_threads = 1;
   workers_.reserve(num_threads);
@@ -26,12 +34,20 @@ ThreadPool::~ThreadPool() {
 }
 
 void ThreadPool::WorkerMain() {
+  // Only flag worker-ness on threads owned by GlobalPool(). Test-only
+  // pools constructed directly with `ThreadPool(n)` aren't GlobalPool,
+  // but they still flag — that's fine; the only consumer is the dispatch
+  // facade nesting check, which is conservative either way.
+  g_in_global_pool_worker = true;
   for (;;) {
     Task task{0, 0, nullptr};
     {
       std::unique_lock<std::mutex> lk(mu_);
       cv_.wait(lk, [&] { return stop_ || !queue_.empty(); });
-      if (stop_ && queue_.empty()) return;
+      if (stop_ && queue_.empty()) {
+        g_in_global_pool_worker = false;
+        return;
+      }
       task = queue_.front();
       queue_.pop();
     }
@@ -78,6 +94,13 @@ void ThreadPool::parallel_for(int begin, int end, int grain,
   std::unique_lock<std::mutex> lk(mu_);
   done_cv_.wait(lk, [&] { return pending_.load() == 0; });
 }
+
+ThreadPool& GlobalPool() {
+  static ThreadPool pool = ThreadPool::FromEnv();
+  return pool;
+}
+
+bool InGlobalPoolWorker() { return g_in_global_pool_worker; }
 
 ThreadPool ThreadPool::FromEnv() {
   std::size_t n = 0;

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "esm_cpp/batch.h"
 #include "esm_cpp/cpu_features.h"
 #include "esm_cpp/model.h"
 #include "esm_cpp/observer.h"
@@ -279,6 +280,75 @@ PYBIND11_MODULE(_core, m) {
           "Run a batch of sequences in parallel across the process-global "
           "thread pool. Returns a list of [seq_len, vocab_size] logit "
           "arrays. Each sequence may have a different length.")
+      .def(
+          "forward_packed",
+          [](const esm::Model& self,
+             py::array_t<std::int32_t, py::array::c_style |
+                                            py::array::forcecast>
+                 packed_ids,
+             py::array_t<std::int32_t, py::array::c_style |
+                                            py::array::forcecast>
+                 cu_seqlens,
+             py::object packed_masks) {
+            if (packed_ids.ndim() != 1) {
+              throw std::invalid_argument(
+                  "packed_ids must be a 1-D int32 array");
+            }
+            if (cu_seqlens.ndim() != 1 || cu_seqlens.shape(0) < 2) {
+              throw std::invalid_argument(
+                  "cu_seqlens must be a 1-D int32 array of size batch + 1");
+            }
+            std::span<const std::int32_t> ids(
+                packed_ids.data(),
+                static_cast<std::size_t>(packed_ids.shape(0)));
+            std::span<const std::int32_t> seqlens(
+                cu_seqlens.data(),
+                static_cast<std::size_t>(cu_seqlens.shape(0)));
+            std::vector<std::int32_t> masks_storage;
+            std::span<const std::int32_t> masks_span;
+            if (!packed_masks.is_none()) {
+              auto m = py::cast<
+                  py::array_t<std::int32_t, py::array::c_style |
+                                                 py::array::forcecast>>(
+                  packed_masks);
+              if (m.ndim() != 1 || m.shape(0) != packed_ids.shape(0)) {
+                throw std::invalid_argument(
+                    "packed_masks must be a 1-D int32 array of the same "
+                    "length as packed_ids");
+              }
+              masks_storage.assign(m.data(), m.data() + m.shape(0));
+              masks_span = masks_storage;
+            }
+            const int batch_size =
+                static_cast<int>(cu_seqlens.shape(0)) - 1;
+            esm::BatchView view(ids, masks_span, seqlens, batch_size);
+            std::vector<std::vector<float>> outputs;
+            {
+              py::gil_scoped_release release;
+              outputs = self.ForwardPacked(view);
+            }
+            const auto V =
+                static_cast<py::ssize_t>(self.config().vocab_size);
+            py::list result;
+            for (int b = 0; b < batch_size; ++b) {
+              const py::ssize_t L_b = static_cast<py::ssize_t>(
+                  seqlens.data()[b + 1] - seqlens.data()[b]);
+              py::array_t<float> arr({L_b, V});
+              std::memcpy(arr.mutable_data(),
+                          outputs[static_cast<std::size_t>(b)].data(),
+                          outputs[static_cast<std::size_t>(b)].size() *
+                              sizeof(float));
+              result.append(std::move(arr));
+            }
+            return result;
+          },
+          py::arg("packed_ids"), py::arg("cu_seqlens"),
+          py::arg("packed_masks") = py::none(),
+          "Run a packed batch as a single concatenated forward through the "
+          "encoder. packed_ids is a 1-D int32 array of all sequences "
+          "concatenated; cu_seqlens has size batch+1 with cu_seqlens[0] = 0 "
+          "and cu_seqlens[-1] = len(packed_ids). Returns a list of "
+          "[L_b, vocab_size] logit arrays.")
       .def(
           "forward",
           [](const esm::Model& self,

@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "esm_cpp/batch.h"
 #include "esm_cpp/observer.h"
 #include "esm_cpp/quant.h"
 #include "esm_cpp/thread_pool.h"
@@ -94,12 +95,18 @@ class Model {
 
   // Run a batch of independent sequences in parallel. Each sequence runs
   // through its own Workspace from a per-thread pool; the dispatch axis
-  // is the batch dimension. Phase 3's cu_seqlens scheduler will replace
-  // this with packed-batch attention; until then each sequence pays its
-  // own arena setup but multiple sequences run concurrently.
+  // is the batch dimension. ForwardPacked is the cu_seqlens-packed sibling
+  // that runs all sequences as one packed forward through the encoder.
   std::vector<std::vector<float>> ForwardBatch(
       const std::vector<std::vector<std::int32_t>>& input_ids,
       const std::vector<std::vector<std::int32_t>>& attention_masks) const;
+
+  // Phase 3 Slice 1: run a packed batch as a single concatenated forward.
+  // The encoder sees one [T, d] tensor where T = sum of per-sequence lengths;
+  // per-sequence attention is enforced via cu_seqlens inside AttentionVarlen.
+  // Returns one logits buffer per sequence, each shaped [L_b, vocab_size].
+  // NOT thread-safe: the single Model instance owns one Workspace.
+  std::vector<std::vector<float>> ForwardPacked(const BatchView& batch) const;
 
   // Number of threads used by ForwardBatch (process-global pool sized
   // from ESM_NUM_THREADS at first Model::load, default physical-core).
@@ -138,14 +145,24 @@ class Model {
 
  private:
   Model() = default;
-  // Forward implementation that lets the caller supply the per-call
-  // workspace and logits buffer. Forward() / ForwardWithHiddenStates()
-  // are the public single-sequence wrappers around this.
+  // Single-sequence forward (B=1 wrapper around ForwardPackedInto). Writes
+  // a flat [L * vocab_size] logits vector. Forward / ForwardWithHiddenStates
+  // / ForwardWithObserver are the public entry points.
   void ForwardInto(
       std::span<const std::int32_t> input_ids,
       std::span<const std::int32_t> attention_mask, Workspace& ws,
       std::vector<float>* logits_out,
       std::vector<std::vector<float>>* hidden_states_out,
+      ActivationObserver* observer = nullptr) const;
+
+  // Packed-batch forward core: writes one logits buffer per sequence into
+  // logits_per_seq_out (each [L_b * V]). If hidden_packed_out is non-null,
+  // it receives the packed [T, d] hidden state at every layer + the final
+  // post-LN tensor (semantics match ForwardWithHiddenStates but on T not L).
+  void ForwardPackedInto(
+      const BatchView& batch, Workspace& ws,
+      std::vector<std::vector<float>>* logits_per_seq_out,
+      std::vector<std::vector<float>>* hidden_packed_out = nullptr,
       ActivationObserver* observer = nullptr) const;
 
   Config cfg_{};
