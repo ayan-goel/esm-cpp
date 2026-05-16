@@ -26,6 +26,12 @@ dev = [
   "pybind11>=2.13",
 ]
 
+[project.scripts]
+esm-cpp-convert = "esm_cpp.convert:main"
+esm-cpp-quantize = "esm_cpp.quantize:main"
+esm-cpp-pppl = "esm_cpp.eval.pppl:main"
+esm-cpp-bench = "esm_cpp.bench.compare:main"
+
 [tool.scikit-build]
 cmake.version = ">=3.20"
 cmake.args = ["-DESM_BUILD_PYTHON=ON", "-DESM_BUILD_TESTS=OFF"]
