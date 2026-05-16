@@ -1,6 +1,22 @@
 #include "esm_cpp/kernels.h"
 #include "esm_cpp/quant.h"
 
+// AVX-512 path needs intrinsics + a few STL helpers. These must live at
+// file scope, NOT inside namespace esm::kernels — system headers nested
+// in a namespace leak C-stdlib symbols (::abs, ::malloc, ::div_t, ...)
+// into that namespace and break libstdc++'s <cstdlib> using-declarations.
+#ifdef ESM_KERNEL_AVX512
+#include <immintrin.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+#include "esm_cpp/thread_pool.h"
+#endif
+
 namespace esm::kernels {
 
 #ifdef ESM_KERNEL_REFERENCE
@@ -60,16 +76,6 @@ void LinearInt8Ref(const float* A, const esm::quant::QuantizedTensor& W,
 // Threading: parallel_for across M when called from the main thread.
 // Skips parallel dispatch when InGlobalPoolWorker() to avoid nested
 // parallel_for deadlock (same pattern as AttentionVarlen).
-
-#include <immintrin.h>
-
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <cstring>
-#include <vector>
-
-#include "esm_cpp/thread_pool.h"
 
 void LinearInt8Ref(const float* A, const esm::quant::QuantizedTensor& W,
                    const float* bias, float* C, int M, int N, int K);
