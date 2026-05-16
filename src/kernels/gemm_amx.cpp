@@ -255,13 +255,18 @@ void LinearAmx(const float* A, const esm::quant::QuantizedTensor& W,
   const std::int32_t* col_sum = W.col_sum.data();
   const float* w_scale = W.per_channel_scales.data();
 
-  // M main rectangle: rows [0, M - M%32). Each parallel chunk owns full
-  // 32-row blocks, configures tiles on first use, runs the microkernel
-  // across all 32-col tiles.
+  // M main rectangle: rows [0, M_main) processed as M_main/32 row-blocks.
+  // parallel_for's `grain` is a *minimum* chunk size, not an alignment —
+  // its chunks can split mid-row-block. Parallelize over the row-block
+  // count instead so every task always sees full 32-row blocks; this
+  // avoids past-end A-tile loads on misaligned chunk boundaries (caused
+  // SIGSEGV at M_main=2048 when 22 workers chunked into 94-row pieces).
   const int M_main = M & ~31;
-  auto run = [&](int begin, int end) {
+  const int num_blocks = M_main / 32;
+  auto run_blocks = [&](int block_begin, int block_end) {
     EnsureThreadTileConfig();
-    for (int m = begin; m < end; m += 32) {
+    for (int b = block_begin; b < block_end; ++b) {
+      const int m = b * 32;
       const std::uint8_t* a_block =
           a_u8 + static_cast<long>(m) * static_cast<long>(K);
       float* c_row = C + static_cast<long>(m) * static_cast<long>(N);
@@ -275,10 +280,10 @@ void LinearAmx(const float* A, const esm::quant::QuantizedTensor& W,
       }
     }
   };
-  if (M_main >= 32 && !esm::InGlobalPoolWorker()) {
-    esm::GlobalPool().parallel_for(0, M_main, /*grain=*/32, run);
-  } else if (M_main >= 32) {
-    run(0, M_main);
+  if (num_blocks > 0 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(0, num_blocks, /*grain=*/1, run_blocks);
+  } else if (num_blocks > 0) {
+    run_blocks(0, num_blocks);
   }
 
   // M-tail (< 32 rows remaining): hand to LinearVnni against the SAME
