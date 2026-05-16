@@ -120,16 +120,20 @@ inline void FinalizeStore16Amx(__m512i acc_raw, const std::int32_t* col_sum,
 
 // Per-thread scratch for the 32×32 int32 accumulator block written by
 // _tile_stored. Sized for one microkernel call; reused across calls.
-thread_local alignas(64) std::int32_t g_amx_c_buf[32 * 32];
+// alignas must lead the decl-specifiers — clang and gcc both reject
+// `thread_local alignas(...)` ordering.
+alignas(64) thread_local std::int32_t g_amx_c_buf[32 * 32];
 // Per-thread scratch for the quantized activations.
 thread_local std::vector<std::uint8_t> g_amx_a_u8;
 
 // 32×32 microkernel: 4 C tiles, 2 A tiles, 2 B tiles. K must be a
-// multiple of 64 (one full tile-K). Caller has gated all of that.
+// multiple of 64 (one full tile-K). Caller has gated all of that. K_pad
+// equals K here (we only run when K % 64 == 0) so packed_vnni reads
+// straight through with stride 64.
 void Kernel32x32(const std::uint8_t* a_block, const std::int8_t* w_panel0,
                   const std::int8_t* w_panel1, const float* w_scale,
                   const std::int32_t* col_sum, const float* bias,
-                  float act_scale, int K, int K_pad, float* c_base, int N) {
+                  float act_scale, int K, float* c_base, int N) {
   _tile_zero(4);
   _tile_zero(5);
   _tile_zero(6);
@@ -247,7 +251,6 @@ void LinearAmx(const float* A, const esm::quant::QuantizedTensor& W,
     }
   }
 
-  const int K_pad = K;  // K is a multiple of 64, so K_pad == K
   const std::int8_t* w_packed = W.packed_vnni.data();
   const std::int32_t* col_sum = W.col_sum.data();
   const float* w_scale = W.per_channel_scales.data();
@@ -264,12 +267,11 @@ void LinearAmx(const float* A, const esm::quant::QuantizedTensor& W,
       float* c_row = C + static_cast<long>(m) * static_cast<long>(N);
       for (int nb = 0; nb < N; nb += 32) {
         const std::int8_t* w_panel0 =
-            w_packed + static_cast<long>(nb) * static_cast<long>(K_pad);
+            w_packed + static_cast<long>(nb) * static_cast<long>(K);
         const std::int8_t* w_panel1 =
-            w_packed + static_cast<long>(nb + 16) * static_cast<long>(K_pad);
+            w_packed + static_cast<long>(nb + 16) * static_cast<long>(K);
         Kernel32x32(a_block, w_panel0, w_panel1, w_scale + nb, col_sum + nb,
-                     bias ? bias + nb : nullptr, act_scale, K, K_pad,
-                     c_row + nb, N);
+                     bias ? bias + nb : nullptr, act_scale, K, c_row + nb, N);
       }
     }
   };
