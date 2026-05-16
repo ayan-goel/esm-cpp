@@ -79,8 +79,9 @@ def score_assay(
         variant_ids = wt_ids.copy()
         variant_ids[p + 1] = mask_id
         masked_inputs.append(variant_ids)
-    masks = [np.ones_like(v) for v in masked_inputs]
-    logits_list = model.forward_batch(masked_inputs, masks)
+    # All variants share the WT length, so cu_seqlens packs them densely
+    # in a single forward.
+    logits_list = model.forward_scheduled(masked_inputs)
     # Map: protein position -> [V] row at that position.
     row_at: dict[int, np.ndarray] = {}
     for p, logits in zip(pos_list, logits_list):

@@ -8,11 +8,10 @@ Definition (Lin et al. 2023):
     NLL_seq = sum_p NLL_p / (L - 2)
   PPPL = exp(mean_over_dataset(NLL_seq))
 
-Each sequence's L masked variants are batched via `Model.forward_batch`
-so the L-fold inflation runs concurrently across the thread pool. This
-is the "killer demo" for the Phase 3 cu_seqlens scheduler (research-
-report §"Continuous-batching scheduler design"); even without that
-scheduler, ForwardBatch's per-thread Workspace handles it correctly.
+Each sequence's L masked variants are packed via `Model.forward_scheduled`,
+which calls into a single cu_seqlens-packed forward through the encoder
+(all variants share length so no length-bucket fires). This is the
+canonical killer demo for the Phase 3 packed forward.
 """
 
 from __future__ import annotations
@@ -51,8 +50,9 @@ def _per_sequence_nll(
         variant = ids.copy()
         variant[p] = mask_token_id
         variants.append(variant)
-    masks = [np.ones_like(v) for v in variants]
-    logits_list = model.forward_batch(variants, masks)
+    # All variants share length L, so cu_seqlens packs them densely;
+    # imbalance metric is 1.0 and no length-bucket split occurs.
+    logits_list = model.forward_scheduled(variants)
     total_nll = 0.0
     for p, logits in zip(masked_positions, logits_list):
         # logits has shape [L, vocab_size]; row p is the prediction at
