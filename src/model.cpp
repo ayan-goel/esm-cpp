@@ -160,6 +160,29 @@ void GgufLoadVector(const io::GgufFile& gf, const std::string& name,
   std::memcpy(dst.data(), info->data, info->size_bytes);
 }
 
+// Slice 5: Q8_ESM tensor blob layout is [N, K] int8 weights followed by
+// [N] float32 per-channel scales, contiguous. Shape on the wire is
+// [K, N] (in, out) matching llama.cpp's natural axis order.
+void GgufLoadQuant(const io::GgufFile& gf, const std::string& name,
+                   esm::quant::QuantizedTensor& dst) {
+  auto info = gf.Get(name);
+  if (!info) throw std::runtime_error("gguf: missing tensor " + name);
+  if (info->dtype != io::GgufFile::GgmlType::Q8_ESM) {
+    throw std::runtime_error("gguf: expected Q8_ESM for " + name);
+  }
+  if (info->shape.size() != 2) {
+    throw std::runtime_error("gguf: Q8_ESM " + name + " must be 2-D");
+  }
+  const std::size_t K = info->shape[0];
+  const std::size_t N = info->shape[1];
+  const std::size_t packed_bytes = N * K;
+  dst.packed.assign(N * K, 0);
+  std::memcpy(dst.packed.data(), info->data, packed_bytes);
+  dst.per_channel_scales.assign(N, 0.0f);
+  std::memcpy(dst.per_channel_scales.data(),
+              info->data + packed_bytes, N * sizeof(float));
+}
+
 std::int64_t GgufMetaInt(const io::GgufFile& gf, const std::string& key) {
   auto v = gf.Metadata(key);
   if (!v) throw std::runtime_error("gguf: missing metadata " + key);
@@ -205,25 +228,51 @@ std::unique_ptr<Model> Model::LoadFromGguf(const std::string& path) {
   }
 
   GgufLoadVector(*file, "token_embd.weight", out->embed_);
+  // Slice 5: detect quantized state via metadata flag. When set, per-layer
+  // Linear weights are stored as Q8_ESM blobs; biases stay FP32. lm_head
+  // and embed stay FP32 regardless (Slice 5 escape list).
+  bool quantized = false;
+  if (auto v = file->Metadata("esm.weights_quantized")) {
+    if (auto* b = std::get_if<bool>(&*v)) quantized = *b;
+  }
+  out->cfg_.weights_quantized = quantized;
+  if (auto v = file->Metadata("esm.first_block_fc1_fp16")) {
+    if (auto* b = std::get_if<bool>(&*v)) {
+      out->cfg_.first_block_fc1_fp16 = *b;
+    }
+  }
   out->layers_.resize(static_cast<std::size_t>(out->cfg_.num_hidden_layers));
   for (int i = 0; i < out->cfg_.num_hidden_layers; ++i) {
     auto& lw = out->layers_[static_cast<std::size_t>(i)];
     GgufLoadVector(*file, GgufLayerName(i, "attn_norm.weight"), lw.attn_ln_w);
     GgufLoadVector(*file, GgufLayerName(i, "attn_norm.bias"), lw.attn_ln_b);
-    GgufLoadVector(*file, GgufLayerName(i, "attn_q.weight"), lw.q_w);
     GgufLoadVector(*file, GgufLayerName(i, "attn_q.bias"), lw.q_b);
-    GgufLoadVector(*file, GgufLayerName(i, "attn_k.weight"), lw.k_w);
     GgufLoadVector(*file, GgufLayerName(i, "attn_k.bias"), lw.k_b);
-    GgufLoadVector(*file, GgufLayerName(i, "attn_v.weight"), lw.v_w);
     GgufLoadVector(*file, GgufLayerName(i, "attn_v.bias"), lw.v_b);
-    GgufLoadVector(*file, GgufLayerName(i, "attn_output.weight"), lw.out_w);
     GgufLoadVector(*file, GgufLayerName(i, "attn_output.bias"), lw.out_b);
     GgufLoadVector(*file, GgufLayerName(i, "ffn_norm.weight"), lw.ffn_ln_w);
     GgufLoadVector(*file, GgufLayerName(i, "ffn_norm.bias"), lw.ffn_ln_b);
-    GgufLoadVector(*file, GgufLayerName(i, "ffn_up.weight"), lw.fc1_w);
     GgufLoadVector(*file, GgufLayerName(i, "ffn_up.bias"), lw.fc1_b);
-    GgufLoadVector(*file, GgufLayerName(i, "ffn_down.weight"), lw.fc2_w);
     GgufLoadVector(*file, GgufLayerName(i, "ffn_down.bias"), lw.fc2_b);
+    if (quantized) {
+      GgufLoadQuant(*file, GgufLayerName(i, "attn_q.weight"), lw.q_w_int8);
+      GgufLoadQuant(*file, GgufLayerName(i, "attn_k.weight"), lw.k_w_int8);
+      GgufLoadQuant(*file, GgufLayerName(i, "attn_v.weight"), lw.v_w_int8);
+      GgufLoadQuant(*file, GgufLayerName(i, "attn_output.weight"),
+                     lw.out_w_int8);
+      GgufLoadQuant(*file, GgufLayerName(i, "ffn_up.weight"),
+                     lw.fc1_w_int8);
+      GgufLoadQuant(*file, GgufLayerName(i, "ffn_down.weight"),
+                     lw.fc2_w_int8);
+    } else {
+      GgufLoadVector(*file, GgufLayerName(i, "attn_q.weight"), lw.q_w);
+      GgufLoadVector(*file, GgufLayerName(i, "attn_k.weight"), lw.k_w);
+      GgufLoadVector(*file, GgufLayerName(i, "attn_v.weight"), lw.v_w);
+      GgufLoadVector(*file, GgufLayerName(i, "attn_output.weight"),
+                      lw.out_w);
+      GgufLoadVector(*file, GgufLayerName(i, "ffn_up.weight"), lw.fc1_w);
+      GgufLoadVector(*file, GgufLayerName(i, "ffn_down.weight"), lw.fc2_w);
+    }
   }
   GgufLoadVector(*file, "enc_norm.weight", out->final_ln_w_);
   GgufLoadVector(*file, "enc_norm.bias", out->final_ln_b_);
@@ -250,7 +299,12 @@ void Model::SaveToGguf(const std::string& path) const {
   std::unordered_map<std::string, io::GgufFile::MetadataValue> meta;
   meta.emplace("general.architecture", std::string("esm"));
   meta.emplace("general.alignment", static_cast<std::int64_t>(32));
-  meta.emplace("general.file_type", static_cast<std::int64_t>(1));  // 1 = F32
+  // general.file_type: 1 = all F32; we use 2 to flag the Q8_ESM mixed
+  // FP32+INT8 path (decimal codepoint, not standard). Phase 5 reader
+  // keys off the esm.weights_quantized bool, not the file_type.
+  meta.emplace("general.file_type",
+                cfg_.weights_quantized ? static_cast<std::int64_t>(2)
+                                       : static_cast<std::int64_t>(1));
   meta.emplace("esm.block_count", static_cast<std::int64_t>(L));
   meta.emplace("esm.embedding_length", static_cast<std::int64_t>(d));
   meta.emplace("esm.feed_forward_length", static_cast<std::int64_t>(ffn));
@@ -265,6 +319,8 @@ void Model::SaveToGguf(const std::string& path) const {
   meta.emplace("esm.context_length",
                 static_cast<std::int64_t>(Tokenizer::kModelMaxLength));
   meta.emplace("esm.gguf_writer", std::string("esm-cpp 0.1.0"));
+  meta.emplace("esm.weights_quantized", cfg_.weights_quantized);
+  meta.emplace("esm.first_block_fc1_fp16", cfg_.first_block_fc1_fp16);
 
   // Helper: build a WriteTensor for an FP32 vector with the given
   // logical [out, in] (or [N] for bias / LN params) shape.
@@ -279,6 +335,32 @@ void Model::SaveToGguf(const std::string& path) const {
     return t;
   };
 
+  // Slice 5: per-quantized-Linear, build a contiguous blob of
+  // [N*K int8 packed bytes][N float32 scales]. Blobs outlive the Write
+  // call via this owning vector.
+  std::vector<std::vector<std::byte>> q8_blobs;
+  if (cfg_.weights_quantized) {
+    q8_blobs.reserve(static_cast<std::size_t>(L) * 6);
+  }
+  auto make_q8 = [&q8_blobs](const esm::quant::QuantizedTensor& qt,
+                              std::uint64_t K, std::uint64_t N)
+      -> io::GgufFile::WriteTensor {
+    const std::size_t packed_bytes = qt.packed.size();
+    const std::size_t scale_bytes =
+        qt.per_channel_scales.size() * sizeof(float);
+    std::vector<std::byte> blob(packed_bytes + scale_bytes);
+    std::memcpy(blob.data(), qt.packed.data(), packed_bytes);
+    std::memcpy(blob.data() + packed_bytes,
+                 qt.per_channel_scales.data(), scale_bytes);
+    q8_blobs.push_back(std::move(blob));
+    io::GgufFile::WriteTensor t;
+    t.dtype = io::GgufFile::GgmlType::Q8_ESM;
+    t.shape = {K, N};
+    t.data = q8_blobs.back().data();
+    t.size_bytes = q8_blobs.back().size();
+    return t;
+  };
+
   std::vector<std::pair<std::string, io::GgufFile::WriteTensor>> tensors;
   tensors.reserve(
       static_cast<std::size_t>(L) * 16 + 8);
@@ -288,58 +370,63 @@ void Model::SaveToGguf(const std::string& path) const {
       make_f32(embed_,
                 {static_cast<std::uint64_t>(d),
                  static_cast<std::uint64_t>(V)}));
+  const std::uint64_t d_u = static_cast<std::uint64_t>(d);
+  const std::uint64_t ffn_u = static_cast<std::uint64_t>(ffn);
   for (int i = 0; i < L; ++i) {
     const auto& lw = layers_[static_cast<std::size_t>(i)];
     tensors.emplace_back(
         GgufLayerName(i, "attn_norm.weight"),
-        make_f32(lw.attn_ln_w, {static_cast<std::uint64_t>(d)}));
+        make_f32(lw.attn_ln_w, {d_u}));
     tensors.emplace_back(
         GgufLayerName(i, "attn_norm.bias"),
-        make_f32(lw.attn_ln_b, {static_cast<std::uint64_t>(d)}));
-    const std::vector<std::uint64_t> d_by_d = {
-        static_cast<std::uint64_t>(d), static_cast<std::uint64_t>(d)};
-    tensors.emplace_back(GgufLayerName(i, "attn_q.weight"),
-                          make_f32(lw.q_w, d_by_d));
-    tensors.emplace_back(
-        GgufLayerName(i, "attn_q.bias"),
-        make_f32(lw.q_b, {static_cast<std::uint64_t>(d)}));
-    tensors.emplace_back(GgufLayerName(i, "attn_k.weight"),
-                          make_f32(lw.k_w, d_by_d));
-    tensors.emplace_back(
-        GgufLayerName(i, "attn_k.bias"),
-        make_f32(lw.k_b, {static_cast<std::uint64_t>(d)}));
-    tensors.emplace_back(GgufLayerName(i, "attn_v.weight"),
-                          make_f32(lw.v_w, d_by_d));
-    tensors.emplace_back(
-        GgufLayerName(i, "attn_v.bias"),
-        make_f32(lw.v_b, {static_cast<std::uint64_t>(d)}));
-    tensors.emplace_back(GgufLayerName(i, "attn_output.weight"),
-                          make_f32(lw.out_w, d_by_d));
-    tensors.emplace_back(
-        GgufLayerName(i, "attn_output.bias"),
-        make_f32(lw.out_b, {static_cast<std::uint64_t>(d)}));
-    tensors.emplace_back(
-        GgufLayerName(i, "ffn_norm.weight"),
-        make_f32(lw.ffn_ln_w, {static_cast<std::uint64_t>(d)}));
-    tensors.emplace_back(
-        GgufLayerName(i, "ffn_norm.bias"),
-        make_f32(lw.ffn_ln_b, {static_cast<std::uint64_t>(d)}));
-    tensors.emplace_back(
-        GgufLayerName(i, "ffn_up.weight"),
-        make_f32(lw.fc1_w,
-                  {static_cast<std::uint64_t>(d),
-                   static_cast<std::uint64_t>(ffn)}));
-    tensors.emplace_back(
-        GgufLayerName(i, "ffn_up.bias"),
-        make_f32(lw.fc1_b, {static_cast<std::uint64_t>(ffn)}));
-    tensors.emplace_back(
-        GgufLayerName(i, "ffn_down.weight"),
-        make_f32(lw.fc2_w,
-                  {static_cast<std::uint64_t>(ffn),
-                   static_cast<std::uint64_t>(d)}));
-    tensors.emplace_back(
-        GgufLayerName(i, "ffn_down.bias"),
-        make_f32(lw.fc2_b, {static_cast<std::uint64_t>(d)}));
+        make_f32(lw.attn_ln_b, {d_u}));
+    if (cfg_.weights_quantized) {
+      tensors.emplace_back(GgufLayerName(i, "attn_q.weight"),
+                            make_q8(lw.q_w_int8, d_u, d_u));
+      tensors.emplace_back(GgufLayerName(i, "attn_k.weight"),
+                            make_q8(lw.k_w_int8, d_u, d_u));
+      tensors.emplace_back(GgufLayerName(i, "attn_v.weight"),
+                            make_q8(lw.v_w_int8, d_u, d_u));
+      tensors.emplace_back(GgufLayerName(i, "attn_output.weight"),
+                            make_q8(lw.out_w_int8, d_u, d_u));
+    } else {
+      const std::vector<std::uint64_t> d_by_d = {d_u, d_u};
+      tensors.emplace_back(GgufLayerName(i, "attn_q.weight"),
+                            make_f32(lw.q_w, d_by_d));
+      tensors.emplace_back(GgufLayerName(i, "attn_k.weight"),
+                            make_f32(lw.k_w, d_by_d));
+      tensors.emplace_back(GgufLayerName(i, "attn_v.weight"),
+                            make_f32(lw.v_w, d_by_d));
+      tensors.emplace_back(GgufLayerName(i, "attn_output.weight"),
+                            make_f32(lw.out_w, d_by_d));
+    }
+    tensors.emplace_back(GgufLayerName(i, "attn_q.bias"),
+                          make_f32(lw.q_b, {d_u}));
+    tensors.emplace_back(GgufLayerName(i, "attn_k.bias"),
+                          make_f32(lw.k_b, {d_u}));
+    tensors.emplace_back(GgufLayerName(i, "attn_v.bias"),
+                          make_f32(lw.v_b, {d_u}));
+    tensors.emplace_back(GgufLayerName(i, "attn_output.bias"),
+                          make_f32(lw.out_b, {d_u}));
+    tensors.emplace_back(GgufLayerName(i, "ffn_norm.weight"),
+                          make_f32(lw.ffn_ln_w, {d_u}));
+    tensors.emplace_back(GgufLayerName(i, "ffn_norm.bias"),
+                          make_f32(lw.ffn_ln_b, {d_u}));
+    if (cfg_.weights_quantized) {
+      tensors.emplace_back(GgufLayerName(i, "ffn_up.weight"),
+                            make_q8(lw.fc1_w_int8, d_u, ffn_u));
+      tensors.emplace_back(GgufLayerName(i, "ffn_down.weight"),
+                            make_q8(lw.fc2_w_int8, ffn_u, d_u));
+    } else {
+      tensors.emplace_back(GgufLayerName(i, "ffn_up.weight"),
+                            make_f32(lw.fc1_w, {d_u, ffn_u}));
+      tensors.emplace_back(GgufLayerName(i, "ffn_down.weight"),
+                            make_f32(lw.fc2_w, {ffn_u, d_u}));
+    }
+    tensors.emplace_back(GgufLayerName(i, "ffn_up.bias"),
+                          make_f32(lw.fc1_b, {ffn_u}));
+    tensors.emplace_back(GgufLayerName(i, "ffn_down.bias"),
+                          make_f32(lw.fc2_b, {d_u}));
   }
   tensors.emplace_back(
       "enc_norm.weight",
