@@ -12,6 +12,7 @@
 #include "esm_cpp/cpu_features.h"
 #include "esm_cpp/model.h"
 #include "esm_cpp/observer.h"
+#include "esm_cpp/scheduler.h"
 #include "esm_cpp/smoothquant.h"
 #include "esm_cpp/tokenizer.h"
 #include "esm_cpp/version.h"
@@ -279,7 +280,11 @@ PYBIND11_MODULE(_core, m) {
           py::arg("input_ids"), py::arg("attention_masks") = py::none(),
           "Run a batch of sequences in parallel across the process-global "
           "thread pool. Returns a list of [seq_len, vocab_size] logit "
-          "arrays. Each sequence may have a different length.")
+          "arrays. Each sequence may have a different length.\n\n"
+          "Soft-deprecated in v0.1.0 in favor of forward_scheduled, which "
+          "packs sequences into single cu_seqlens forwards with optional "
+          "length-bucketing. forward_batch is kept as a perf-comparison "
+          "baseline; switch to forward_scheduled for new code.")
       .def(
           "forward_packed",
           [](const esm::Model& self,
@@ -349,6 +354,74 @@ PYBIND11_MODULE(_core, m) {
           "concatenated; cu_seqlens has size batch+1 with cu_seqlens[0] = 0 "
           "and cu_seqlens[-1] = len(packed_ids). Returns a list of "
           "[L_b, vocab_size] logit arrays.")
+      .def(
+          "forward_scheduled",
+          [](const esm::Model& self,
+             const std::vector<py::array_t<
+                 std::int32_t,
+                 py::array::c_style | py::array::forcecast>>& batch_ids,
+             py::object batch_masks, float imbalance_threshold,
+             int max_batch_size) {
+            std::vector<std::vector<std::int32_t>> ids_vec;
+            ids_vec.reserve(batch_ids.size());
+            for (const auto& arr : batch_ids) {
+              if (arr.ndim() != 1) {
+                throw std::invalid_argument(
+                    "each input_ids entry must be a 1-D int32 array");
+              }
+              ids_vec.emplace_back(arr.data(), arr.data() + arr.shape(0));
+            }
+            std::vector<std::vector<std::int32_t>> masks_vec;
+            if (!batch_masks.is_none()) {
+              auto py_masks = py::cast<std::vector<py::array_t<
+                  std::int32_t,
+                  py::array::c_style | py::array::forcecast>>>(batch_masks);
+              if (py_masks.size() != batch_ids.size()) {
+                throw std::invalid_argument(
+                    "attention_masks length must match input_ids length");
+              }
+              masks_vec.reserve(py_masks.size());
+              for (std::size_t i = 0; i < py_masks.size(); ++i) {
+                if (py_masks[i].ndim() != 1 ||
+                    py_masks[i].shape(0) != batch_ids[i].shape(0)) {
+                  throw std::invalid_argument(
+                      "attention_mask[i] must be a 1-D int32 array of the "
+                      "same length as input_ids[i]");
+                }
+                masks_vec.emplace_back(
+                    py_masks[i].data(),
+                    py_masks[i].data() + py_masks[i].shape(0));
+              }
+            }
+            esm::SchedulerConfig cfg;
+            cfg.imbalance_threshold = imbalance_threshold;
+            cfg.max_batch_size = max_batch_size;
+            std::vector<std::vector<float>> outputs;
+            {
+              py::gil_scoped_release release;
+              outputs = self.ForwardScheduled(ids_vec, masks_vec, cfg);
+            }
+            const auto V =
+                static_cast<py::ssize_t>(self.config().vocab_size);
+            py::list result;
+            for (std::size_t b = 0; b < outputs.size(); ++b) {
+              const auto L =
+                  static_cast<py::ssize_t>(ids_vec[b].size());
+              py::array_t<float> arr({L, V});
+              std::memcpy(arr.mutable_data(), outputs[b].data(),
+                          outputs[b].size() * sizeof(float));
+              result.append(std::move(arr));
+            }
+            return result;
+          },
+          py::arg("input_ids"), py::arg("attention_masks") = py::none(),
+          py::arg("imbalance_threshold") = 1.2f,
+          py::arg("max_batch_size") = 256,
+          "Run a list of sequences through one or more packed forwards "
+          "with length-aware bucketing. Returns logits in input order. "
+          "imbalance_threshold gates the bucket-split (default 1.2 = "
+          "split when max(L)/mean(L) > 1.2). max_batch_size caps the "
+          "number of sequences in a single packed dispatch.")
       .def(
           "forward",
           [](const esm::Model& self,

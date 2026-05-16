@@ -520,6 +520,68 @@ std::vector<std::vector<float>> Model::ForwardPacked(
   return outputs;
 }
 
+std::vector<std::vector<float>> Model::ForwardScheduled(
+    const std::vector<std::vector<std::int32_t>>& input_ids,
+    const std::vector<std::vector<std::int32_t>>& attention_masks,
+    const SchedulerConfig& cfg) const {
+  const std::size_t N = input_ids.size();
+  if (N == 0) return {};
+  if (!attention_masks.empty() && attention_masks.size() != N) {
+    throw std::runtime_error("attention_masks/input_ids batch size mismatch");
+  }
+  std::vector<int> lengths;
+  lengths.reserve(N);
+  for (const auto& ids : input_ids) {
+    lengths.push_back(static_cast<int>(ids.size()));
+  }
+  auto plan = PlanBatches(lengths, cfg);
+
+  std::vector<std::vector<float>> outputs(N);
+  for (const auto& group : plan) {
+    if (group.empty()) continue;
+    // Pack the chosen sequences back-to-back. cu_seqlens drives per-
+    // sequence isolation inside ForwardPacked.
+    std::vector<std::int32_t> packed_ids;
+    std::vector<std::int32_t> packed_masks;
+    std::vector<std::int32_t> cu(group.size() + 1, 0);
+    std::size_t total = 0;
+    bool any_masks = false;
+    for (int idx : group) {
+      total += input_ids[static_cast<std::size_t>(idx)].size();
+      if (!attention_masks.empty() &&
+          !attention_masks[static_cast<std::size_t>(idx)].empty()) {
+        any_masks = true;
+      }
+    }
+    packed_ids.reserve(total);
+    if (any_masks) packed_masks.reserve(total);
+    for (std::size_t gi = 0; gi < group.size(); ++gi) {
+      const int idx = group[gi];
+      const auto& ids = input_ids[static_cast<std::size_t>(idx)];
+      packed_ids.insert(packed_ids.end(), ids.begin(), ids.end());
+      if (any_masks) {
+        if (!attention_masks.empty() &&
+            !attention_masks[static_cast<std::size_t>(idx)].empty()) {
+          const auto& m =
+              attention_masks[static_cast<std::size_t>(idx)];
+          packed_masks.insert(packed_masks.end(), m.begin(), m.end());
+        } else {
+          packed_masks.insert(packed_masks.end(), ids.size(), 1);
+        }
+      }
+      cu[gi + 1] = cu[gi] + static_cast<std::int32_t>(ids.size());
+    }
+    BatchView view(packed_ids, packed_masks, cu,
+                    static_cast<int>(group.size()));
+    auto group_out = ForwardPacked(view);
+    // Place each per-sequence logits back in caller order.
+    for (std::size_t gi = 0; gi < group.size(); ++gi) {
+      outputs[static_cast<std::size_t>(group[gi])] = std::move(group_out[gi]);
+    }
+  }
+  return outputs;
+}
+
 namespace {
 // Thread-local Workspace owned by each pool worker. Re-used across
 // every ForwardInto call from the same worker; sized on first call.

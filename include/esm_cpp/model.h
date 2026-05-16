@@ -10,6 +10,7 @@
 #include "esm_cpp/batch.h"
 #include "esm_cpp/observer.h"
 #include "esm_cpp/quant.h"
+#include "esm_cpp/scheduler.h"
 #include "esm_cpp/thread_pool.h"
 #include "esm_cpp/workspace.h"
 
@@ -107,6 +108,16 @@ class Model {
   // Returns one logits buffer per sequence, each shaped [L_b, vocab_size].
   // NOT thread-safe: the single Model instance owns one Workspace.
   std::vector<std::vector<float>> ForwardPacked(const BatchView& batch) const;
+
+  // Phase 3 Slice 2: synchronous scheduled batch. Plans the input list
+  // into one or more packed forwards (chunked by max_batch_size and
+  // length-bucketed when imbalanced per SchedulerConfig), dispatches
+  // each, and reassembles per-sequence logits in input order. Use
+  // attention_masks=empty list when every token is real.
+  std::vector<std::vector<float>> ForwardScheduled(
+      const std::vector<std::vector<std::int32_t>>& input_ids,
+      const std::vector<std::vector<std::int32_t>>& attention_masks,
+      const SchedulerConfig& cfg = {}) const;
 
   // Number of threads used by ForwardBatch (process-global pool sized
   // from ESM_NUM_THREADS at first Model::load, default physical-core).
