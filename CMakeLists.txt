@@ -74,6 +74,21 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
   target_link_libraries(esm_cpp_kernels_avx512 PRIVATE esm_warnings)
   target_compile_features(esm_cpp_kernels_avx512 PUBLIC cxx_std_20)
   list(APPEND ESM_KERNEL_OBJECT_LIBS esm_cpp_kernels_avx512)
+
+  # Slice 6: AMX-INT8 TDPBUSD path. Compiled into its own TU because
+  # `-mamx-tile -mamx-int8` are GCC 11+ / Clang 14+ only and we want the
+  # AMX intrinsics nowhere except this file. Runtime gate inside LinearAmx
+  # handles Linux < 5.16 (no XSAVE permission) by falling back to VNNI.
+  add_library(esm_cpp_kernels_amx OBJECT src/kernels/gemm_amx.cpp)
+  target_include_directories(esm_cpp_kernels_amx PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_compile_definitions(esm_cpp_kernels_amx PRIVATE ESM_KERNEL_AMX)
+  target_compile_options(esm_cpp_kernels_amx PRIVATE
+    -mamx-tile -mamx-int8 -mavx512f -mavx512bw -mavx512dq -mavx512vl
+    -mavx512vnni -mfma)
+  target_link_libraries(esm_cpp_kernels_amx PRIVATE esm_warnings)
+  target_compile_features(esm_cpp_kernels_amx PUBLIC cxx_std_20)
+  list(APPEND ESM_KERNEL_OBJECT_LIBS esm_cpp_kernels_amx)
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")

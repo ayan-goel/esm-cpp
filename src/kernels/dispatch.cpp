@@ -43,6 +43,8 @@ void Linear(const float* A, const float* W, const float* bias, float* C,
 #if defined(__x86_64__) || defined(_M_X64)
 void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
                 const float* bias, float* C, int M, int N, int K);
+void LinearAmx(const float* A, const esm::quant::QuantizedTensor& W,
+                const float* bias, float* C, int M, int N, int K);
 void GeluAvx512(const float* x, float* out, std::size_t n);
 void LayerNormAvx512(const float* x, const float* gamma, const float* beta,
                      float eps, float* out, int num_rows, int d);
@@ -55,8 +57,11 @@ void LinearInt8(const float* A, const esm::quant::QuantizedTensor& W,
                 const float* bias, float* C, int M, int N, int K) {
   switch (esm::CurrentIsa()) {
 #if defined(__x86_64__) || defined(_M_X64)
-    case Isa::Avx512Vnni:
     case Isa::Amx:
+      // LinearAmx handles shape-gating + XSAVE-permission detection
+      // internally; it falls back to LinearVnni when AMX can't be used.
+      return LinearAmx(A, W, bias, C, M, N, K);
+    case Isa::Avx512Vnni:
       return LinearVnni(A, W, bias, C, M, N, K);
 #endif
     default:

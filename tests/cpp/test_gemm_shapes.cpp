@@ -145,7 +145,7 @@ const std::vector<Shape>& Int8Shapes() {
   static const std::vector<Shape> shapes = {
       // tiny / odd: M < 6 forces the M-tail path
       {1, 32, 32}, {3, 32, 32}, {5, 32, 64},
-      // M=6 / M=12 / M=18: exactly 1 / 2 / 3 full row-blocks
+      // M=6 / M=12 / M=18: exactly 1 / 2 / 3 full Goto row-blocks
       {6, 64, 64}, {12, 96, 128}, {18, 128, 128},
       // N not multiple of 32 -> Goto routes whole call to legacy
       {18, 17, 64}, {64, 33, 320}, {64, 320, 17},
@@ -155,6 +155,14 @@ const std::vector<Shape>& Int8Shapes() {
       {32, 320, 320}, {32, 1280, 320}, {32, 320, 1280},
       // 650M-shaped (d=1280, ffn=5120) — small M to keep test fast
       {18, 1280, 1280}, {18, 5120, 1280}, {18, 1280, 5120},
+      // AMX-amenable: M ≥ 32, N % 32 == 0, K % 64 == 0. These exercise
+      // the TDPBUSD 32×32 microkernel when host_isa == amx; otherwise
+      // they still pass via VNNI fallback.
+      {32, 64, 64}, {32, 64, 128}, {64, 128, 64},
+      {64, 64, 320}, {32, 1280, 1280},
+      // AMX gate near-miss: M=33 hits AMX-main on [0, 32) then VNNI on
+      // M-tail [32, 33). K=66 not multiple of 64 → falls back entirely.
+      {33, 64, 64}, {32, 64, 66},
   };
   return shapes;
 }
