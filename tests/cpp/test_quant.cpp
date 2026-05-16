@@ -50,6 +50,58 @@ TEST(QuantPack, RoundTripMaxAbsBoundedByPerChannelStep) {
   }
 }
 
+TEST(QuantPack, BuildVnniCachePopulatesPackedAndColSum) {
+  // After Quantize, packed_vnni + col_sum derived fields must be populated
+  // so that LinearVnni can skip per-call PackWeight + col_sum recomputation.
+  // packed_vnni layout: for each 16-N panel, for each 4-K tile, 64 bytes
+  // arranged as [N0:k0,k1,k2,k3, N1:k0,..., N15:k0,k1,k2,k3]. K_pad rounds
+  // K up to a multiple of 4; N-tail and K-tail are zero-padded.
+  const int N = 19, K = 13;  // N tail (% 16 != 0) and K tail (% 4 != 0)
+  auto W = RandomVec(N * K, 0xc101);
+  esm::quant::QuantizedTensor qt;
+  esm::quant::Quantize(W.data(), N, K, &qt);
+  const int K_pad = (K + 3) & ~3;
+  ASSERT_EQ(static_cast<int>(qt.packed_vnni.size()), N * K_pad);
+  ASSERT_EQ(static_cast<int>(qt.col_sum.size()), N);
+  for (int n = 0; n < N; ++n) {
+    std::int32_t expect = 0;
+    for (int k = 0; k < K; ++k) {
+      expect += static_cast<std::int32_t>(qt.packed[n * K + k]);
+    }
+    EXPECT_EQ(qt.col_sum[n], expect) << "n=" << n;
+  }
+  for (int nb = 0; nb < N; nb += 16) {
+    const int n_block = std::min(16, N - nb);
+    const std::int8_t* panel = qt.packed_vnni.data() + nb * K_pad;
+    for (int kb = 0; kb < K_pad; kb += 4) {
+      const std::int8_t* tile = panel + kb * 16;
+      for (int nn = 0; nn < n_block; ++nn) {
+        for (int kk = 0; kk < 4; ++kk) {
+          const std::int8_t expect = (kb + kk < K)
+              ? qt.packed[(nb + nn) * K + (kb + kk)]
+              : std::int8_t{0};
+          EXPECT_EQ(tile[nn * 4 + kk], expect)
+              << "nb=" << nb << " kb=" << kb << " nn=" << nn << " kk=" << kk;
+        }
+      }
+    }
+  }
+}
+
+TEST(QuantPack, BuildVnniCacheIdempotent) {
+  // BuildVnniCache called explicitly after Quantize must produce identical
+  // results; the cache is a deterministic function of qt.packed.
+  const int N = 5, K = 13;
+  auto W = RandomVec(N * K, 0xc102);
+  esm::quant::QuantizedTensor qt;
+  esm::quant::Quantize(W.data(), N, K, &qt);
+  auto packed_vnni_1 = qt.packed_vnni;
+  auto col_sum_1 = qt.col_sum;
+  esm::quant::BuildVnniCache(&qt);
+  EXPECT_EQ(qt.packed_vnni, packed_vnni_1);
+  EXPECT_EQ(qt.col_sum, col_sum_1);
+}
+
 TEST(QuantPack, AllZeroRowGetsZeroScaleAndZeroPacked) {
   const int N = 2, K = 5;
   std::vector<float> W(N * K, 0.0f);

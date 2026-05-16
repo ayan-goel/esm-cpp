@@ -3,8 +3,41 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 namespace esm::quant {
+
+void BuildVnniCache(QuantizedTensor* out) {
+  const int N = out->N;
+  const int K = out->K;
+  const int K_pad = (K + 3) & ~3;
+  out->packed_vnni.assign(static_cast<std::size_t>(N) *
+                              static_cast<std::size_t>(K_pad),
+                          std::int8_t{0});
+  for (int nb = 0; nb < N; nb += 16) {
+    const int n_block = std::min(16, N - nb);
+    std::int8_t* panel =
+        out->packed_vnni.data() + static_cast<long>(nb) * K_pad;
+    for (int kb = 0; kb < K; kb += 4) {
+      std::int8_t* tile = panel + static_cast<long>(kb) * 16;
+      const int k_step = std::min(4, K - kb);
+      for (int nn = 0; nn < n_block; ++nn) {
+        for (int kk = 0; kk < k_step; ++kk) {
+          tile[nn * 4 + kk] =
+              out->packed[static_cast<std::size_t>(nb + nn) * K + (kb + kk)];
+        }
+      }
+    }
+  }
+  out->col_sum.assign(static_cast<std::size_t>(N), 0);
+  for (int n = 0; n < N; ++n) {
+    std::int32_t s = 0;
+    const std::int8_t* row =
+        out->packed.data() + static_cast<long>(n) * K;
+    for (int k = 0; k < K; ++k) s += row[k];
+    out->col_sum[static_cast<std::size_t>(n)] = s;
+  }
+}
 
 void QuantizeActivationRef(const float* x, std::size_t n, float scale,
                             std::uint8_t* q) {
@@ -48,6 +81,7 @@ void Quantize(const float* W_fp32, int N, int K, QuantizedTensor* out) {
           static_cast<std::int8_t>(q);
     }
   }
+  BuildVnniCache(out);
 }
 
 }  // namespace esm::quant

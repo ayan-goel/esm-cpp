@@ -82,36 +82,11 @@ void LinearInt8Ref(const float* A, const esm::quant::QuantizedTensor& W,
 
 namespace {
 
-// Per-thread scratch buffers reused across LinearVnni calls. Sized on
-// demand; never shrunk. Avoids per-call malloc on the hot path.
+// Per-thread scratch buffer reused across LinearVnni calls. Sized on
+// demand; never shrunk. Avoids per-call malloc on the hot path. Weight
+// packing + col_sum live on the QuantizedTensor itself (BuildVnniCache);
+// only the activation u8 staging buffer is per-call.
 thread_local std::vector<std::uint8_t> g_a_u8;
-thread_local std::vector<std::int8_t> g_w_packed;
-thread_local std::vector<std::int32_t> g_col_sum;
-
-// Pack W from row-major [N, K] into VPDPBUSD tile order. Output layout:
-// for each N-block of 16, for each K-block of 4: one 64-byte tile
-// containing [N0:k0,k1,k2,k3, N1:k0,k1,k2,k3, ..., N15:k0,k1,k2,k3].
-// N tail (< 16) zero-padded; K tail (< 4) zero-padded.
-void PackWeight(const std::int8_t* w, int N, int K, int K_pad,
-                std::int8_t* packed) {
-  std::memset(packed,
-              0, static_cast<std::size_t>(N) * static_cast<std::size_t>(K_pad));
-  for (int nb = 0; nb < N; nb += 16) {
-    const int n_block = std::min(16, N - nb);
-    std::int8_t* panel = packed +
-        static_cast<long>(nb) * static_cast<long>(K_pad);
-    for (int kb = 0; kb < K; kb += 4) {
-      std::int8_t* tile = panel + static_cast<long>(kb) * 16;
-      const int k_step = std::min(4, K - kb);
-      for (int nn = 0; nn < n_block; ++nn) {
-        for (int kk = 0; kk < k_step; ++kk) {
-          tile[nn * 4 + kk] =
-              w[(nb + nn) * static_cast<long>(K) + (kb + kk)];
-        }
-      }
-    }
-  }
-}
 
 // One-row finalize: take an s32 accumulator zmm (16 lanes for n..n+15),
 // apply zero-point correction, scale by per-channel + activation scales,
@@ -242,48 +217,64 @@ void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
   }
 
   // Step 1: per-tensor activation scale = max(|A|) / 127.
-  float a_max = 0.0f;
+  // AVX-512 absmax via _mm512_max_ps with the sign-bit-cleared mask.
   const std::size_t MK = static_cast<std::size_t>(M) *
                           static_cast<std::size_t>(K);
-  for (std::size_t i = 0; i < MK; ++i) {
-    const float v = std::fabs(A[i]);
-    if (v > a_max) a_max = v;
+  float a_max = 0.0f;
+  {
+    __m512 v_max = _mm512_setzero_ps();
+    const __m512 abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
+    std::size_t i = 0;
+    for (; i + 16 <= MK; i += 16) {
+      __m512 a = _mm512_and_ps(_mm512_loadu_ps(A + i), abs_mask);
+      v_max = _mm512_max_ps(v_max, a);
+    }
+    a_max = _mm512_reduce_max_ps(v_max);
+    for (; i < MK; ++i) {
+      const float v = std::fabs(A[i]);
+      if (v > a_max) a_max = v;
+    }
   }
   const float act_scale = (a_max > 0.0f) ? (a_max / 127.0f) : 1.0f;
   const float inv_act_scale = 1.0f / act_scale;
 
   // Step 2: quantize A to u8 with zero-point 128 (q in [-127, 127] then
-  // shifted by +128 -> u8 in [1, 255]).
+  // shifted by +128 -> u8 in [1, 255]). _mm512_cvtps_epi32 rounds to the
+  // current rounding mode (round-to-even by default); the scalar fallback
+  // uses lround (round-half-away-from-zero) for tail elements. The 1-ULP
+  // difference at .5 boundaries is comfortably inside the INT8 atol=1
+  // tolerance the cross-check tests use.
   if (g_a_u8.size() < MK) g_a_u8.resize(MK);
   std::uint8_t* a_u8 = g_a_u8.data();
-  for (std::size_t i = 0; i < MK; ++i) {
-    int q = static_cast<int>(std::lround(A[i] * inv_act_scale));
-    if (q < -127) q = -127;
-    if (q > 127) q = 127;
-    a_u8[i] = static_cast<std::uint8_t>(q + 128);
+  {
+    const __m512 scale_v = _mm512_set1_ps(inv_act_scale);
+    const __m512i hi127 = _mm512_set1_epi32(127);
+    const __m512i lo127 = _mm512_set1_epi32(-127);
+    const __m512i shift128 = _mm512_set1_epi32(128);
+    std::size_t i = 0;
+    for (; i + 16 <= MK; i += 16) {
+      __m512 scaled = _mm512_mul_ps(_mm512_loadu_ps(A + i), scale_v);
+      __m512i q = _mm512_cvtps_epi32(scaled);
+      q = _mm512_min_epi32(_mm512_max_epi32(q, lo127), hi127);
+      q = _mm512_add_epi32(q, shift128);
+      __m128i u8 = _mm512_cvtepi32_epi8(q);
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(a_u8 + i), u8);
+    }
+    for (; i < MK; ++i) {
+      int q = static_cast<int>(std::lround(A[i] * inv_act_scale));
+      if (q < -127) q = -127;
+      if (q > 127) q = 127;
+      a_u8[i] = static_cast<std::uint8_t>(q + 128);
+    }
   }
 
-  // Step 3: pack W into 64-byte VPDPBUSD tiles. K_pad rounds K up to a
-  // multiple of 4 (production ESM shapes are always divisible by 4).
+  // Steps 3 + 4: VPDPBUSD-tiled weight layout and zero-point col_sum live
+  // on the QuantizedTensor itself (populated by BuildVnniCache at load/
+  // quantize time; idempotent and weights-only). The kernel just reads
+  // them — no per-call repacking or reductions.
   const int K_pad = (K + 3) & ~3;
-  const std::size_t packed_size =
-      static_cast<std::size_t>(N) * static_cast<std::size_t>(K_pad);
-  if (g_w_packed.size() < packed_size) g_w_packed.resize(packed_size);
-  std::int8_t* w_packed = g_w_packed.data();
-  PackWeight(W.packed.data(), N, K, K_pad, w_packed);
-
-  // Step 4: column sums for zero-point correction.
-  if (g_col_sum.size() < static_cast<std::size_t>(N)) {
-    g_col_sum.resize(static_cast<std::size_t>(N));
-  }
-  std::int32_t* col_sum = g_col_sum.data();
-  for (int n = 0; n < N; ++n) {
-    std::int32_t s = 0;
-    const std::int8_t* w_row =
-        W.packed.data() + static_cast<long>(n) * static_cast<long>(K);
-    for (int k = 0; k < K; ++k) s += w_row[k];
-    col_sum[n] = s;
-  }
+  const std::int8_t* w_packed = W.packed_vnni.data();
+  const std::int32_t* col_sum = W.col_sum.data();
 
   // Step 5: GEMM. Parallelize across M when we're not already inside
   // a pool worker (would nested-deadlock if we are).

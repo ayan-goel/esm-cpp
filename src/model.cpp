@@ -181,6 +181,9 @@ void GgufLoadQuant(const io::GgufFile& gf, const std::string& name,
   dst.per_channel_scales.assign(N, 0.0f);
   std::memcpy(dst.per_channel_scales.data(),
               info->data + packed_bytes, N * sizeof(float));
+  dst.N = static_cast<int>(N);
+  dst.K = static_cast<int>(K);
+  esm::quant::BuildVnniCache(&dst);
 }
 
 std::int64_t GgufMetaInt(const io::GgufFile& gf, const std::string& key) {
