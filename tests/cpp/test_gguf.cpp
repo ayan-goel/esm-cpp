@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <vector>
@@ -76,8 +77,12 @@ TEST(GgufFile, MetadataRoundTripsAcrossTypes) {
       std::get<double>(*gf->Metadata("esm.attention.layer_norm_epsilon")),
       1.0e-5);
   EXPECT_EQ(std::get<bool>(*gf->Metadata("esm.token_dropout")), true);
-  const auto& dims =
-      std::get<std::vector<std::int64_t>>(*gf->Metadata("esm.dims"));
+  // gf->Metadata returns a value-typed optional; binding a reference
+  // through std::get on the temporary leaves a dangling reference once
+  // the full-expression ends. Copy into a local instead.
+  auto dims_opt = gf->Metadata("esm.dims");
+  ASSERT_TRUE(dims_opt.has_value());
+  const auto dims = std::get<std::vector<std::int64_t>>(*dims_opt);
   EXPECT_EQ(dims, (std::vector<std::int64_t>{320, 6, 20, 1280}));
 }
 
