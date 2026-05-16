@@ -49,6 +49,12 @@ namespace esm::kernels {
 void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
                 const float* bias, float* C, int M, int N, int K);
 
+// Shared parallel activation prefix (absmax + quantize). Defined in
+// gemm_int8.cpp's AVX-512 TU and reused here so both INT8 paths get the
+// same parallelization without duplicating the kernel body.
+void QuantizeActPrefixAvx512(const float* A, std::size_t MK,
+                              std::uint8_t* a_u8, float* act_scale_out);
+
 namespace {
 
 // AMX tile config layout, fixed by Intel ISA. palette_id=1 enables INT8
@@ -201,55 +207,15 @@ void LinearAmx(const float* A, const esm::quant::QuantizedTensor& W,
     return LinearVnni(A, W, bias, C, M, N, K);
   }
 
-  // Activation prefix: AVX-512 absmax + quantize. Same form as the VNNI
-  // path; the resulting u8 buffer is what TDPBUSD consumes. _mm512_
-  // cvtps_epi32 rounds to current mode (round-to-even); 1-ULP drift vs
-  // std::lround at .5 boundaries is well inside INT8 atol=1.
+  // Activation prefix: shared parallel absmax + quantize helper. Both the
+  // VNNI and AMX paths consume the same u8 layout, so the prefix is
+  // factored to QuantizeActPrefixAvx512 (defined in gemm_int8.cpp).
   const std::size_t MK = static_cast<std::size_t>(M) *
                           static_cast<std::size_t>(K);
-  float a_max = 0.0f;
-  {
-    __m512 v_max = _mm512_setzero_ps();
-    const __m512 abs_mask =
-        _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
-    std::size_t i = 0;
-    for (; i + 16 <= MK; i += 16) {
-      __m512 a = _mm512_and_ps(_mm512_loadu_ps(A + i), abs_mask);
-      v_max = _mm512_max_ps(v_max, a);
-    }
-    a_max = _mm512_reduce_max_ps(v_max);
-    for (; i < MK; ++i) {
-      const float v = std::fabs(A[i]);
-      if (v > a_max) a_max = v;
-    }
-  }
-  const float act_scale = (a_max > 0.0f) ? (a_max / 127.0f) : 1.0f;
-  const float inv_act_scale = 1.0f / act_scale;
-
   if (g_amx_a_u8.size() < MK) g_amx_a_u8.resize(MK);
   std::uint8_t* a_u8 = g_amx_a_u8.data();
-  {
-    const __m512 scale_v = _mm512_set1_ps(inv_act_scale);
-    const __m512i hi127 = _mm512_set1_epi32(127);
-    const __m512i lo127 = _mm512_set1_epi32(-127);
-    const __m512i shift128 = _mm512_set1_epi32(128);
-    std::size_t i = 0;
-    for (; i + 16 <= MK; i += 16) {
-      __m512 scaled = _mm512_mul_ps(_mm512_loadu_ps(A + i), scale_v);
-      __m512i q = _mm512_cvtps_epi32(scaled);
-      q = _mm512_min_epi32(_mm512_max_epi32(q, lo127), hi127);
-      q = _mm512_add_epi32(q, shift128);
-      __m128i u8 = _mm512_cvtepi32_epi8(q);
-      _mm_storeu_si128(reinterpret_cast<__m128i*>(a_u8 + i), u8);
-    }
-    for (; i < MK; ++i) {
-      const float v = A[i] * inv_act_scale;
-      int q = static_cast<int>(std::lround(v));
-      if (q < -127) q = -127;
-      if (q > 127) q = 127;
-      a_u8[i] = static_cast<std::uint8_t>(q + 128);
-    }
-  }
+  float act_scale = 1.0f;
+  QuantizeActPrefixAvx512(A, MK, a_u8, &act_scale);
 
   const std::int8_t* w_packed = W.packed_vnni.data();
   const std::int32_t* col_sum = W.col_sum.data();

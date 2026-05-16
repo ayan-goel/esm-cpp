@@ -6,6 +6,8 @@
 // AVX-512 path; system headers at file scope (per the gemm_int8.cpp lesson).
 #ifdef ESM_KERNEL_AVX512
 #include <immintrin.h>
+
+#include "esm_cpp/thread_pool.h"
 #endif
 
 namespace esm::kernels {
@@ -51,7 +53,7 @@ void LayerNormRef(const float* x, const float* gamma, const float* beta,
 void LayerNormAvx512(const float* x, const float* gamma, const float* beta,
                      float eps, float* out, int num_rows, int d) {
   const float inv_d = 1.0f / static_cast<float>(d);
-  for (int r = 0; r < num_rows; ++r) {
+  auto compute_row = [&](int r) {
     const float* xr = x + static_cast<long>(r) * d;
     float* yr = out + static_cast<long>(r) * d;
 
@@ -126,6 +128,17 @@ void LayerNormAvx512(const float* x, const float* gamma, const float* beta,
       __m512 b = _mm512_maskz_loadu_ps(mask, beta + i);
       _mm512_mask_storeu_ps(yr + i, mask, _mm512_fmadd_ps(normed, g, b));
     }
+  };
+  // Each row is independent; parallel_for across rows when called from
+  // outside a worker (TransformerBlock dispatches LN on the main thread
+  // sequentially, so the inner parallel_for is safe).
+  if (num_rows > 1 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(
+        0, num_rows, /*grain=*/1, [&](int begin, int end) {
+          for (int r = begin; r < end; ++r) compute_row(r);
+        });
+  } else {
+    for (int r = 0; r < num_rows; ++r) compute_row(r);
   }
 }
 

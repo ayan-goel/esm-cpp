@@ -9,6 +9,7 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -366,49 +367,35 @@ void ComputeRowsGoto(const std::uint8_t* a_u8, const std::int8_t* w_packed,
 
 }  // namespace
 
-void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
-                const float* bias, float* C, int M, int N, int K) {
-  // K must be at least 1; if it's zero just zero the output.
-  if (K <= 0 || M <= 0 || N <= 0) {
-    if (M > 0 && N > 0 && C) {
-      std::memset(C, 0,
-                  static_cast<std::size_t>(M) * static_cast<std::size_t>(N) *
-                      sizeof(float));
-    }
-    return;
-  }
-
-  // Step 1: per-tensor activation scale = max(|A|) / 127.
-  // AVX-512 absmax via _mm512_max_ps with the sign-bit-cleared mask.
-  const std::size_t MK = static_cast<std::size_t>(M) *
-                          static_cast<std::size_t>(K);
-  float a_max = 0.0f;
-  {
+// Activation prefix: compute the per-tensor activation scale (max|A|/127)
+// and quantize A to u8 with zero-point 128. Parallelized over MK in
+// 16-element-aligned chunks; the absmax pass reduces via a CAS on the
+// IEEE-754 bit pattern (non-negative float bits are monotonic in float
+// magnitude, so the bit-pattern max is the float max).
+//
+// Called from LinearVnni and from LinearAmx (forward-declared in
+// gemm_amx.cpp) so both INT8 paths share the same parallel prefix.
+// Threshold avoids pool-dispatch overhead on tiny MK.
+void QuantizeActPrefixAvx512(const float* A, std::size_t MK,
+                              std::uint8_t* a_u8, float* act_scale_out) {
+  constexpr std::size_t kParallelThreshold = 64 * 1024;
+  auto run_serial_absmax = [&]() -> float {
     __m512 v_max = _mm512_setzero_ps();
-    const __m512 abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
+    const __m512 abs_mask =
+        _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
     std::size_t i = 0;
     for (; i + 16 <= MK; i += 16) {
-      __m512 a = _mm512_and_ps(_mm512_loadu_ps(A + i), abs_mask);
-      v_max = _mm512_max_ps(v_max, a);
+      v_max = _mm512_max_ps(v_max,
+                            _mm512_and_ps(_mm512_loadu_ps(A + i), abs_mask));
     }
-    a_max = _mm512_reduce_max_ps(v_max);
+    float local = _mm512_reduce_max_ps(v_max);
     for (; i < MK; ++i) {
       const float v = std::fabs(A[i]);
-      if (v > a_max) a_max = v;
+      if (v > local) local = v;
     }
-  }
-  const float act_scale = (a_max > 0.0f) ? (a_max / 127.0f) : 1.0f;
-  const float inv_act_scale = 1.0f / act_scale;
-
-  // Step 2: quantize A to u8 with zero-point 128 (q in [-127, 127] then
-  // shifted by +128 -> u8 in [1, 255]). _mm512_cvtps_epi32 rounds to the
-  // current rounding mode (round-to-even by default); the scalar fallback
-  // uses lround (round-half-away-from-zero) for tail elements. The 1-ULP
-  // difference at .5 boundaries is comfortably inside the INT8 atol=1
-  // tolerance the cross-check tests use.
-  if (g_a_u8.size() < MK) g_a_u8.resize(MK);
-  std::uint8_t* a_u8 = g_a_u8.data();
-  {
+    return local;
+  };
+  auto run_serial_quantize = [&](float inv_act_scale) {
     const __m512 scale_v = _mm512_set1_ps(inv_act_scale);
     const __m512i hi127 = _mm512_set1_epi32(127);
     const __m512i lo127 = _mm512_set1_epi32(-127);
@@ -428,7 +415,105 @@ void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
       if (q > 127) q = 127;
       a_u8[i] = static_cast<std::uint8_t>(q + 128);
     }
+  };
+
+  if (MK < kParallelThreshold || esm::InGlobalPoolWorker()) {
+    const float a_max = run_serial_absmax();
+    const float act_scale = (a_max > 0.0f) ? (a_max / 127.0f) : 1.0f;
+    *act_scale_out = act_scale;
+    run_serial_quantize(1.0f / act_scale);
+    return;
   }
+
+  // Parallel absmax. Chunk by 16-element blocks so each chunk's inner
+  // loop is a clean 16-wide vector loop with at most one masked-tail
+  // block at the very end of the array.
+  const int n_blocks = static_cast<int>((MK + 15) / 16);
+  std::atomic<std::uint32_t> shared_bits{0};
+  esm::GlobalPool().parallel_for(
+      0, n_blocks, /*grain=*/256, [&](int block_begin, int block_end) {
+        __m512 v_max = _mm512_setzero_ps();
+        const __m512 abs_mask =
+            _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
+        for (int b = block_begin; b < block_end; ++b) {
+          const std::size_t i = static_cast<std::size_t>(b) * 16;
+          if (i + 16 <= MK) {
+            __m512 v = _mm512_and_ps(_mm512_loadu_ps(A + i), abs_mask);
+            v_max = _mm512_max_ps(v_max, v);
+          } else {
+            const int tail = static_cast<int>(MK - i);
+            const __mmask16 mask = static_cast<__mmask16>((1u << tail) - 1u);
+            __m512 v = _mm512_maskz_loadu_ps(mask, A + i);
+            v = _mm512_and_ps(v, abs_mask);
+            v_max = _mm512_max_ps(v_max, v);
+          }
+        }
+        const float local = _mm512_reduce_max_ps(v_max);
+        std::uint32_t local_bits;
+        std::memcpy(&local_bits, &local, sizeof(float));
+        std::uint32_t prev = shared_bits.load(std::memory_order_relaxed);
+        while (local_bits > prev &&
+               !shared_bits.compare_exchange_weak(
+                   prev, local_bits, std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {}
+      });
+  const std::uint32_t a_max_bits =
+      shared_bits.load(std::memory_order_relaxed);
+  float a_max;
+  std::memcpy(&a_max, &a_max_bits, sizeof(float));
+  const float act_scale = (a_max > 0.0f) ? (a_max / 127.0f) : 1.0f;
+  const float inv_act_scale = 1.0f / act_scale;
+  *act_scale_out = act_scale;
+
+  // Parallel quantize. Same 16-block chunking; the masked-store path
+  // covers MK not divisible by 16.
+  esm::GlobalPool().parallel_for(
+      0, n_blocks, /*grain=*/256, [&](int block_begin, int block_end) {
+        const __m512 scale_v = _mm512_set1_ps(inv_act_scale);
+        const __m512i hi127 = _mm512_set1_epi32(127);
+        const __m512i lo127 = _mm512_set1_epi32(-127);
+        const __m512i shift128 = _mm512_set1_epi32(128);
+        for (int b = block_begin; b < block_end; ++b) {
+          const std::size_t i = static_cast<std::size_t>(b) * 16;
+          if (i + 16 <= MK) {
+            __m512 scaled = _mm512_mul_ps(_mm512_loadu_ps(A + i), scale_v);
+            __m512i q = _mm512_cvtps_epi32(scaled);
+            q = _mm512_min_epi32(_mm512_max_epi32(q, lo127), hi127);
+            q = _mm512_add_epi32(q, shift128);
+            __m128i u8 = _mm512_cvtepi32_epi8(q);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(a_u8 + i), u8);
+          } else {
+            const int tail = static_cast<int>(MK - i);
+            for (int kk = 0; kk < tail; ++kk) {
+              int q = static_cast<int>(std::lround(A[i + kk] * inv_act_scale));
+              if (q < -127) q = -127;
+              if (q > 127) q = 127;
+              a_u8[i + kk] = static_cast<std::uint8_t>(q + 128);
+            }
+          }
+        }
+      });
+}
+
+void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
+                const float* bias, float* C, int M, int N, int K) {
+  // K must be at least 1; if it's zero just zero the output.
+  if (K <= 0 || M <= 0 || N <= 0) {
+    if (M > 0 && N > 0 && C) {
+      std::memset(C, 0,
+                  static_cast<std::size_t>(M) * static_cast<std::size_t>(N) *
+                      sizeof(float));
+    }
+    return;
+  }
+
+  // Steps 1 + 2: activation absmax + quantize, parallelized across MK.
+  const std::size_t MK = static_cast<std::size_t>(M) *
+                          static_cast<std::size_t>(K);
+  if (g_a_u8.size() < MK) g_a_u8.resize(MK);
+  std::uint8_t* a_u8 = g_a_u8.data();
+  float act_scale = 1.0f;
+  QuantizeActPrefixAvx512(A, MK, a_u8, &act_scale);
 
   // Steps 3 + 4: VPDPBUSD-tiled weight layout and zero-point col_sum live
   // on the QuantizedTensor itself (populated by BuildVnniCache at load/

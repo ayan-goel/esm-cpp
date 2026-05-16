@@ -7,6 +7,8 @@
 // keep system headers at file scope — never inside namespace esm::kernels.
 #ifdef ESM_KERNEL_AVX512
 #include <immintrin.h>
+
+#include "esm_cpp/thread_pool.h"
 #endif
 
 namespace esm::kernels {
@@ -85,24 +87,55 @@ inline __m512 ErfAvx512(__m512 x) {
 }  // namespace
 
 void GeluAvx512(const float* x, float* out, std::size_t n) {
-  const __m512 half = _mm512_set1_ps(0.5f);
-  const __m512 inv_sqrt2 = _mm512_set1_ps(0.70710678118654752440f);
-  const __m512 one = _mm512_set1_ps(1.0f);
-  std::size_t i = 0;
-  for (; i + 16 <= n; i += 16) {
-    __m512 v = _mm512_loadu_ps(x + i);
-    __m512 e = ErfAvx512(_mm512_mul_ps(v, inv_sqrt2));
-    __m512 y = _mm512_mul_ps(_mm512_mul_ps(v, half), _mm512_add_ps(one, e));
-    _mm512_storeu_ps(out + i, y);
+  // Per-chunk worker: process [start_elem, end_elem) where end_elem may
+  // equal n (last chunk owns the masked tail). The chunk granularity is
+  // ZmmStride elements so most chunks fit a clean 16-wide vector loop.
+  constexpr std::size_t kZmmStride = 16;
+  auto worker = [&](std::size_t start_elem, std::size_t end_elem) {
+    const __m512 half = _mm512_set1_ps(0.5f);
+    const __m512 inv_sqrt2 = _mm512_set1_ps(0.70710678118654752440f);
+    const __m512 one = _mm512_set1_ps(1.0f);
+    std::size_t i = start_elem;
+    for (; i + 16 <= end_elem; i += 16) {
+      __m512 v = _mm512_loadu_ps(x + i);
+      __m512 e = ErfAvx512(_mm512_mul_ps(v, inv_sqrt2));
+      __m512 y = _mm512_mul_ps(_mm512_mul_ps(v, half),
+                                _mm512_add_ps(one, e));
+      _mm512_storeu_ps(out + i, y);
+    }
+    if (i < end_elem) {
+      const std::size_t tail = end_elem - i;
+      const __mmask16 mask = static_cast<__mmask16>((1u << tail) - 1u);
+      __m512 v = _mm512_maskz_loadu_ps(mask, x + i);
+      __m512 e = ErfAvx512(_mm512_mul_ps(v, inv_sqrt2));
+      __m512 y = _mm512_mul_ps(_mm512_mul_ps(v, half),
+                                _mm512_add_ps(one, e));
+      _mm512_mask_storeu_ps(out + i, mask, y);
+    }
+  };
+  // Chunk along the element axis. For ESM-2's largest layer (650M ffn =
+  // 5120, T = 2048 → 10.5 M elements), 22 cores yield ~480 K elements
+  // per worker. We use a grain of 1024 elements to keep the parallel_for
+  // overhead amortized for very short calls (e.g. lm_head with d = 320).
+  // Chunks are aligned to kZmmStride so only the LAST chunk hits the
+  // masked tail path.
+  constexpr std::size_t kElemsPerChunk = 4096;  // 256 zmm vectors / chunk
+  const int total_chunks = static_cast<int>(
+      (n + kElemsPerChunk - 1) / kElemsPerChunk);
+  if (total_chunks > 1 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(
+        0, total_chunks, /*grain=*/1, [&](int begin, int end) {
+          for (int c = begin; c < end; ++c) {
+            const std::size_t s =
+                static_cast<std::size_t>(c) * kElemsPerChunk;
+            const std::size_t e = std::min(s + kElemsPerChunk, n);
+            worker(s, e);
+          }
+        });
+  } else {
+    worker(0, n);
   }
-  if (i < n) {
-    const std::size_t tail = n - i;
-    const __mmask16 mask = static_cast<__mmask16>((1u << tail) - 1u);
-    __m512 v = _mm512_maskz_loadu_ps(mask, x + i);
-    __m512 e = ErfAvx512(_mm512_mul_ps(v, inv_sqrt2));
-    __m512 y = _mm512_mul_ps(_mm512_mul_ps(v, half), _mm512_add_ps(one, e));
-    _mm512_mask_storeu_ps(out + i, mask, y);
-  }
+  (void)kZmmStride;
 }
 
 #endif  // ESM_KERNEL_AVX512
