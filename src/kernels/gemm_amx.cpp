@@ -137,6 +137,12 @@ thread_local std::vector<std::uint8_t> g_amx_a_u8;
 // multiple of 64 (one full tile-K). Caller has gated all of that. K_pad
 // equals K here (we only run when K % 64 == 0) so packed_vnni reads
 // straight through with stride 64.
+//
+// SW prefetch in the K-loop hides the L2→L1 latency on B tiles. Each
+// B-tile is 1024 bytes (16 N-rows × 64 K-bytes), at 16 per K-iter for
+// the two panels. Prefetching the NEXT K-iter's B tiles ahead of the
+// current one keeps the AMX execution unit fed even when B doesn't
+// stay L1-resident (it doesn't for fc2 K=5120 panels at 5 KB each).
 void Kernel32x32(const std::uint8_t* a_block, const std::int8_t* w_panel0,
                   const std::int8_t* w_panel1, const float* w_scale,
                   const std::int32_t* col_sum, const float* bias,
@@ -146,6 +152,25 @@ void Kernel32x32(const std::uint8_t* a_block, const std::int8_t* w_panel0,
   _tile_zero(6);
   _tile_zero(7);
   for (int kb = 0; kb < K; kb += 64) {
+    // Prefetch next K-iter's B tiles into L1 to overlap with current
+    // K-iter's dpbusds. 16-tile-row stride is 16×64 = 1024 bytes per
+    // panel; two cache lines (128 bytes) cover the first half of each
+    // tile's first row. We issue two PFs per panel — empirically tuned
+    // to the SPR L1 fill stream depth (~10 outstanding requests/cycle).
+    if (kb + 64 < K) {
+      _mm_prefetch(reinterpret_cast<const char*>(
+                       w_panel0 + static_cast<long>(kb + 64) * 16),
+                   _MM_HINT_T0);
+      _mm_prefetch(reinterpret_cast<const char*>(
+                       w_panel0 + static_cast<long>(kb + 64) * 16 + 64),
+                   _MM_HINT_T0);
+      _mm_prefetch(reinterpret_cast<const char*>(
+                       w_panel1 + static_cast<long>(kb + 64) * 16),
+                   _MM_HINT_T0);
+      _mm_prefetch(reinterpret_cast<const char*>(
+                       w_panel1 + static_cast<long>(kb + 64) * 16 + 64),
+                   _MM_HINT_T0);
+    }
     // A tiles: rows [0, 16) and [16, 32) of a_block, each 64 K-bytes
     // wide. Stride is K (the activation matrix row stride).
     _tile_loadd(0, a_block + 0 * static_cast<long>(K) + kb,
@@ -240,6 +265,22 @@ void LinearAmx(const float* A, const esm::quant::QuantizedTensor& W,
           a_u8 + static_cast<long>(m) * static_cast<long>(K);
       float* c_row = C + static_cast<long>(m) * static_cast<long>(N);
       for (int nb = 0; nb < N; nb += 32) {
+        // Prefetch the NEXT N-tile's first K-stride of B into L2 while
+        // we run the current N-tile's microkernel. Each panel's first
+        // 64-byte tile-row covers the start of the K loop. We use T1
+        // (L2) since the data won't be touched until ~K-loop cycles
+        // from now — further than L1 retention guarantees.
+        if (nb + 32 < N) {
+          _mm_prefetch(reinterpret_cast<const char*>(
+                           w_packed +
+                           static_cast<long>(nb + 32) * static_cast<long>(K)),
+                       _MM_HINT_T1);
+          _mm_prefetch(reinterpret_cast<const char*>(
+                           w_packed +
+                           static_cast<long>(nb + 32 + 16) *
+                               static_cast<long>(K)),
+                       _MM_HINT_T1);
+        }
         const std::int8_t* w_panel0 =
             w_packed + static_cast<long>(nb) * static_cast<long>(K);
         const std::int8_t* w_panel1 =
