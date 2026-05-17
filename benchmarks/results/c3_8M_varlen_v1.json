@@ -1,0 +1,49 @@
+{
+  "config": {
+    "model": "esm2_t6_8M",
+    "model_source": {
+      "kind": "safetensors",
+      "path": "/home/ayangoel/.cache/huggingface/hub/models--facebook--esm2_t6_8M_UR50D/snapshots/c731040fcd8d73dceaa04b0a8e6329b345b0f5df/model.safetensors",
+      "hf_id": "facebook/esm2_t6_8M_UR50D"
+    },
+    "dataset": "benchmarks/data/synthetic_varlen_v1.fasta",
+    "num_sequences": 256,
+    "warmup": 2,
+    "iters": 5,
+    "modes": [
+      "esm-cpp-int8",
+      "hf-eager-fp32"
+    ]
+  },
+  "hardware": {
+    "platform": "Linux-6.8.0-1054-gcp-x86_64-with-glibc2.35",
+    "machine": "x86_64",
+    "python": "3.10.12",
+    "esm_cpp_host_isa": "amx",
+    "esm_cpp_current_isa": "amx",
+    "esm_cpp_num_threads": 22,
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz",
+    "cpu_threads": 22,
+    "ram_gb": 86.4
+  },
+  "results": {
+    "esm-cpp-int8": {
+      "iters": 5,
+      "p50_ms": 648.6068339982012,
+      "p99_ms": 666.5916584813385,
+      "mean_ms": 650.507823398948,
+      "throughput_seqs_per_s": 393.53869514187,
+      "isa": "amx"
+    },
+    "hf-eager-fp32": {
+      "iters": 5,
+      "p50_ms": 5515.377276999061,
+      "p99_ms": 5529.628255161078,
+      "mean_ms": 5512.906009800645,
+      "throughput_seqs_per_s": 46.43648913021417,
+      "torch_intra_threads": 11
+    }
+  },
+  "speedup_fp32_vs_hf": null,
+  "speedup_int8_vs_hf": 8.474772802877808
+}

@@ -1,0 +1,25 @@
+{
+  "model": "esm2_t30_150M",
+  "isa": "amx",
+  "num_sequences": 25,
+  "fp32_pppl": NaN,
+  "int8_pppl": NaN,
+  "drift": NaN,
+  "gate_threshold": 0.1,
+  "gate_pass": false,
+  "env_amx_attention": false,
+  "env_quantize_lm_head": false,
+  "results": {
+    "fp32": {
+      "pppl": NaN,
+      "elapsed_s": 470.36610506099896,
+      "drift_vs_fp32": 0.0
+    },
+    "int8": {
+      "pppl": NaN,
+      "elapsed_s": 73.7382306920008,
+      "drift_vs_fp32": NaN,
+      "gate_pass": false
+    }
+  }
+}

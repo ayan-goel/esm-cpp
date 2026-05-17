@@ -132,6 +132,55 @@ The remaining headroom toward 12-15× HF on this workload lives in the AMX GEMM 
 
 <!-- BENCH_TABLE_BEGIN -->
 
+| Run | Host | ISA | Seqs | Mean ms | Throughput (seqs/s) | Speedup vs HF |
+|---|---|---|---:|---:|---:|---:|
+| esm2_t30_150M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 2932.6 | 2.73 | 0.37x |
+| esm2_t30_150M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 1090.3 | 7.34 | — |
+| esm2_t30_150M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 1434.4 | 5.58 | 0.79x |
+| esm2_t30_150M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 1126.9 | 7.10 | — |
+| esm2_t30_150M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 523.1 | 15.29 | 2.09x |
+| esm2_t30_150M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 1093.6 | 7.32 | — |
+| esm2_t30_150M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 256 | 4883.9 | 52.42 | 9.55x |
+| esm2_t30_150M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 256 | 46631.1 | 5.49 | — |
+| esm2_t33_650M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 8699.3 | 0.92 | 0.39x |
+| esm2_t33_650M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 3420.4 | 2.34 | — |
+| esm2_t33_650M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 4239.4 | 1.89 | 0.79x |
+| esm2_t33_650M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 3343.0 | 2.39 | — |
+| esm2_t33_650M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 849.6 | 9.42 | 4.04x |
+| esm2_t33_650M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 3431.9 | 2.33 | — |
+| esm2_t33_650M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 829.2 | 9.65 | 4.01x |
+| esm2_t33_650M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 3325.7 | 2.41 | — |
+| esm2_t33_650M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 917.7 | 8.72 | 4.09x |
+| esm2_t33_650M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 3751.8 | 2.13 | — |
+| esm2_t33_650M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 898.5 | 8.90 | 3.79x |
+| esm2_t33_650M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 3409.3 | 2.35 | — |
+| esm2_t33_650M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 1246.9 | 6.42 | 2.73x |
+| esm2_t33_650M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 3408.5 | 2.35 | — |
+| esm2_t33_650M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 1165.0 | 6.87 | 2.91x |
+| esm2_t33_650M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 3395.2 | 2.36 | — |
+| esm2_t33_650M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 1105.9 | 7.23 | 3.12x |
+| esm2_t33_650M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 3456.0 | 2.31 | — |
+| esm2_t33_650M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 928.3 | 8.62 | 3.65x |
+| esm2_t33_650M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 3387.6 | 2.36 | — |
+| esm2_t33_650M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 256 | 12371.8 | 20.69 | 9.31x |
+| esm2_t33_650M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 256 | 115121.2 | 2.22 | — |
+| esm2_t33_650M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 256 | 11450.7 | 22.36 | 10.04x |
+| esm2_t33_650M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 256 | 114996.0 | 2.23 | — |
+| esm2_t6_8M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 95.5 | 83.81 | 0.26x |
+| esm2_t6_8M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 24.5 | 326.09 | — |
+| esm2_t6_8M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 80.7 | 99.19 | 0.30x |
+| esm2_t6_8M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 24.2 | 330.25 | — |
+| esm2_t6_8M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 8 | 22.7 | 352.22 | 1.08x |
+| esm2_t6_8M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 8 | 24.6 | 325.54 | — |
+| esm2_t6_8M / esm-cpp-int8 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | amx | 256 | 650.5 | 393.54 | 8.47x |
+| esm2_t6_8M / hf-eager-fp32 | Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz | n/a | 256 | 5512.9 | 46.44 | — |
+| esm2_t6_8M / esm-cpp-fp32 | Apple M3 Pro | neon | 8 | 52.9 | 151.11 | — |
+| esm2_t6_8M / esm-cpp-int8 | Apple M3 Pro | neon | 8 | 3024.7 | 2.64 | — |
+| unknown / fp32 | unknown | n/a | 0 | 0.0 | 0.00 | — |
+| unknown / int8+bf16_attn | unknown | n/a | 0 | 0.0 | 0.00 | — |
+| unknown / fp32 | unknown | n/a | 0 | 0.0 | 0.00 | — |
+| unknown / int8 | unknown | n/a | 0 | 0.0 | 0.00 | — |
+
 <!-- BENCH_TABLE_END -->
 
 Re-run `python tools/render_benchmark_table.py --results benchmarks/results --out docs/benchmarks.md` after dropping new `*.json` files into `benchmarks/results/` to regenerate this block.
