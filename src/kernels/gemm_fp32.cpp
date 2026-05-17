@@ -1,7 +1,15 @@
 #include "esm_cpp/kernels.h"
 
+#include <cstddef>
+
 #ifdef ESM_KERNEL_NEON
 #include <Accelerate/Accelerate.h>
+#endif
+
+#ifdef ESM_KERNEL_AVX512
+#include <immintrin.h>
+
+#include "esm_cpp/thread_pool.h"
 #endif
 
 namespace esm::kernels {
@@ -51,51 +59,126 @@ void LinearNeon(const float* A, const float* W, const float* bias, float* C,
 
 #ifdef ESM_KERNEL_AVX512
 
-// STUB — the canonical Phase 1 SIMD path. Slice 3.1-3.3 hand-off (needs
-// an x86 AVX-512+VNNI instance to validate; see notes/phase1-handoff.md
-// for the rationale of why this isn't written here).
+// FP32 AVX-512 GEMM. C[m, n] = sum_k A[m, k] * W[n, k] + bias[n].
+// W is row-major [N, K] — PyTorch's nn.Linear layout (out_features ×
+// in_features). Both A and W rows are contiguous along K, so we
+// accumulate the dot-product across K inside zmm registers and
+// reduce-add at the end. Eight independent accumulators per (m, N-block)
+// give the FMA pipeline enough parallelism to stay busy (SPR can issue
+// 2 FMAs/cycle on ports 0+5, and the dependency chain on a single zmm
+// would otherwise bottleneck at the 4-cycle FMA latency).
 //
-// Target design (decision locked in tasks/plan.md §S3):
-//
-//   Microkernel: 16 rows x 32 cols of FP32 C accumulated in 16 zmm
-//   registers. Each K-step issues two vfmadd231ps (one per output-col
-//   half) against a broadcast-loaded A column. K_C ~ 512, M_C ~ 256,
-//   N_C ~ 4096 with the standard 6-loop Goto packing nest:
-//     for jc in [0, N) step N_C:         pack B panel [K, N_C] -> Bp
-//       for kc in [0, K) step K_C:        pack A panel [M, K_C] -> Ap
-//         for ic in [0, M) step M_C:
-//           for jr in [0, N_C) step 32:
-//             for ir in [0, M_C) step 16:
-//               kernel_16x32(Ap, Bp, &C[ic+ir, jc+jr], K_C, ldc, beta)
-//   Bias is folded into the kernel's beta=0 init (load bias[jc..jc+32]
-//   into the 16 zmm accs at K=0). Tail M%16 / N%32 / K%K_C handled by
-//   masked-load microkernels (use _mm512_mask_loadu_ps with the rem mask).
-//
-// References worth re-reading at implementation time:
-//   - salykova.github.io/matmul-cpu — the clearest walkthrough we know of
-//   - yzhaiustc/Optimizing-DGEMM-on-Intel-CPUs-with-AVX512F — production
-//   - BLIS docs/Performance.md — confirms the >90% MKL target
-//
-// libxsmm hookup (Slice 3.6): libxsmm_smmdispatch on the four critical
-// (M, N, K) tuples at Model::load time and cache the function pointers
-// on the Model. Use libxsmm for shapes where M<32 or N<32 (lm_head's
-// [L, 33], future small-batch service shapes). The hand-written
-// microkernel above is the primary path for the four production shapes;
-// libxsmm covers the small-shape tail.
-//
-// Verification ordering when this lands:
-//   1) tests/cpp/test_gemm_shapes.cpp::Avx512DispatchMatchesRef
-//      — add an #if defined(__x86_64__) sibling to the NEON test; same
-//      shape sweep, same 1e-4 relative tolerance.
-//   2) bench_gemm in Release on the gate machine; compare against MKL's
-//      cblas_sgemm via a wrapper script (tasks/plan.md S6.2).
-//   3) Re-run HF parity; layer envelope should match or improve on the
-//      NEON-Accelerate envelope captured in commit 5766242.
-void LinearRef(const float* A, const float* W, const float* bias, float* C,
-               int M, int N, int K);
+// Parallelism: across M-rows. lm_head's two FP32 GEMMs (lm_dense at
+// [2048, d, d] and lm_decoder at [2048, V, d]) dominated the 650M
+// forward at 53 % + 1 % of wall time before this kernel landed — the
+// previous LinearAvx512 was a stub that delegated to LinearRef, so
+// every FP32 GEMM ran scalar single-threaded.
+namespace {
+
+inline __m512 MaskedLoad(const float* p, std::size_t tail) {
+  const __mmask16 mask = static_cast<__mmask16>((1u << tail) - 1u);
+  return _mm512_maskz_loadu_ps(mask, p);
+}
+
+inline void Dot1Row8N(const float* a_row, const float* W, int K, int N_stride,
+                       int n_base, const float* bias, float* c_row) {
+  __m512 acc0 = _mm512_setzero_ps();
+  __m512 acc1 = _mm512_setzero_ps();
+  __m512 acc2 = _mm512_setzero_ps();
+  __m512 acc3 = _mm512_setzero_ps();
+  __m512 acc4 = _mm512_setzero_ps();
+  __m512 acc5 = _mm512_setzero_ps();
+  __m512 acc6 = _mm512_setzero_ps();
+  __m512 acc7 = _mm512_setzero_ps();
+  const float* w0 = W + static_cast<long>(n_base + 0) * N_stride;
+  const float* w1 = W + static_cast<long>(n_base + 1) * N_stride;
+  const float* w2 = W + static_cast<long>(n_base + 2) * N_stride;
+  const float* w3 = W + static_cast<long>(n_base + 3) * N_stride;
+  const float* w4 = W + static_cast<long>(n_base + 4) * N_stride;
+  const float* w5 = W + static_cast<long>(n_base + 5) * N_stride;
+  const float* w6 = W + static_cast<long>(n_base + 6) * N_stride;
+  const float* w7 = W + static_cast<long>(n_base + 7) * N_stride;
+  int k = 0;
+  for (; k + 16 <= K; k += 16) {
+    __m512 a = _mm512_loadu_ps(a_row + k);
+    acc0 = _mm512_fmadd_ps(a, _mm512_loadu_ps(w0 + k), acc0);
+    acc1 = _mm512_fmadd_ps(a, _mm512_loadu_ps(w1 + k), acc1);
+    acc2 = _mm512_fmadd_ps(a, _mm512_loadu_ps(w2 + k), acc2);
+    acc3 = _mm512_fmadd_ps(a, _mm512_loadu_ps(w3 + k), acc3);
+    acc4 = _mm512_fmadd_ps(a, _mm512_loadu_ps(w4 + k), acc4);
+    acc5 = _mm512_fmadd_ps(a, _mm512_loadu_ps(w5 + k), acc5);
+    acc6 = _mm512_fmadd_ps(a, _mm512_loadu_ps(w6 + k), acc6);
+    acc7 = _mm512_fmadd_ps(a, _mm512_loadu_ps(w7 + k), acc7);
+  }
+  if (k < K) {
+    const std::size_t tail = static_cast<std::size_t>(K - k);
+    __m512 a = MaskedLoad(a_row + k, tail);
+    acc0 = _mm512_fmadd_ps(a, MaskedLoad(w0 + k, tail), acc0);
+    acc1 = _mm512_fmadd_ps(a, MaskedLoad(w1 + k, tail), acc1);
+    acc2 = _mm512_fmadd_ps(a, MaskedLoad(w2 + k, tail), acc2);
+    acc3 = _mm512_fmadd_ps(a, MaskedLoad(w3 + k, tail), acc3);
+    acc4 = _mm512_fmadd_ps(a, MaskedLoad(w4 + k, tail), acc4);
+    acc5 = _mm512_fmadd_ps(a, MaskedLoad(w5 + k, tail), acc5);
+    acc6 = _mm512_fmadd_ps(a, MaskedLoad(w6 + k, tail), acc6);
+    acc7 = _mm512_fmadd_ps(a, MaskedLoad(w7 + k, tail), acc7);
+  }
+  const float b0 = bias ? bias[n_base + 0] : 0.0f;
+  const float b1 = bias ? bias[n_base + 1] : 0.0f;
+  const float b2 = bias ? bias[n_base + 2] : 0.0f;
+  const float b3 = bias ? bias[n_base + 3] : 0.0f;
+  const float b4 = bias ? bias[n_base + 4] : 0.0f;
+  const float b5 = bias ? bias[n_base + 5] : 0.0f;
+  const float b6 = bias ? bias[n_base + 6] : 0.0f;
+  const float b7 = bias ? bias[n_base + 7] : 0.0f;
+  c_row[n_base + 0] = b0 + _mm512_reduce_add_ps(acc0);
+  c_row[n_base + 1] = b1 + _mm512_reduce_add_ps(acc1);
+  c_row[n_base + 2] = b2 + _mm512_reduce_add_ps(acc2);
+  c_row[n_base + 3] = b3 + _mm512_reduce_add_ps(acc3);
+  c_row[n_base + 4] = b4 + _mm512_reduce_add_ps(acc4);
+  c_row[n_base + 5] = b5 + _mm512_reduce_add_ps(acc5);
+  c_row[n_base + 6] = b6 + _mm512_reduce_add_ps(acc6);
+  c_row[n_base + 7] = b7 + _mm512_reduce_add_ps(acc7);
+}
+
+inline float Dot1Row1N(const float* a_row, const float* w_row, int K) {
+  __m512 acc = _mm512_setzero_ps();
+  int k = 0;
+  for (; k + 16 <= K; k += 16) {
+    acc = _mm512_fmadd_ps(_mm512_loadu_ps(a_row + k),
+                           _mm512_loadu_ps(w_row + k), acc);
+  }
+  if (k < K) {
+    const std::size_t tail = static_cast<std::size_t>(K - k);
+    acc = _mm512_fmadd_ps(MaskedLoad(a_row + k, tail),
+                           MaskedLoad(w_row + k, tail), acc);
+  }
+  return _mm512_reduce_add_ps(acc);
+}
+
+}  // namespace
+
 void LinearAvx512(const float* A, const float* W, const float* bias, float* C,
                   int M, int N, int K) {
-  LinearRef(A, W, bias, C, M, N, K);
+  auto work_rows = [&](int m_begin, int m_end) {
+    constexpr int kNR = 8;
+    for (int m = m_begin; m < m_end; ++m) {
+      const float* a_row = A + static_cast<long>(m) * K;
+      float* c_row = C + static_cast<long>(m) * N;
+      int n = 0;
+      for (; n + kNR <= N; n += kNR) {
+        Dot1Row8N(a_row, W, K, K, n, bias, c_row);
+      }
+      for (; n < N; ++n) {
+        const float* w_row = W + static_cast<long>(n) * K;
+        c_row[n] = (bias ? bias[n] : 0.0f) + Dot1Row1N(a_row, w_row, K);
+      }
+    }
+  };
+  if (M > 1 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(0, M, /*grain=*/1, work_rows);
+  } else {
+    work_rows(0, M);
+  }
 }
 
 #endif  // ESM_KERNEL_AVX512

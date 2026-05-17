@@ -212,4 +212,44 @@ TEST(GemmShapes, Avx512VnniInt8DispatchMatchesRefAcrossGotoMicrokernel) {
     RunInt8Shape(s, /*with_bias=*/true);
   }
 }
+
+namespace {
+bool HostHasAvx512() {
+  const esm::Isa isa = esm::HostIsa();
+  return isa == esm::Isa::Avx512 || isa == esm::Isa::Avx512Vnni ||
+         isa == esm::Isa::Amx;
+}
+}  // namespace
+
+// FP32 AVX-512 Linear cross-check. Until this kernel landed, the FP32
+// path delegated to LinearRef; on the gate machine all of lm_head's
+// FP32 GEMMs ran scalar single-threaded, costing >50 % of the 650M
+// forward. This test guards the new multi-accumulator implementation.
+TEST(GemmShapes, Avx512Fp32DispatchMatchesRefAcrossEsmShapes) {
+  if (!HostHasAvx512()) GTEST_SKIP() << "host lacks AVX-512";
+  // Cover the shapes lm_head actually drives plus a few tail/N-tail
+  // cases: N not multiple of 8 hits the per-output fallback, K not
+  // multiple of 16 hits the masked tail.
+  const std::vector<Shape> shapes = {
+      // lm_head shapes (M=B*L, N=d, K=d) and (M=B*L, N=V=33, K=d)
+      {2048, 1280, 1280},  // 650M lm_dense
+      {2048, 33, 1280},    // 650M lm_decoder
+      {2048, 640, 640},    // 150M lm_dense
+      {2048, 33, 640},     // 150M lm_decoder
+      {800, 320, 320},     // 8M lm_dense (B=8, L=100)
+      {800, 33, 320},      // 8M lm_decoder
+      // Tail cases: N not multiple of 8, K not multiple of 16
+      {17, 11, 19},
+      {32, 9, 32},
+      {16, 17, 64},
+  };
+  for (const auto& s : shapes) {
+    // FP32 FMA reordering: 1e-4 covers K up to ~10^4 against rand[-1, 1].
+    // Force "avx512vnni" so kernels::Linear routes to LinearAvx512 even
+    // when host_isa is amx (the Avx512 / Avx512Vnni / Amx switch arms
+    // are all aliases here).
+    RunShape("avx512vnni", s, /*with_bias=*/false, 1e-4f);
+    RunShape("avx512vnni", s, /*with_bias=*/true, 1e-4f);
+  }
+}
 #endif  // x86_64
