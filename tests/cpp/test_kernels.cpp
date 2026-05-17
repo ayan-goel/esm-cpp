@@ -22,6 +22,68 @@ bool HostHasAvx512() {
 #endif
 }  // namespace
 
+TEST(ResidualAddInplaceRef, BasicMath) {
+  std::vector<float> y = {1.0f, 2.0f, 3.0f, 4.0f};
+  std::vector<float> x = {0.5f, -1.0f, 10.0f, 100.0f};
+  esm::kernels::ResidualAddInplaceRef(y.data(), x.data(), y.size());
+  std::vector<float> expected = {1.5f, 1.0f, 13.0f, 104.0f};
+  for (std::size_t i = 0; i < expected.size(); ++i)
+    EXPECT_NEAR(y[i], expected[i], 1e-6f);
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+namespace esm::kernels {
+void ResidualAddInplaceAvx512(float* y, const float* x, std::size_t n);
+void ScaleInplaceAvx512(float* x, std::size_t n, float scale);
+}  // namespace esm::kernels
+
+TEST(ScaleInplaceAvx512, MatchesRefAcrossScalesAndSizes) {
+  if (!HostHasAvx512()) GTEST_SKIP() << "host lacks AVX-512";
+  for (float scale : {1.0f, 0.0f, -1.0f, 0.125f, 1.0f / 8.0f /*Q-scale @ dh=64*/}) {
+    for (std::size_t n : {std::size_t{1}, std::size_t{15}, std::size_t{17},
+                           std::size_t{32}, std::size_t{4097},
+                           std::size_t{8 * 1280}}) {
+      std::vector<float> x_ref(n), x_got(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        x_ref[i] = 0.5f * std::cos(static_cast<float>(i) * 0.019f);
+        x_got[i] = x_ref[i];
+      }
+      esm::kernels::ScaleInplaceRef(x_ref.data(), n, scale);
+      esm::kernels::ScaleInplaceAvx512(x_got.data(), n, scale);
+      for (std::size_t i = 0; i < n; ++i) {
+        EXPECT_NEAR(x_got[i], x_ref[i], 1e-6f)
+            << "n=" << n << " scale=" << scale << " i=" << i;
+      }
+    }
+  }
+}
+
+TEST(ResidualAddInplaceAvx512, MatchesRefOnDenseSweep) {
+  if (!HostHasAvx512()) GTEST_SKIP() << "host lacks AVX-512";
+  // Sizes cover tail cases (< 16, multiples of 16, multiples of 4096, and
+  // a 650M-scale ffn-sized vector to exercise the parallel chunking).
+  for (std::size_t n : {std::size_t{1}, std::size_t{15}, std::size_t{16},
+                         std::size_t{17}, std::size_t{31}, std::size_t{32},
+                         std::size_t{1023}, std::size_t{1024}, std::size_t{1025},
+                         std::size_t{4095}, std::size_t{4096}, std::size_t{4097},
+                         std::size_t{8 * 1280}, std::size_t{2048 * 5120}}) {
+    std::vector<float> y_ref(n), y_got(n), x(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      y_ref[i] = 0.3f * std::sin(static_cast<float>(i) * 0.011f);
+      y_got[i] = y_ref[i];
+      x[i] = 0.4f * std::cos(static_cast<float>(i) * 0.017f);
+    }
+    esm::kernels::ResidualAddInplaceRef(y_ref.data(), x.data(), n);
+    esm::kernels::ResidualAddInplaceAvx512(y_got.data(), x.data(), n);
+    for (std::size_t i = 0; i < n; ++i) {
+      // Elementwise add is bit-identical (no reordering); 1e-6 is overkill
+      // but covers the masked-tail rounding edge if any.
+      EXPECT_NEAR(y_got[i], y_ref[i], 1e-6f) << "n=" << n << " i=" << i;
+    }
+  }
+}
+#endif  // x86_64
+
 TEST(LinearRef, MatchesHandComputed_2x3_times_4x3_plus_bias) {
   // A: [[1, 2, 3], [4, 5, 6]]            (M=2, K=3)
   // W: [[1, 0, -1], [0, 1, 0], [1, 1, 1], [2, -1, 0]]  (N=4, K=3)

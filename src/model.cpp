@@ -597,7 +597,7 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   {
     esm::profile::ScopedTimer t("q_scale_rope");
     const float q_scale = 1.0f / std::sqrt(static_cast<float>(dh));
-    for (long i = 0; i < static_cast<long>(L) * d; ++i) q_packed[i] *= q_scale;
+    kernels::ScaleInplace(q_packed, static_cast<std::size_t>(L) * d, q_scale);
 
     // RoPE positions reset per sequence — table only needs max_seqlen rows
     // even when packed T = sum(L_b) is much larger.
@@ -629,9 +629,8 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   // Residual: hidden += attn_proj
   {
     esm::profile::ScopedTimer t("residual");
-    for (long i = 0; i < static_cast<long>(L) * d; ++i) {
-      hidden[i] += scratch_attn_proj[i];
-    }
+    kernels::ResidualAddInplace(hidden, scratch_attn_proj,
+                                 static_cast<std::size_t>(L) * d);
   }
 
   // Pre-FFN LayerNorm on `hidden` -> scratch_ln
@@ -677,9 +676,8 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   // Residual: hidden += ffn_out
   {
     esm::profile::ScopedTimer t("residual");
-    for (long i = 0; i < static_cast<long>(L) * d; ++i) {
-      hidden[i] += scratch_ffn_out[i];
-    }
+    kernels::ResidualAddInplace(hidden, scratch_ffn_out,
+                                 static_cast<std::size_t>(L) * d);
   }
 }
 

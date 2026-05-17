@@ -51,6 +51,7 @@ set(ESM_KERNEL_SOURCES
   src/kernels/gemm_int8.cpp
   src/kernels/layernorm.cpp
   src/kernels/gelu.cpp
+  src/kernels/residual.cpp
   src/kernels/rope.cpp
   src/kernels/attention.cpp
 )

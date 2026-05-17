@@ -51,6 +51,8 @@ void LayerNormAvx512(const float* x, const float* gamma, const float* beta,
 void AttentionVarlenAvx512(const float* q, const float* k, const float* v,
                             const int* cu_seqlens, int batch_size,
                             int num_heads, int head_dim, float* out);
+void ResidualAddInplaceAvx512(float* y, const float* x, std::size_t n);
+void ScaleInplaceAvx512(float* x, std::size_t n, float scale);
 #endif
 
 void LinearInt8(const float* A, const esm::quant::QuantizedTensor& W,
@@ -93,6 +95,32 @@ void Gelu(const float* x, float* out, std::size_t n) {
 #endif
     default:
       return GeluRef(x, out, n);
+  }
+}
+
+void ResidualAddInplace(float* y, const float* x, std::size_t n) {
+  switch (esm::CurrentIsa()) {
+#if defined(__x86_64__) || defined(_M_X64)
+    case Isa::Avx512:
+    case Isa::Avx512Vnni:
+    case Isa::Amx:
+      return ResidualAddInplaceAvx512(y, x, n);
+#endif
+    default:
+      return ResidualAddInplaceRef(y, x, n);
+  }
+}
+
+void ScaleInplace(float* x, std::size_t n, float scale) {
+  switch (esm::CurrentIsa()) {
+#if defined(__x86_64__) || defined(_M_X64)
+    case Isa::Avx512:
+    case Isa::Avx512Vnni:
+    case Isa::Amx:
+      return ScaleInplaceAvx512(x, n, scale);
+#endif
+    default:
+      return ScaleInplaceRef(x, n, scale);
   }
 }
 

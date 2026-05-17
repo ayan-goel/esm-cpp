@@ -19,6 +19,16 @@ namespace esm::kernels {
 void Linear(const float* A, const float* W, const float* bias, float* C,
             int M, int N, int K);
 
+// Elementwise y[i] += x[i] (residual connection). Used twice per
+// TransformerBlock; cost is dominated by parallelism, not arithmetic.
+void ResidualAddInplace(float* y, const float* x, std::size_t n);
+void ResidualAddInplaceRef(float* y, const float* x, std::size_t n);
+
+// Elementwise x[i] *= scale (Q-scale before RoPE; see CLAUDE.md). The
+// scale is a single broadcast value, not a vector.
+void ScaleInplace(float* x, std::size_t n, float scale);
+void ScaleInplaceRef(float* x, std::size_t n, float scale);
+
 void LayerNorm(const float* x, const float* gamma, const float* beta,
                float eps, float* out, int num_rows, int d);
 
