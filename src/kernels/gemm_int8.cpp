@@ -14,7 +14,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <string_view>
 #include <vector>
 
 #include "esm_cpp/thread_pool.h"
@@ -523,24 +522,14 @@ void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
   const std::int8_t* w_packed = W.packed_vnni.data();
   const std::int32_t* col_sum = W.col_sum.data();
 
-  // Step 5: GEMM. The Goto 6×32 microkernel is the default (fills the
-  // VPDPBUSD pipe with 12 independent accumulators). ESM_VNNI_KERNEL=
-  // legacy1x16 forces the single-accumulator path — kept for one release
-  // as an A/B escape hatch if a shape regresses; will be removed after
-  // 650M HF parity is re-verified on real workloads.
+  // Step 5: GEMM through the Goto 6×32 microkernel (fills the VPDPBUSD
+  // pipe with 12 independent accumulators). ComputeRowsGoto falls back
+  // to the legacy 1×16 path internally for the M-tail (M % 6) and the
+  // N-tail (N % 32) — see lines 342 + 363.
   const float* w_scale = W.per_channel_scales.data();
-  const char* kernel_env = std::getenv("ESM_VNNI_KERNEL");
-  const bool use_legacy = kernel_env != nullptr &&
-                           std::string_view(kernel_env) ==
-                               std::string_view("legacy1x16");
   auto run = [&](int begin, int end) {
-    if (use_legacy) {
-      ComputeRows(a_u8, w_packed, w_scale, col_sum, bias, act_scale, K,
-                  K_pad, N, C, begin, end);
-    } else {
-      ComputeRowsGoto(a_u8, w_packed, w_scale, col_sum, bias, act_scale, K,
-                      K_pad, N, C, begin, end);
-    }
+    ComputeRowsGoto(a_u8, w_packed, w_scale, col_sum, bias, act_scale, K,
+                    K_pad, N, C, begin, end);
   };
   if (M > 1 && !esm::InGlobalPoolWorker()) {
     // Grain of 6 keeps full 6-row blocks together in each worker's chunk;
