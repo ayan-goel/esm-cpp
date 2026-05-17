@@ -252,6 +252,15 @@ TEST(AttentionVarlenAvx512Bf16, MatchesRefAtBf16Tolerance) {
     auto Q = RandomVec(static_cast<std::size_t>(T) * c.H * c.dh, 0xA1A2);
     auto K = RandomVec(static_cast<std::size_t>(T) * c.H * c.dh, 0xB1B2);
     auto V = RandomVec(static_cast<std::size_t>(T) * c.H * c.dh, 0xC1C2);
+    // Pre-scale Q by 1/sqrt(head_dim) to match real ESM-2 forward
+    // usage (CLAUDE.md: scale Q BEFORE RoPE, not the score after).
+    // Without this, raw Q in [-1, 1] produces scores ~4-8 magnitude
+    // which causes softmax to be heavily peaked. Peaked softmax
+    // amplifies BF16's per-element rounding error through exp() into
+    // a 10-15 % relative output drift — not a kernel bug, just a
+    // pessimistic test setup. Production always pre-scales Q.
+    const float q_scale = 1.0f / std::sqrt(static_cast<float>(c.dh));
+    for (auto& v : Q) v *= q_scale;
     std::vector<int> cu = c.L2 > 0 ? std::vector<int>{0, c.L1, T}
                                     : std::vector<int>{0, c.L1};
     const int batch_size = static_cast<int>(cu.size()) - 1;
@@ -283,8 +292,12 @@ TEST(AttentionVarlenAvx512Bf16, MatchesRefAtBf16Tolerance) {
         worst_i = i;
       }
     }
-    constexpr float kBf16Rtol = 5e-2f;
-    constexpr float kBf16Atol = 1e-3f;
+    // With Q pre-scaled to production magnitudes, BF16 precision drift
+    // through softmax + V-weighted-sum settles around 1-2 % on typical
+    // output elements. 3 % rtol + 1e-4 atol gives headroom for the
+    // worst-case (near-zero output) without masking algorithm bugs.
+    constexpr float kBf16Rtol = 3e-2f;
+    constexpr float kBf16Atol = 1e-4f;
     for (std::size_t i = 0; i < out_ref.size(); ++i) {
       const float ref_mag = std::fabs(out_ref[i]);
       EXPECT_NEAR(out_bf16[i], out_ref[i],
