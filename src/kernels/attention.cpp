@@ -468,8 +468,10 @@ inline void RunOneHeadAvx512(const float* q, const float* k, const float* v,
 //      weight × FP32 V, no BF16 throughput win available.
 //
 // CLAUDE.md: FP32 accumulator preserved inside attention (the _ps
-// accumulator type in _mm512_dpbf16_ps is exactly that).
-namespace {
+// accumulator type in _mm512_dpbf16_ps is exactly that). These helpers
+// live in the SAME anonymous namespace as the FP32 attention helpers
+// above — opening a nested anonymous would shadow `AttentionVarlenAvx512`
+// when we forward-call it as the BF16 fallback path.
 
 thread_local std::vector<std::uint16_t> g_attn_q_bf16;
 thread_local std::vector<std::uint16_t> g_attn_k_bf16;
@@ -686,6 +688,13 @@ bool ReadBf16AttentionEnvOnce() {
 }
 
 }  // namespace
+
+// Forward declaration: AttentionVarlenAvx512Bf16's head_dim-not-multiple-
+// of-32 fallback delegates to the FP32 path, which is defined later in
+// this TU.
+void AttentionVarlenAvx512(const float* q, const float* k, const float* v,
+                            const int* cu_seqlens, int batch_size,
+                            int num_heads, int head_dim, float* out);
 
 void AttentionVarlenAvx512Bf16(const float* q, const float* k, const float* v,
                                 const int* cu_seqlens, int batch_size,
