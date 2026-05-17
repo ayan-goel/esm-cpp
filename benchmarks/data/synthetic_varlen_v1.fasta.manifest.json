@@ -1,0 +1,17 @@
+{
+  "source": "synthetic (OAS-length-distribution-matched)",
+  "generator": "tools/make_synthetic_varlen.py",
+  "snapshot_date": "2026-05-17",
+  "num_sequences": 256,
+  "seed": 20260516,
+  "fasta_sha256": "81badf0b1f528db7f3f3d9e87bfd795796ddfbd54da8747d71ecbf57f83ff4e2",
+  "length_distribution": {
+    "model": "0.95 * Gaussian(120, 12) clip[80, 180] + 0.05 * Uniform[200, 250]",
+    "min": 87,
+    "max": 249,
+    "mean": 126.2,
+    "median": 121
+  },
+  "alphabet": "ACDEFGHIKLMNPQRSTVWY",
+  "note": "Synthetic content for perf benchmarking only \u2014 measures cu_seqlens-packed-batch vs HF-padded-batch. For external quality claims, use real OAS sequences via tools/fetch_oas_antibodies.py."
+}
