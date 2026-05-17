@@ -27,8 +27,6 @@ ESM-2 at 8M, 35M, 150M, 650M, 3B. W8A8 INT8 with SmoothQuant ships for 150M and 
 
 The variable-length advantage comes from the `cu_seqlens` packed-batch forward: HuggingFace pads every sequence in a batch to `max(len)` and processes the resulting padded tensor uniformly; esm.cpp packs sequences back-to-back along the token axis and isolates per-sequence attention via `cu_seqlens`. On antibody-shaped data (mean ~120 residues, max ~250) that saves ~3× of HF's attention compute and ~2× of its FFN compute on top of the INT8/AMX baseline.
 
-Reproduction commands + raw JSON results in [docs/benchmarks.md](docs/benchmarks.md). Phase-by-phase technical retrospectives live in `notes/phase{4..7}.md`.
-
 ## Install
 
 ```bash
