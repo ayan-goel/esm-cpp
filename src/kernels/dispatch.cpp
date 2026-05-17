@@ -53,6 +53,9 @@ void AttentionVarlenAvx512(const float* q, const float* k, const float* v,
                             int num_heads, int head_dim, float* out);
 void ResidualAddInplaceAvx512(float* y, const float* x, std::size_t n);
 void ScaleInplaceAvx512(float* x, std::size_t n, float scale);
+void RopeApplyVarlenAvx512(float* x, const float* cos, const float* sin,
+                            const int* cu_seqlens, int batch_size,
+                            int num_heads, int head_dim);
 #endif
 
 void LinearInt8(const float* A, const esm::quant::QuantizedTensor& W,
@@ -129,6 +132,23 @@ void RopeApplyInplace(float* x, const float* cos, const float* sin,
   switch (esm::CurrentIsa()) {
     default:
       return RopeApplyInplaceRef(x, cos, sin, num_heads, seq_len, head_dim);
+  }
+}
+
+void RopeApplyVarlen(float* x, const float* cos, const float* sin,
+                     const int* cu_seqlens, int batch_size, int num_heads,
+                     int head_dim) {
+  switch (esm::CurrentIsa()) {
+#if defined(__x86_64__) || defined(_M_X64)
+    case Isa::Avx512:
+    case Isa::Avx512Vnni:
+    case Isa::Amx:
+      return RopeApplyVarlenAvx512(x, cos, sin, cu_seqlens, batch_size,
+                                    num_heads, head_dim);
+#endif
+    default:
+      return RopeApplyVarlenRef(x, cos, sin, cu_seqlens, batch_size,
+                                num_heads, head_dim);
   }
 }
 

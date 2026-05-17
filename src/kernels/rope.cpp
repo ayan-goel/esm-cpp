@@ -1,5 +1,13 @@
 #include "esm_cpp/kernels.h"
 
+#include <cstddef>
+
+#ifdef ESM_KERNEL_AVX512
+#include <immintrin.h>
+
+#include "esm_cpp/thread_pool.h"
+#endif
+
 namespace esm::kernels {
 
 #ifdef ESM_KERNEL_REFERENCE
@@ -56,5 +64,87 @@ void RopeApplyVarlenRef(float* x, const float* cos, const float* sin,
 }
 
 #endif  // ESM_KERNEL_REFERENCE
+
+#ifdef ESM_KERNEL_AVX512
+
+// Packed-varlen RoPE in [T, H, dh] layout. The half-then-half pattern
+// is load-bearing — Llama/GPT-NeoX style, NOT interleaved (see CLAUDE.md
+// and esm/rotary_embedding.py). We rely on RopeBuildTables's invariant
+// that crow[i] == crow[i + half] and srow[i] == srow[i + half], so the
+// same SIMD load of cos/sin serves both halves of the rotation.
+//
+// Per-position math (per CLAUDE.md):
+//   new_lo = x_lo * c - x_hi * s
+//   new_hi = x_hi * c + x_lo * s
+//
+// Vectorized over the first-half index i in chunks of 16. Parallelized
+// across (batch × num_heads) — same fan-out as the AVX-512 attention
+// kernel (S6 phase 6). Skips dispatch under InGlobalPoolWorker() to
+// avoid the nested-pool deadlock pattern.
+void RopeApplyVarlenAvx512(float* x, const float* cos, const float* sin,
+                            const int* cu_seqlens, int batch_size,
+                            int num_heads, int head_dim) {
+  const int half = head_dim / 2;
+
+  auto run_one_pos = [&](int t_global, int p, int h) {
+    const float* crow =
+        cos + static_cast<long>(p) * head_dim;
+    const float* srow =
+        sin + static_cast<long>(p) * head_dim;
+    float* xrow =
+        x + (static_cast<long>(t_global) * num_heads + h) * head_dim;
+
+    int i = 0;
+    for (; i + 16 <= half; i += 16) {
+      __m512 x_lo = _mm512_loadu_ps(xrow + i);
+      __m512 x_hi = _mm512_loadu_ps(xrow + i + half);
+      __m512 c = _mm512_loadu_ps(crow + i);
+      __m512 s = _mm512_loadu_ps(srow + i);
+      __m512 lo_c_term = _mm512_mul_ps(x_lo, c);
+      __m512 hi_s_term = _mm512_mul_ps(x_lo, s);
+      // new_lo = x_lo * c - x_hi * s = -(x_hi * s) + (x_lo * c)
+      __m512 new_lo = _mm512_fnmadd_ps(x_hi, s, lo_c_term);
+      // new_hi = x_hi * c + x_lo * s
+      __m512 new_hi = _mm512_fmadd_ps(x_hi, c, hi_s_term);
+      _mm512_storeu_ps(xrow + i, new_lo);
+      _mm512_storeu_ps(xrow + i + half, new_hi);
+    }
+    if (i < half) {
+      const int tail = half - i;
+      const __mmask16 mask = static_cast<__mmask16>((1u << tail) - 1u);
+      __m512 x_lo = _mm512_maskz_loadu_ps(mask, xrow + i);
+      __m512 x_hi = _mm512_maskz_loadu_ps(mask, xrow + i + half);
+      __m512 c = _mm512_maskz_loadu_ps(mask, crow + i);
+      __m512 s = _mm512_maskz_loadu_ps(mask, srow + i);
+      __m512 lo_c_term = _mm512_mul_ps(x_lo, c);
+      __m512 hi_s_term = _mm512_mul_ps(x_lo, s);
+      __m512 new_lo = _mm512_fnmadd_ps(x_hi, s, lo_c_term);
+      __m512 new_hi = _mm512_fmadd_ps(x_hi, c, hi_s_term);
+      _mm512_mask_storeu_ps(xrow + i, mask, new_lo);
+      _mm512_mask_storeu_ps(xrow + i + half, mask, new_hi);
+    }
+  };
+
+  const int total_bh = batch_size * num_heads;
+  auto worker = [&](int bh_begin, int bh_end) {
+    for (int bh = bh_begin; bh < bh_end; ++bh) {
+      const int b = bh / num_heads;
+      const int h = bh % num_heads;
+      const int seq_start = cu_seqlens[b];
+      const int seq_end = cu_seqlens[b + 1];
+      const int seq_len = seq_end - seq_start;
+      for (int p = 0; p < seq_len; ++p) {
+        run_one_pos(seq_start + p, p, h);
+      }
+    }
+  };
+  if (total_bh > 1 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(0, total_bh, /*grain=*/1, worker);
+  } else {
+    worker(0, total_bh);
+  }
+}
+
+#endif  // ESM_KERNEL_AVX512
 
 }  // namespace esm::kernels

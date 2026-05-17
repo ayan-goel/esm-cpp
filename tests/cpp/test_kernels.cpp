@@ -291,6 +291,66 @@ TEST(RopeApplyInplace, HalfThenHalfRotation) {
   EXPECT_NEAR(x[7], 4.0f * c01 + 2.0f * s01, 1e-5f);
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+namespace esm::kernels {
+void RopeApplyVarlenAvx512(float* x, const float* cos, const float* sin,
+                           const int* cu_seqlens, int batch_size,
+                           int num_heads, int head_dim);
+}  // namespace esm::kernels
+
+namespace {
+struct RopeShape {
+  int B;
+  int H;
+  int dh;
+  std::vector<int> seq_lens;  // length B
+};
+
+void RunRopeShape(const RopeShape& sh) {
+  int T = 0;
+  for (int l : sh.seq_lens) T += l;
+  int max_seq = 0;
+  for (int l : sh.seq_lens) max_seq = std::max(max_seq, l);
+  std::vector<int> cu(sh.B + 1, 0);
+  for (int b = 0; b < sh.B; ++b) cu[b + 1] = cu[b] + sh.seq_lens[b];
+
+  std::vector<float> cos(static_cast<std::size_t>(max_seq) * sh.dh);
+  std::vector<float> sin(static_cast<std::size_t>(max_seq) * sh.dh);
+  esm::kernels::RopeBuildTables(max_seq, sh.dh, cos.data(), sin.data());
+
+  std::vector<float> x_ref(static_cast<std::size_t>(T) * sh.H * sh.dh);
+  for (std::size_t i = 0; i < x_ref.size(); ++i) {
+    x_ref[i] = 0.3f * std::sin(static_cast<float>(i) * 0.019f);
+  }
+  std::vector<float> x_got = x_ref;
+
+  esm::kernels::RopeApplyVarlenRef(x_ref.data(), cos.data(), sin.data(),
+                                    cu.data(), sh.B, sh.H, sh.dh);
+  esm::kernels::RopeApplyVarlenAvx512(x_got.data(), cos.data(), sin.data(),
+                                       cu.data(), sh.B, sh.H, sh.dh);
+  for (std::size_t i = 0; i < x_ref.size(); ++i) {
+    EXPECT_NEAR(x_got[i], x_ref[i], 1e-6f)
+        << "B=" << sh.B << " H=" << sh.H << " dh=" << sh.dh
+        << " i=" << i;
+  }
+}
+}  // namespace
+
+TEST(RopeApplyVarlenAvx512, MatchesRefAcrossEsmDims) {
+  if (!HostHasAvx512()) GTEST_SKIP() << "host lacks AVX-512";
+  // ESM-2 head_dim coverage: 16 (8M), 24 (35M), 32 (150M), 64 (650M).
+  // Mix of B (1 / 4 / 8) and seq_lens including odd values to exercise
+  // the half < 16 masked-tail path (dh=16 → half=8) and the dh-not-
+  // multiple-of-16 case (dh=24 → half=12).
+  RunRopeShape({1, 5,  16, {100}});                  // 8M
+  RunRopeShape({8, 5,  16, {100, 100, 100, 100, 100, 100, 100, 100}}); // 8M batch
+  RunRopeShape({4, 20, 24, {128, 128, 128, 128}});   // 35M
+  RunRopeShape({2, 20, 32, {256, 37}});              // 150M + odd seq tail
+  RunRopeShape({8, 20, 64, {256, 256, 256, 256, 256, 256, 256, 256}}); // 650M
+  RunRopeShape({3, 20, 64, {1, 1, 1}});              // single-token edge
+}
+#endif  // x86_64
+
 TEST(AttentionRef, SingleHeadSingleTokenIsIdentityOnV) {
   // L=1, H=1, dh=2. softmax(QK^T) = 1, so out = V.
   std::vector<float> Q = {0.5f, 0.5f};

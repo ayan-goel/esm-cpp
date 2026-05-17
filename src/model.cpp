@@ -602,10 +602,10 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
     // RoPE positions reset per sequence — table only needs max_seqlen rows
     // even when packed T = sum(L_b) is much larger.
     kernels::RopeBuildTables(max_seqlen, dh, scratch_cos, scratch_sin);
-    kernels::RopeApplyVarlenRef(q_packed, scratch_cos, scratch_sin, cu_seqlens,
-                                batch_size, H, dh);
-    kernels::RopeApplyVarlenRef(k_packed, scratch_cos, scratch_sin, cu_seqlens,
-                                batch_size, H, dh);
+    kernels::RopeApplyVarlen(q_packed, scratch_cos, scratch_sin, cu_seqlens,
+                              batch_size, H, dh);
+    kernels::RopeApplyVarlen(k_packed, scratch_cos, scratch_sin, cu_seqlens,
+                              batch_size, H, dh);
   }
 
   // Self-attention. Output is [L, H*dh] = [L, d] (heads concatenated).

@@ -87,6 +87,9 @@ void RopeApplyInplaceRef(float* x, const float* cos, const float* sin,
 void RopeApplyVarlenRef(float* x, const float* cos, const float* sin,
                         const int* cu_seqlens, int batch_size, int num_heads,
                         int head_dim);
+void RopeApplyVarlen(float* x, const float* cos, const float* sin,
+                     const int* cu_seqlens, int batch_size, int num_heads,
+                     int head_dim);
 
 // Scaled-dot self-attention (no Q-scale here; caller scales Q ahead of
 // RoPE per the ESM convention). Mask: -inf for padded positions, 0 for
