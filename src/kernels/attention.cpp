@@ -12,6 +12,14 @@
 #ifdef ESM_KERNEL_AVX512
 #include <immintrin.h>
 
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <vector>
+
 #include "esm_cpp/thread_pool.h"
 #endif
 
@@ -435,11 +443,320 @@ inline void RunOneHeadAvx512(const float* q, const float* k, const float* v,
   }
 }
 
+// BF16 variant of the attention kernel — uses VDPBF16PS for Pass 1,
+// FP32 fallback for Pass 2 (softmax) and Pass 3 (S · V). The plan
+// section S7 specifies the AMX TDPBF16PS path; this simpler AVX-512
+// BF16 variant captures the same throughput gain (32 BF16 muls per
+// instruction = 2× FP32 FMA throughput, half the K-tile bytes) without
+// the AMX tile-state complexity. PPPL gate still required before this
+// becomes default-on; for now ESM_AMX_ATTENTION=on opts in per the
+// plan's safety mitigation.
+//
+// Per-(b, h) plan:
+//   1. Pre-convert Q[L, h, :] and K[L, h, :] to BF16 in thread_local
+//      scratch buffers (each [L * head_dim] BF16 = half the FP32 size).
+//      The conversion uses _mm512_cvtne2ps_pbh which packs 32 FP32
+//      into 32 BF16 in one zmm.
+//   2. Pass 1: same 16-zmm-accumulator structure as Slice 4/6 but the
+//      inner head_dim chunk is 32 (BF16) instead of 16 (FP32). Each
+//      _mm512_dpbf16_ps does 32 BF16 mul-adds → 16 FP32 accumulator
+//      lanes (DEST[i] += SRC1.bf16[2i]*SRC2.bf16[2i] +
+//      SRC1.bf16[2i+1]*SRC2.bf16[2i+1]) which is exactly the partial
+//      dot of two head_dim values.
+//   3. Pass 2 (softmax) unchanged — FP32 throughout.
+//   4. Pass 3 (S · V) unchanged — the per-output FMA is FP32 scalar
+//      weight × FP32 V, no BF16 throughput win available.
+//
+// CLAUDE.md: FP32 accumulator preserved inside attention (the _ps
+// accumulator type in _mm512_dpbf16_ps is exactly that).
+namespace {
+
+thread_local std::vector<std::uint16_t> g_attn_q_bf16;
+thread_local std::vector<std::uint16_t> g_attn_k_bf16;
+
+inline void ConvertPackedToBf16(const float* src, std::uint16_t* dst,
+                                 int n) {
+  int i = 0;
+  for (; i + 32 <= n; i += 32) {
+    __m512 lo = _mm512_loadu_ps(src + i);
+    __m512 hi = _mm512_loadu_ps(src + i + 16);
+    __m512bh bh = _mm512_cvtne2ps_pbh(hi, lo);
+    _mm512_storeu_si512(reinterpret_cast<__m512i*>(dst + i),
+                         reinterpret_cast<__m512i>(bh));
+  }
+  if (i + 16 <= n) {
+    __m512 v = _mm512_loadu_ps(src + i);
+    __m256bh half = _mm512_cvtneps_pbh(v);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i),
+                         reinterpret_cast<__m256i>(half));
+    i += 16;
+  }
+  if (i < n) {
+    // Scalar tail. Round-to-nearest-even FP32 → BF16: shift bit 16
+    // off the top, with a +0.5-ulp bias.
+    for (; i < n; ++i) {
+      std::uint32_t bits;
+      const float f = src[i];
+      std::memcpy(&bits, &f, sizeof(bits));
+      const std::uint32_t bias = 0x7FFFu + ((bits >> 16) & 1u);
+      bits += bias;
+      dst[i] = static_cast<std::uint16_t>(bits >> 16);
+    }
+  }
+}
+
+template <int HEAD_DIM_T>
+inline void RunOneHeadAvx512Bf16Impl(const std::uint16_t* q_bf16,
+                                      const std::uint16_t* k_bf16,
+                                      const float* v, int seq_start,
+                                      int seq_len, int h, int num_heads,
+                                      int head_dim_arg, float* out,
+                                      float* scores) {
+  const int head_dim = HEAD_DIM_T >= 0 ? HEAD_DIM_T : head_dim_arg;
+  // BF16 path supports head_dim multiples of 32 only — the BF16 zmm
+  // holds 32 values per chunk. Inner-loop tail handling for
+  // non-multiples isn't worth the complexity in the BF16 path; the
+  // caller routes such heads to the FP32 kernel.
+  const int head_dim_chunks_bf16 = head_dim / 32;
+  for (int i = 0; i < seq_len; ++i) {
+    const int t_q = seq_start + i;
+    // Q for this query is contiguous head_dim BF16 in q_bf16 scratch
+    // (we pre-packed it as [L, head_dim] so per-h indexing is just
+    // i * head_dim).
+    const std::uint16_t* qi_bf16 = q_bf16 + static_cast<long>(i) * head_dim;
+
+    // Pass 1: scores[j] = qi · kj for each j, via VDPBF16PS.
+    __m512 v_max = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+    int j = 0;
+    for (; j + 16 <= seq_len; j += 16) {
+      __m512 a0  = _mm512_setzero_ps();
+      __m512 a1  = _mm512_setzero_ps();
+      __m512 a2  = _mm512_setzero_ps();
+      __m512 a3  = _mm512_setzero_ps();
+      __m512 a4  = _mm512_setzero_ps();
+      __m512 a5  = _mm512_setzero_ps();
+      __m512 a6  = _mm512_setzero_ps();
+      __m512 a7  = _mm512_setzero_ps();
+      __m512 a8  = _mm512_setzero_ps();
+      __m512 a9  = _mm512_setzero_ps();
+      __m512 a10 = _mm512_setzero_ps();
+      __m512 a11 = _mm512_setzero_ps();
+      __m512 a12 = _mm512_setzero_ps();
+      __m512 a13 = _mm512_setzero_ps();
+      __m512 a14 = _mm512_setzero_ps();
+      __m512 a15 = _mm512_setzero_ps();
+      const long k_row_stride = static_cast<long>(head_dim);
+      const std::uint16_t* kj_base =
+          k_bf16 + static_cast<long>(j) * k_row_stride;
+
+      for (int d = 0; d < head_dim_chunks_bf16; ++d) {
+        const int d_off = d * 32;
+        __m512bh qc = reinterpret_cast<__m512bh>(
+            _mm512_loadu_si512(
+                reinterpret_cast<const __m512i*>(qi_bf16 + d_off)));
+#define LOAD_KJ(N)                                                         \
+  __m512bh kc##N = reinterpret_cast<__m512bh>(_mm512_loadu_si512(           \
+      reinterpret_cast<const __m512i*>(kj_base + N * k_row_stride + d_off)))
+        LOAD_KJ(0);  LOAD_KJ(1);  LOAD_KJ(2);  LOAD_KJ(3);
+        LOAD_KJ(4);  LOAD_KJ(5);  LOAD_KJ(6);  LOAD_KJ(7);
+        LOAD_KJ(8);  LOAD_KJ(9);  LOAD_KJ(10); LOAD_KJ(11);
+        LOAD_KJ(12); LOAD_KJ(13); LOAD_KJ(14); LOAD_KJ(15);
+#undef LOAD_KJ
+        a0  = _mm512_dpbf16_ps(a0,  qc, kc0);
+        a1  = _mm512_dpbf16_ps(a1,  qc, kc1);
+        a2  = _mm512_dpbf16_ps(a2,  qc, kc2);
+        a3  = _mm512_dpbf16_ps(a3,  qc, kc3);
+        a4  = _mm512_dpbf16_ps(a4,  qc, kc4);
+        a5  = _mm512_dpbf16_ps(a5,  qc, kc5);
+        a6  = _mm512_dpbf16_ps(a6,  qc, kc6);
+        a7  = _mm512_dpbf16_ps(a7,  qc, kc7);
+        a8  = _mm512_dpbf16_ps(a8,  qc, kc8);
+        a9  = _mm512_dpbf16_ps(a9,  qc, kc9);
+        a10 = _mm512_dpbf16_ps(a10, qc, kc10);
+        a11 = _mm512_dpbf16_ps(a11, qc, kc11);
+        a12 = _mm512_dpbf16_ps(a12, qc, kc12);
+        a13 = _mm512_dpbf16_ps(a13, qc, kc13);
+        a14 = _mm512_dpbf16_ps(a14, qc, kc14);
+        a15 = _mm512_dpbf16_ps(a15, qc, kc15);
+      }
+      __m512 scores_chunk = _mm512_set_ps(
+          _mm512_reduce_add_ps(a15), _mm512_reduce_add_ps(a14),
+          _mm512_reduce_add_ps(a13), _mm512_reduce_add_ps(a12),
+          _mm512_reduce_add_ps(a11), _mm512_reduce_add_ps(a10),
+          _mm512_reduce_add_ps(a9),  _mm512_reduce_add_ps(a8),
+          _mm512_reduce_add_ps(a7),  _mm512_reduce_add_ps(a6),
+          _mm512_reduce_add_ps(a5),  _mm512_reduce_add_ps(a4),
+          _mm512_reduce_add_ps(a3),  _mm512_reduce_add_ps(a2),
+          _mm512_reduce_add_ps(a1),  _mm512_reduce_add_ps(a0));
+      _mm512_storeu_ps(scores + j, scores_chunk);
+      v_max = _mm512_max_ps(v_max, scores_chunk);
+    }
+    // j-tail: < 16 K-rows. Use scalar BF16 dot (slow but rare; called
+    // only on the seq_len tail, which for ESM-2 typical L=256 is empty).
+    for (; j < seq_len; ++j) {
+      const std::uint16_t* kj =
+          k_bf16 + static_cast<long>(j) * static_cast<long>(head_dim);
+      __m512 acc = _mm512_setzero_ps();
+      for (int d = 0; d < head_dim_chunks_bf16; ++d) {
+        const int d_off = d * 32;
+        __m512bh qc = reinterpret_cast<__m512bh>(_mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(qi_bf16 + d_off)));
+        __m512bh kc = reinterpret_cast<__m512bh>(_mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(kj + d_off)));
+        acc = _mm512_dpbf16_ps(acc, qc, kc);
+      }
+      scores[j] = _mm512_reduce_add_ps(acc);
+    }
+    float max_score = _mm512_reduce_max_ps(v_max);
+    for (int jj = (seq_len & ~15); jj < seq_len; ++jj) {
+      if (scores[jj] > max_score) max_score = scores[jj];
+    }
+
+    // Pass 2: softmax — same as the FP32 kernel.
+    const __m512 v_max_bcast = _mm512_set1_ps(max_score);
+    __m512 v_sum = _mm512_setzero_ps();
+    j = 0;
+    for (; j + 16 <= seq_len; j += 16) {
+      __m512 s = _mm512_sub_ps(_mm512_loadu_ps(scores + j), v_max_bcast);
+      __m512 e = ExpAvx512Attn(s);
+      _mm512_storeu_ps(scores + j, e);
+      v_sum = _mm512_add_ps(v_sum, e);
+    }
+    float sum = _mm512_reduce_add_ps(v_sum);
+    for (; j < seq_len; ++j) {
+      const float e = std::exp(scores[j] - max_score);
+      scores[j] = e;
+      sum += e;
+    }
+    const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+
+    // Pass 3: out_row = sum_j (scores[j] * inv_sum) * V[j]. FP32 V.
+    __m512 o0 = _mm512_setzero_ps();
+    __m512 o1 = _mm512_setzero_ps();
+    __m512 o2 = _mm512_setzero_ps();
+    __m512 o3 = _mm512_setzero_ps();
+    const int o_full_chunks = head_dim / 16;
+    for (int jj = 0; jj < seq_len; ++jj) {
+      const float w_scalar = scores[jj] * inv_sum;
+      if (w_scalar == 0.0f) continue;
+      const __m512 w = _mm512_set1_ps(w_scalar);
+      const int t_k = seq_start + jj;
+      const float* vj =
+          v + (static_cast<long>(t_k) * num_heads + h) * head_dim;
+      if (o_full_chunks > 0) o0 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vj +  0), o0);
+      if (o_full_chunks > 1) o1 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vj + 16), o1);
+      if (o_full_chunks > 2) o2 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vj + 32), o2);
+      if (o_full_chunks > 3) o3 = _mm512_fmadd_ps(w, _mm512_loadu_ps(vj + 48), o3);
+    }
+    float* out_row =
+        out + (static_cast<long>(t_q) * num_heads + h) * head_dim;
+    if (o_full_chunks > 0) _mm512_storeu_ps(out_row +  0, o0);
+    if (o_full_chunks > 1) _mm512_storeu_ps(out_row + 16, o1);
+    if (o_full_chunks > 2) _mm512_storeu_ps(out_row + 32, o2);
+    if (o_full_chunks > 3) _mm512_storeu_ps(out_row + 48, o3);
+  }
+}
+
+inline void RunOneHeadAvx512Bf16(const std::uint16_t* q_bf16,
+                                  const std::uint16_t* k_bf16,
+                                  const float* v, int seq_start,
+                                  int seq_len, int h, int num_heads,
+                                  int head_dim, float* out, float* scores) {
+  switch (head_dim) {
+    case 32:
+      return RunOneHeadAvx512Bf16Impl<32>(q_bf16, k_bf16, v, seq_start,
+                                           seq_len, h, num_heads, head_dim,
+                                           out, scores);
+    case 64:
+      return RunOneHeadAvx512Bf16Impl<64>(q_bf16, k_bf16, v, seq_start,
+                                           seq_len, h, num_heads, head_dim,
+                                           out, scores);
+    default:
+      return RunOneHeadAvx512Bf16Impl<-1>(q_bf16, k_bf16, v, seq_start,
+                                           seq_len, h, num_heads, head_dim,
+                                           out, scores);
+  }
+}
+
+bool ReadBf16AttentionEnvOnce() {
+  const char* v = std::getenv("ESM_AMX_ATTENTION");
+  if (!v || !*v) return false;
+  const std::string s = v;
+  return s == "on" || s == "1" || s == "true";
+}
+
 }  // namespace
+
+void AttentionVarlenAvx512Bf16(const float* q, const float* k, const float* v,
+                                const int* cu_seqlens, int batch_size,
+                                int num_heads, int head_dim, float* out) {
+  // BF16 path only supports head_dim multiples of 32 (the BF16 zmm
+  // holds 32 values per chunk). For other sizes (e.g. 35M's dh=24),
+  // fall back to the FP32 path.
+  if ((head_dim & 31) != 0) {
+    AttentionVarlenAvx512(q, k, v, cu_seqlens, batch_size, num_heads,
+                          head_dim, out);
+    return;
+  }
+  const int total_bh = batch_size * num_heads;
+  int max_seq = 0;
+  for (int b = 0; b < batch_size; ++b) {
+    max_seq = std::max(max_seq, cu_seqlens[b + 1] - cu_seqlens[b]);
+  }
+  auto run = [&](int bh_begin, int bh_end) {
+    if (g_attn_scores.size() <
+        static_cast<std::size_t>(max_seq + 16)) {
+      g_attn_scores.assign(static_cast<std::size_t>(max_seq + 16), 0.0f);
+    }
+    const std::size_t qk_scratch =
+        static_cast<std::size_t>(max_seq) * head_dim;
+    if (g_attn_q_bf16.size() < qk_scratch)
+      g_attn_q_bf16.assign(qk_scratch, 0);
+    if (g_attn_k_bf16.size() < qk_scratch)
+      g_attn_k_bf16.assign(qk_scratch, 0);
+    float* scores = g_attn_scores.data();
+    for (int bh = bh_begin; bh < bh_end; ++bh) {
+      const int b = bh / num_heads;
+      const int h = bh % num_heads;
+      const int seq_start = cu_seqlens[b];
+      const int seq_end = cu_seqlens[b + 1];
+      const int seq_len = seq_end - seq_start;
+      if (seq_len <= 0) continue;
+
+      // Pack Q[seq_start..seq_end, h, :] and K[same] to contiguous
+      // BF16 scratch [seq_len, head_dim]. Strided FP32 → packed BF16.
+      for (int i = 0; i < seq_len; ++i) {
+        const int t = seq_start + i;
+        ConvertPackedToBf16(
+            q + (static_cast<long>(t) * num_heads + h) * head_dim,
+            g_attn_q_bf16.data() + static_cast<long>(i) * head_dim,
+            head_dim);
+        ConvertPackedToBf16(
+            k + (static_cast<long>(t) * num_heads + h) * head_dim,
+            g_attn_k_bf16.data() + static_cast<long>(i) * head_dim,
+            head_dim);
+      }
+
+      RunOneHeadAvx512Bf16(g_attn_q_bf16.data(), g_attn_k_bf16.data(), v,
+                            seq_start, seq_len, h, num_heads, head_dim,
+                            out, scores);
+    }
+  };
+  if (total_bh > 1 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(0, total_bh, /*grain=*/1, run);
+  } else {
+    run(0, total_bh);
+  }
+}
 
 void AttentionVarlenAvx512(const float* q, const float* k, const float* v,
                             const int* cu_seqlens, int batch_size,
                             int num_heads, int head_dim, float* out) {
+  static const bool bf16_attention_on = ReadBf16AttentionEnvOnce();
+  if (bf16_attention_on && (head_dim & 31) == 0) {
+    return AttentionVarlenAvx512Bf16(q, k, v, cu_seqlens, batch_size,
+                                      num_heads, head_dim, out);
+  }
   // Parallelize across (batch × head) — 33-layer ESM-2 at B=8 H=20 gives
   // 160 work items, enough to keep all 22 cores fed. The previous
   // batch-only parallelism left 14 of 22 cores idle every layer; on the

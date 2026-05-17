@@ -203,6 +203,60 @@ TEST(AttentionVarlenRef, B2PackedIsolatesSequences) {
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
+namespace esm::kernels {
+void AttentionVarlenAvx512Bf16(const float* q, const float* k, const float* v,
+                                const int* cu_seqlens, int batch_size,
+                                int num_heads, int head_dim, float* out);
+}  // namespace esm::kernels
+
+TEST(AttentionVarlenAvx512Bf16, MatchesRefAtBf16Tolerance) {
+  if (!HostHasAvx512()) GTEST_SKIP() << "host lacks AVX-512";
+  // The BF16 variant only supports head_dim multiples of 32 (BF16 zmm
+  // chunk size). At BF16 precision the per-element error is ~1 ULP of
+  // BF16 ≈ 1/128 ≈ 0.008 — call it 1e-2 absolute, scaled by element
+  // magnitude. Plan-mandated tolerance.
+  struct Case {
+    int H;
+    int dh;
+    int L1;
+    int L2;
+  };
+  const Case cases[] = {
+      {4, 32, 17, 0},  {4, 64, 33, 0},   {4, 32, 48, 0},
+      {4, 64, 64, 0},  {20, 64, 256, 0}, {20, 64, 128, 128},
+      {20, 64, 37, 0}, {20, 64, 1, 1},
+  };
+  for (const auto& c : cases) {
+    const int T = c.L1 + c.L2;
+    auto Q = RandomVec(static_cast<std::size_t>(T) * c.H * c.dh, 0xA1A2);
+    auto K = RandomVec(static_cast<std::size_t>(T) * c.H * c.dh, 0xB1B2);
+    auto V = RandomVec(static_cast<std::size_t>(T) * c.H * c.dh, 0xC1C2);
+    std::vector<int> cu = c.L2 > 0 ? std::vector<int>{0, c.L1, T}
+                                    : std::vector<int>{0, c.L1};
+    const int batch_size = static_cast<int>(cu.size()) - 1;
+
+    std::vector<float> out_ref(static_cast<std::size_t>(T) * c.H * c.dh);
+    std::vector<float> out_bf16(static_cast<std::size_t>(T) * c.H * c.dh);
+    esm::kernels::AttentionVarlenRef(Q.data(), K.data(), V.data(),
+                                       cu.data(), batch_size, c.H, c.dh,
+                                       out_ref.data());
+    esm::kernels::AttentionVarlenAvx512Bf16(Q.data(), K.data(), V.data(),
+                                              cu.data(), batch_size, c.H,
+                                              c.dh, out_bf16.data());
+    for (std::size_t i = 0; i < out_ref.size(); ++i) {
+      const float ref_mag = std::fabs(out_ref[i]);
+      // rtol 1e-2 + atol 1e-4 — BF16 inputs to Pass 1 + softmax
+      // exponentiation amplify the per-element error past pure BF16
+      // ULP. The Slice 4/6 FP32 path stays the production default;
+      // BF16 is opt-in for v0.1 and gated on PPPL for default-on.
+      EXPECT_NEAR(out_bf16[i], out_ref[i],
+                   1e-4f + 1e-2f * ref_mag)
+          << "H=" << c.H << " dh=" << c.dh << " L1=" << c.L1
+          << " L2=" << c.L2 << " i=" << i;
+    }
+  }
+}
+
 TEST(AttentionVarlenAvx512, MatchesRefAcrossEsmHeadDims) {
   if (!HostHasAvx512()) GTEST_SKIP() << "host lacks AVX-512";
   // ESM head_dim values: 16 (8M), 24 (35M), 32 (150M), 64 (650M / 3B).

@@ -71,7 +71,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
   target_compile_definitions(esm_cpp_kernels_avx512 PRIVATE ESM_KERNEL_AVX512)
   target_compile_options(esm_cpp_kernels_avx512 PRIVATE
-    -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni -mfma)
+    -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni -mavx512bf16 -mfma)
   target_link_libraries(esm_cpp_kernels_avx512 PRIVATE esm_warnings)
   target_compile_features(esm_cpp_kernels_avx512 PUBLIC cxx_std_20)
   list(APPEND ESM_KERNEL_OBJECT_LIBS esm_cpp_kernels_avx512)
