@@ -1,4 +1,5 @@
 #include "esm_cpp/kernels.h"
+#include "esm_cpp/profile.h"
 #include "esm_cpp/quant.h"
 
 // AMX-INT8 path uses TDPBUSD with on-chip 16-row × 64-byte tiles for
@@ -204,8 +205,10 @@ void LinearAmx(const float* A, const esm::quant::QuantizedTensor& W,
   // through LinearVnni (which itself routes to the multi-accumulator
   // Goto kernel for the same hot shapes).
   if (M < 32 || (N & 31) != 0 || (K & 63) != 0 || !AmxProcessReady()) {
+    esm::profile::BumpCounter("amx_fallback_to_vnni");
     return LinearVnni(A, W, bias, C, M, N, K);
   }
+  esm::profile::BumpCounter("amx_engaged");
 
   // Activation prefix: shared parallel absmax + quantize helper. Both the
   // VNNI and AMX paths consume the same u8 layout, so the prefix is

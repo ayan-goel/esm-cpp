@@ -118,6 +118,7 @@ add_library(esm_cpp_core STATIC
   src/kernels/cpu_features.cpp
   src/kernels/dispatch.cpp
   src/kernels/rope_tables.cpp
+  src/profile.cpp
   src/quant/observer.cpp
   src/quant/pack.cpp
   src/quant/smoothquant.cpp

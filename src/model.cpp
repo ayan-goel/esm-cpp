@@ -15,6 +15,7 @@
 #include "esm_cpp/cpu_features.h"
 #include "esm_cpp/io.h"
 #include "esm_cpp/kernels.h"
+#include "esm_cpp/profile.h"
 #include "esm_cpp/smoothquant.h"
 #include "esm_cpp/tokenizer.h"
 
@@ -567,8 +568,11 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   const int ffn = cfg.intermediate_size;
 
   // Pre-attention LayerNorm on `hidden` -> scratch_ln
-  kernels::LayerNorm(hidden, w.attn_ln_w.data(), w.attn_ln_b.data(),
-                     cfg.layer_norm_eps, scratch_ln, L, d);
+  {
+    esm::profile::ScopedTimer t("attn_ln");
+    kernels::LayerNorm(hidden, w.attn_ln_w.data(), w.attn_ln_b.data(),
+                       cfg.layer_norm_eps, scratch_ln, L, d);
+  }
   if (observer) {
     observer->Observe("layer" + std::to_string(layer_index) + ".attn_ln_output",
                       scratch_ln, static_cast<std::size_t>(L) * d);
@@ -579,45 +583,63 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   float* q_packed = scratch_qkv_flat;
   float* k_packed = scratch_qkv_flat + static_cast<long>(L) * d;
   float* v_packed = scratch_qkv_flat + 2L * L * d;
-  LinearProj(cfg, scratch_ln, w.q_w.data(), w.q_w_int8, w.q_b.data(),
-             q_packed, L, d, d);
-  LinearProj(cfg, scratch_ln, w.k_w.data(), w.k_w_int8, w.k_b.data(),
-             k_packed, L, d, d);
-  LinearProj(cfg, scratch_ln, w.v_w.data(), w.v_w_int8, w.v_b.data(),
-             v_packed, L, d, d);
+  {
+    esm::profile::ScopedTimer t("qkv_proj");
+    LinearProj(cfg, scratch_ln, w.q_w.data(), w.q_w_int8, w.q_b.data(),
+               q_packed, L, d, d);
+    LinearProj(cfg, scratch_ln, w.k_w.data(), w.k_w_int8, w.k_b.data(),
+               k_packed, L, d, d);
+    LinearProj(cfg, scratch_ln, w.v_w.data(), w.v_w_int8, w.v_b.data(),
+               v_packed, L, d, d);
+  }
 
   // Q-scale BEFORE RoPE — ESM's load-bearing quirk; see CLAUDE.md.
-  const float q_scale = 1.0f / std::sqrt(static_cast<float>(dh));
-  for (long i = 0; i < static_cast<long>(L) * d; ++i) q_packed[i] *= q_scale;
+  {
+    esm::profile::ScopedTimer t("q_scale_rope");
+    const float q_scale = 1.0f / std::sqrt(static_cast<float>(dh));
+    for (long i = 0; i < static_cast<long>(L) * d; ++i) q_packed[i] *= q_scale;
 
-  // RoPE positions reset per sequence — table only needs max_seqlen rows
-  // even when packed T = sum(L_b) is much larger.
-  kernels::RopeBuildTables(max_seqlen, dh, scratch_cos, scratch_sin);
-  kernels::RopeApplyVarlenRef(q_packed, scratch_cos, scratch_sin, cu_seqlens,
-                              batch_size, H, dh);
-  kernels::RopeApplyVarlenRef(k_packed, scratch_cos, scratch_sin, cu_seqlens,
-                              batch_size, H, dh);
+    // RoPE positions reset per sequence — table only needs max_seqlen rows
+    // even when packed T = sum(L_b) is much larger.
+    kernels::RopeBuildTables(max_seqlen, dh, scratch_cos, scratch_sin);
+    kernels::RopeApplyVarlenRef(q_packed, scratch_cos, scratch_sin, cu_seqlens,
+                                batch_size, H, dh);
+    kernels::RopeApplyVarlenRef(k_packed, scratch_cos, scratch_sin, cu_seqlens,
+                                batch_size, H, dh);
+  }
 
   // Self-attention. Output is [L, H*dh] = [L, d] (heads concatenated).
-  kernels::AttentionVarlen(q_packed, k_packed, v_packed, cu_seqlens, batch_size,
-                           H, dh, scratch_attn_out);
+  {
+    esm::profile::ScopedTimer t("attention");
+    kernels::AttentionVarlen(q_packed, k_packed, v_packed, cu_seqlens, batch_size,
+                             H, dh, scratch_attn_out);
+  }
   if (observer) {
     observer->Observe("layer" + std::to_string(layer_index) + ".attn_out",
                       scratch_attn_out, static_cast<std::size_t>(L) * d);
   }
 
   // out_proj
-  LinearProj(cfg, scratch_attn_out, w.out_w.data(), w.out_w_int8,
-             w.out_b.data(), scratch_attn_proj, L, d, d);
+  {
+    esm::profile::ScopedTimer t("attn_out_proj");
+    LinearProj(cfg, scratch_attn_out, w.out_w.data(), w.out_w_int8,
+               w.out_b.data(), scratch_attn_proj, L, d, d);
+  }
 
   // Residual: hidden += attn_proj
-  for (long i = 0; i < static_cast<long>(L) * d; ++i) {
-    hidden[i] += scratch_attn_proj[i];
+  {
+    esm::profile::ScopedTimer t("residual");
+    for (long i = 0; i < static_cast<long>(L) * d; ++i) {
+      hidden[i] += scratch_attn_proj[i];
+    }
   }
 
   // Pre-FFN LayerNorm on `hidden` -> scratch_ln
-  kernels::LayerNorm(hidden, w.ffn_ln_w.data(), w.ffn_ln_b.data(),
-                     cfg.layer_norm_eps, scratch_ln, L, d);
+  {
+    esm::profile::ScopedTimer t("ffn_ln");
+    kernels::LayerNorm(hidden, w.ffn_ln_w.data(), w.ffn_ln_b.data(),
+                       cfg.layer_norm_eps, scratch_ln, L, d);
+  }
   if (observer) {
     observer->Observe("layer" + std::to_string(layer_index) + ".ffn_ln_output",
                       scratch_ln, static_cast<std::size_t>(L) * d);
@@ -631,22 +653,33 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   }
 
   // fc1: [L, d] -> [L, 4d]
-  LinearProj(cfg, scratch_ln, w.fc1_w.data(), w.fc1_w_int8, w.fc1_b.data(),
-             scratch_inter, L, ffn, d);
-  // GELU
-  kernels::Gelu(scratch_inter, scratch_inter_gelu,
-                static_cast<std::size_t>(L) * ffn);
+  {
+    esm::profile::ScopedTimer t("fc1");
+    LinearProj(cfg, scratch_ln, w.fc1_w.data(), w.fc1_w_int8, w.fc1_b.data(),
+               scratch_inter, L, ffn, d);
+  }
+  {
+    esm::profile::ScopedTimer t("gelu");
+    kernels::Gelu(scratch_inter, scratch_inter_gelu,
+                  static_cast<std::size_t>(L) * ffn);
+  }
   if (observer) {
     observer->Observe("layer" + std::to_string(layer_index) + ".inter_gelu",
                       scratch_inter_gelu, static_cast<std::size_t>(L) * ffn);
   }
   // fc2: [L, 4d] -> [L, d]
-  LinearProj(cfg, scratch_inter_gelu, w.fc2_w.data(), w.fc2_w_int8,
-             w.fc2_b.data(), scratch_ffn_out, L, d, ffn);
+  {
+    esm::profile::ScopedTimer t("fc2");
+    LinearProj(cfg, scratch_inter_gelu, w.fc2_w.data(), w.fc2_w_int8,
+               w.fc2_b.data(), scratch_ffn_out, L, d, ffn);
+  }
 
   // Residual: hidden += ffn_out
-  for (long i = 0; i < static_cast<long>(L) * d; ++i) {
-    hidden[i] += scratch_ffn_out[i];
+  {
+    esm::profile::ScopedTimer t("residual");
+    for (long i = 0; i < static_cast<long>(L) * d; ++i) {
+      hidden[i] += scratch_ffn_out[i];
+    }
   }
 }
 
@@ -725,8 +758,11 @@ void Model::ForwardPackedInto(
   ws.reserve(scratch_floats * sizeof(float) + alignment_slack);
 
   float* hidden = ws.allocate<float>(Td);
-  Embed(cfg_, embed_.data(), batch.packed_ids, batch.packed_masks,
-        batch.cu_seqlens.data(), B, hidden);
+  {
+    esm::profile::ScopedTimer t("embed");
+    Embed(cfg_, embed_.data(), batch.packed_ids, batch.packed_masks,
+          batch.cu_seqlens.data(), B, hidden);
+  }
 
   if (hidden_packed_out) {
     hidden_packed_out->clear();
@@ -761,29 +797,44 @@ void Model::ForwardPackedInto(
   // Final encoder LayerNorm (= HF emb_layer_norm_after); produces the
   // hidden state that lm_head consumes.
   float* final_ln = ws.allocate<float>(Td);
-  kernels::LayerNorm(hidden, final_ln_w_.data(), final_ln_b_.data(),
-                     cfg_.layer_norm_eps, final_ln, T, d);
+  {
+    esm::profile::ScopedTimer t("final_ln");
+    kernels::LayerNorm(hidden, final_ln_w_.data(), final_ln_b_.data(),
+                       cfg_.layer_norm_eps, final_ln, T, d);
+  }
   if (hidden_packed_out) {
     hidden_packed_out->back().assign(final_ln, final_ln + Td);
   }
 
   // lm_head: dense -> gelu -> layer_norm -> tied decoder + bias.
   float* lm_dense = ws.allocate<float>(Td);
-  kernels::Linear(final_ln, lm_dense_w_.data(), lm_dense_b_.data(), lm_dense,
-                  T, d, d);
+  {
+    esm::profile::ScopedTimer t("lm_dense");
+    kernels::Linear(final_ln, lm_dense_w_.data(), lm_dense_b_.data(), lm_dense,
+                    T, d, d);
+  }
   float* lm_gelu = ws.allocate<float>(Td);
-  kernels::Gelu(lm_dense, lm_gelu, Td);
+  {
+    esm::profile::ScopedTimer t("lm_gelu");
+    kernels::Gelu(lm_dense, lm_gelu, Td);
+  }
   float* lm_ln = ws.allocate<float>(Td);
-  kernels::LayerNorm(lm_gelu, lm_ln_w_.data(), lm_ln_b_.data(),
-                     cfg_.layer_norm_eps, lm_ln, T, d);
+  {
+    esm::profile::ScopedTimer t("lm_ln");
+    kernels::LayerNorm(lm_gelu, lm_ln_w_.data(), lm_ln_b_.data(),
+                       cfg_.layer_norm_eps, lm_ln, T, d);
+  }
 
   // Tied decoder: packed [T, V] logits then split per-sequence. embed_
   // has shape [V, d] which is exactly the layout Linear expects for
   // W [N=V, K=d]. The packed logits live in the arena; per-sequence
   // outputs are the caller-visible boundary allocs.
   float* packed_logits = ws.allocate<float>(TV);
-  kernels::Linear(lm_ln, embed_.data(), lm_decoder_bias_.data(),
-                  packed_logits, T, V, d);
+  {
+    esm::profile::ScopedTimer t("lm_decoder");
+    kernels::Linear(lm_ln, embed_.data(), lm_decoder_bias_.data(),
+                    packed_logits, T, V, d);
+  }
   if (logits_per_seq_out) {
     logits_per_seq_out->resize(static_cast<std::size_t>(B));
     for (int b = 0; b < B; ++b) {
@@ -797,6 +848,8 @@ void Model::ForwardPackedInto(
                       static_cast<std::size_t>(V) * sizeof(float));
     }
   }
+
+  esm::profile::DumpAndReset();
 }
 
 void Model::ForwardInto(
