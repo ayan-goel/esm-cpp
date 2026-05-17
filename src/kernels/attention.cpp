@@ -11,6 +11,8 @@
 // namespace block leak C-stdlib symbols into esm::kernels).
 #ifdef ESM_KERNEL_AVX512
 #include <immintrin.h>
+
+#include "esm_cpp/thread_pool.h"
 #endif
 
 namespace esm::kernels {
@@ -190,113 +192,140 @@ inline float DotAvx512(const float* a, const float* b, int n) {
 
 }  // namespace
 
+namespace {
+
+// One (batch, head) attention pass. Fully self-contained: reads from
+// the shared q/k/v buffers offset by (t_q × H + h) × dh, writes to the
+// corresponding rows of out. scores must point at scratch >= seq_len + 16.
+inline void RunOneHeadAvx512(const float* q, const float* k, const float* v,
+                              int seq_start, int seq_len, int h, int num_heads,
+                              int head_dim, float* out, float* scores) {
+  for (int i = 0; i < seq_len; ++i) {
+    const int t_q = seq_start + i;
+    const float* qi =
+        q + (static_cast<long>(t_q) * num_heads + h) * head_dim;
+
+    // Pass 1: scores[j] = qi · kj for each j; track running max.
+    __m512 v_max = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
+    int j = 0;
+    for (; j + 16 <= seq_len; j += 16) {
+      // Compute 16 scores; only the dot itself is vectorized inside
+      // DotAvx512 — we still do 16 separate dot products per j-chunk
+      // because each one depends on a different K row.
+      for (int jj = 0; jj < 16; ++jj) {
+        const int t_k = seq_start + j + jj;
+        const float* kj =
+            k + (static_cast<long>(t_k) * num_heads + h) * head_dim;
+        scores[j + jj] = DotAvx512(qi, kj, head_dim);
+      }
+      v_max = _mm512_max_ps(v_max, _mm512_loadu_ps(scores + j));
+    }
+    for (; j < seq_len; ++j) {
+      const int t_k = seq_start + j;
+      const float* kj =
+          k + (static_cast<long>(t_k) * num_heads + h) * head_dim;
+      scores[j] = DotAvx512(qi, kj, head_dim);
+    }
+    float max_score = ReduceMaxPs(v_max);
+    for (int jj = (seq_len & ~15); jj < seq_len; ++jj) {
+      if (scores[jj] > max_score) max_score = scores[jj];
+    }
+
+    // Pass 2: scores[j] = exp(scores[j] - max); sum.
+    const __m512 v_max_bcast = _mm512_set1_ps(max_score);
+    __m512 v_sum = _mm512_setzero_ps();
+    j = 0;
+    for (; j + 16 <= seq_len; j += 16) {
+      __m512 s = _mm512_sub_ps(_mm512_loadu_ps(scores + j), v_max_bcast);
+      __m512 e = ExpAvx512Attn(s);
+      _mm512_storeu_ps(scores + j, e);
+      v_sum = _mm512_add_ps(v_sum, e);
+    }
+    float sum = ReduceAddPs(v_sum);
+    for (; j < seq_len; ++j) {
+      const float e = std::exp(scores[j] - max_score);
+      scores[j] = e;
+      sum += e;
+    }
+    const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+
+    // Pass 3: out_row = sum_j (scores[j] * inv_sum) * V[j].
+    float* out_row =
+        out + (static_cast<long>(t_q) * num_heads + h) * head_dim;
+    // Zero out_row.
+    {
+      int d = 0;
+      for (; d + 16 <= head_dim; d += 16) {
+        _mm512_storeu_ps(out_row + d, _mm512_setzero_ps());
+      }
+      if (d < head_dim) {
+        const int tail = head_dim - d;
+        const __mmask16 mask = static_cast<__mmask16>((1u << tail) - 1u);
+        _mm512_mask_storeu_ps(out_row + d, mask, _mm512_setzero_ps());
+      }
+    }
+    for (int jj = 0; jj < seq_len; ++jj) {
+      const float w = scores[jj] * inv_sum;
+      if (w == 0.0f) continue;
+      const int t_k = seq_start + jj;
+      const float* vj =
+          v + (static_cast<long>(t_k) * num_heads + h) * head_dim;
+      const __m512 wv = _mm512_set1_ps(w);
+      int d = 0;
+      for (; d + 16 <= head_dim; d += 16) {
+        __m512 vv = _mm512_loadu_ps(vj + d);
+        __m512 ov = _mm512_loadu_ps(out_row + d);
+        _mm512_storeu_ps(out_row + d, _mm512_fmadd_ps(vv, wv, ov));
+      }
+      if (d < head_dim) {
+        const int tail = head_dim - d;
+        const __mmask16 mask = static_cast<__mmask16>((1u << tail) - 1u);
+        __m512 vv = _mm512_maskz_loadu_ps(mask, vj + d);
+        __m512 ov = _mm512_maskz_loadu_ps(mask, out_row + d);
+        _mm512_mask_storeu_ps(out_row + d, mask,
+                               _mm512_fmadd_ps(vv, wv, ov));
+      }
+    }
+  }
+}
+
+}  // namespace
+
 void AttentionVarlenAvx512(const float* q, const float* k, const float* v,
                             const int* cu_seqlens, int batch_size,
                             int num_heads, int head_dim, float* out) {
+  // Parallelize across (batch × head) — 33-layer ESM-2 at B=8 H=20 gives
+  // 160 work items, enough to keep all 22 cores fed. The previous
+  // batch-only parallelism left 14 of 22 cores idle every layer; on the
+  // gate-machine profile this section was 30 % of the 650M forward.
+  const int total_bh = batch_size * num_heads;
+  // Compute max_seq across batches once; each worker's scores scratch
+  // needs to fit the largest sequence.
+  int max_seq = 0;
   for (int b = 0; b < batch_size; ++b) {
-    const int seq_start = cu_seqlens[b];
-    const int seq_end = cu_seqlens[b + 1];
-    const int seq_len = seq_end - seq_start;
-    if (seq_len <= 0) continue;
+    max_seq = std::max(max_seq, cu_seqlens[b + 1] - cu_seqlens[b]);
+  }
+  auto run = [&](int bh_begin, int bh_end) {
     if (g_attn_scores.size() <
-        static_cast<std::size_t>(seq_len + 16)) {
-      g_attn_scores.assign(static_cast<std::size_t>(seq_len + 16), 0.0f);
-    } else {
-      std::fill(g_attn_scores.begin() + seq_len,
-                g_attn_scores.begin() + seq_len + 16, 0.0f);
+        static_cast<std::size_t>(max_seq + 16)) {
+      g_attn_scores.assign(static_cast<std::size_t>(max_seq + 16), 0.0f);
     }
     float* scores = g_attn_scores.data();
-
-    for (int h = 0; h < num_heads; ++h) {
-      for (int i = 0; i < seq_len; ++i) {
-        const int t_q = seq_start + i;
-        const float* qi =
-            q + (static_cast<long>(t_q) * num_heads + h) * head_dim;
-
-        // Pass 1: scores[j] = qi · kj for each j; track running max.
-        __m512 v_max = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
-        int j = 0;
-        for (; j + 16 <= seq_len; j += 16) {
-          // Compute 16 scores; only the dot itself is vectorized inside
-          // DotAvx512 — we still do 16 separate dot products per j-chunk
-          // because each one depends on a different K row.
-          for (int jj = 0; jj < 16; ++jj) {
-            const int t_k = seq_start + j + jj;
-            const float* kj =
-                k + (static_cast<long>(t_k) * num_heads + h) * head_dim;
-            scores[j + jj] = DotAvx512(qi, kj, head_dim);
-          }
-          v_max = _mm512_max_ps(v_max,
-                                _mm512_loadu_ps(scores + j));
-        }
-        for (; j < seq_len; ++j) {
-          const int t_k = seq_start + j;
-          const float* kj =
-              k + (static_cast<long>(t_k) * num_heads + h) * head_dim;
-          scores[j] = DotAvx512(qi, kj, head_dim);
-        }
-        float max_score = ReduceMaxPs(v_max);
-        for (int jj = (seq_len & ~15); jj < seq_len; ++jj) {
-          if (scores[jj] > max_score) max_score = scores[jj];
-        }
-
-        // Pass 2: scores[j] = exp(scores[j] - max); sum.
-        const __m512 v_max_bcast = _mm512_set1_ps(max_score);
-        __m512 v_sum = _mm512_setzero_ps();
-        j = 0;
-        for (; j + 16 <= seq_len; j += 16) {
-          __m512 s = _mm512_sub_ps(_mm512_loadu_ps(scores + j), v_max_bcast);
-          __m512 e = ExpAvx512Attn(s);
-          _mm512_storeu_ps(scores + j, e);
-          v_sum = _mm512_add_ps(v_sum, e);
-        }
-        float sum = ReduceAddPs(v_sum);
-        for (; j < seq_len; ++j) {
-          const float e = std::exp(scores[j] - max_score);
-          scores[j] = e;
-          sum += e;
-        }
-        const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
-
-        // Pass 3: out_row = sum_j (scores[j] * inv_sum) * V[j].
-        float* out_row =
-            out + (static_cast<long>(t_q) * num_heads + h) * head_dim;
-        // Zero out_row.
-        {
-          int d = 0;
-          for (; d + 16 <= head_dim; d += 16) {
-            _mm512_storeu_ps(out_row + d, _mm512_setzero_ps());
-          }
-          if (d < head_dim) {
-            const int tail = head_dim - d;
-            const __mmask16 mask = static_cast<__mmask16>((1u << tail) - 1u);
-            _mm512_mask_storeu_ps(out_row + d, mask, _mm512_setzero_ps());
-          }
-        }
-        for (int jj = 0; jj < seq_len; ++jj) {
-          const float w = scores[jj] * inv_sum;
-          if (w == 0.0f) continue;
-          const int t_k = seq_start + jj;
-          const float* vj =
-              v + (static_cast<long>(t_k) * num_heads + h) * head_dim;
-          const __m512 wv = _mm512_set1_ps(w);
-          int d = 0;
-          for (; d + 16 <= head_dim; d += 16) {
-            __m512 vv = _mm512_loadu_ps(vj + d);
-            __m512 ov = _mm512_loadu_ps(out_row + d);
-            _mm512_storeu_ps(out_row + d, _mm512_fmadd_ps(vv, wv, ov));
-          }
-          if (d < head_dim) {
-            const int tail = head_dim - d;
-            const __mmask16 mask = static_cast<__mmask16>((1u << tail) - 1u);
-            __m512 vv = _mm512_maskz_loadu_ps(mask, vj + d);
-            __m512 ov = _mm512_maskz_loadu_ps(mask, out_row + d);
-            _mm512_mask_storeu_ps(out_row + d, mask,
-                                   _mm512_fmadd_ps(vv, wv, ov));
-          }
-        }
-      }
+    for (int bh = bh_begin; bh < bh_end; ++bh) {
+      const int b = bh / num_heads;
+      const int h = bh % num_heads;
+      const int seq_start = cu_seqlens[b];
+      const int seq_end = cu_seqlens[b + 1];
+      const int seq_len = seq_end - seq_start;
+      if (seq_len <= 0) continue;
+      RunOneHeadAvx512(q, k, v, seq_start, seq_len, h, num_heads, head_dim,
+                       out, scores);
     }
+  };
+  if (total_bh > 1 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(0, total_bh, /*grain=*/1, run);
+  } else {
+    run(0, total_bh);
   }
 }
 

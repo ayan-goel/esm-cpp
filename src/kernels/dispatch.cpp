@@ -139,18 +139,10 @@ inline void AttentionVarlenBody(const float* q, const float* k,
 void AttentionVarlen(const float* q, const float* k, const float* v,
                      const int* cu_seqlens, int batch_size, int num_heads,
                      int head_dim, float* out) {
-  // Per-sequence attention is fully independent across batches — parallel
-  // dispatch across the batch dim is the natural axis. Skip the dispatch
-  // when already running inside a pool worker (e.g. ForwardBatch's
-  // per-sequence parallelism) to avoid nested-parallel_for deadlock.
-  if (batch_size > 1 && !esm::InGlobalPoolWorker()) {
-    esm::GlobalPool().parallel_for(
-        0, batch_size, /*grain=*/1, [&](int begin, int end) {
-          AttentionVarlenBody(q, k, v, cu_seqlens + begin, end - begin,
-                               num_heads, head_dim, out);
-        });
-    return;
-  }
+  // AVX-512 / VNNI / AMX kernels self-parallelize across (B × H) inside
+  // AttentionVarlenAvx512 — exposes 160 chunks at B=8 H=20 instead of
+  // the 8 we got from batch-only fan-out. Ref path stays serial; only
+  // tests exercise it.
   AttentionVarlenBody(q, k, v, cu_seqlens, batch_size, num_heads, head_dim,
                        out);
 }
