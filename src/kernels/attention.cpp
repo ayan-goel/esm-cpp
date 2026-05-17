@@ -212,11 +212,24 @@ namespace {
 // FP32 accumulator throughout (CLAUDE.md mandatory under long-seq INT8 KV).
 // Max head_dim = 64 (650M / 3B) → 4 zmm output chunks; we size the O
 // register array at 8 for headroom past v0.1.
+//
+// The body is templated on head_dim where useful: 16/32/64 are the
+// production paths (multiples of 16, no masked tail) and they let the
+// compiler fully unroll the inner d-loop and elide the runtime tail
+// branch. 24 (35M) and dynamic head_dim fall through to the dynamic
+// dispatch.
 constexpr int kOMaxChunks = 8;
 
-inline void RunOneHeadAvx512(const float* q, const float* k, const float* v,
-                              int seq_start, int seq_len, int h, int num_heads,
-                              int head_dim, float* out, float* scores) {
+template <int HEAD_DIM_T>
+inline void RunOneHeadAvx512Impl(const float* q, const float* k,
+                                  const float* v, int seq_start, int seq_len,
+                                  int h, int num_heads, int head_dim_arg,
+                                  float* out, float* scores) {
+  // HEAD_DIM_T = -1 means "dynamic"; otherwise it's a compile-time
+  // constant that lets the compiler unroll. Hot paths (16/32/64) use
+  // the constant version, which also lets us static-assert the no-
+  // tail invariant.
+  const int head_dim = HEAD_DIM_T >= 0 ? HEAD_DIM_T : head_dim_arg;
   const int head_dim_full = head_dim & ~15;
   const int head_dim_tail = head_dim - head_dim_full;
   const __mmask16 head_dim_tail_mask =
@@ -396,6 +409,29 @@ inline void RunOneHeadAvx512(const float* q, const float* k, const float* v,
       _mm512_mask_storeu_ps(out_row + head_dim_full,
                              head_dim_tail_mask, o_tail);
     }
+  }
+}
+
+inline void RunOneHeadAvx512(const float* q, const float* k, const float* v,
+                              int seq_start, int seq_len, int h, int num_heads,
+                              int head_dim, float* out, float* scores) {
+  // Compile-time dispatch by head_dim for the ESM-2 production sizes.
+  // Dispatch overhead is one untaken branch; the body is fully inlined.
+  switch (head_dim) {
+    case 16:
+      return RunOneHeadAvx512Impl<16>(q, k, v, seq_start, seq_len, h,
+                                       num_heads, head_dim, out, scores);
+    case 32:
+      return RunOneHeadAvx512Impl<32>(q, k, v, seq_start, seq_len, h,
+                                       num_heads, head_dim, out, scores);
+    case 64:
+      return RunOneHeadAvx512Impl<64>(q, k, v, seq_start, seq_len, h,
+                                       num_heads, head_dim, out, scores);
+    default:
+      // 24 (35M), 17, 3, ... — anything that doesn't have a fast
+      // specialization. The dynamic path handles masked tails too.
+      return RunOneHeadAvx512Impl<-1>(q, k, v, seq_start, seq_len, h,
+                                       num_heads, head_dim, out, scores);
   }
 }
 
