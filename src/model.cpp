@@ -808,8 +808,13 @@ void Model::ForwardPackedInto(
   float* lm_dense = ws.allocate<float>(Td);
   {
     esm::profile::ScopedTimer t("lm_dense");
-    kernels::Linear(final_ln, lm_dense_w_.data(), lm_dense_b_.data(), lm_dense,
-                    T, d, d);
+    if (cfg_.lm_head_dense_quantized) {
+      kernels::LinearInt8(final_ln, lm_dense_w_int8_, lm_dense_b_.data(),
+                          lm_dense, T, d, d);
+    } else {
+      kernels::Linear(final_ln, lm_dense_w_.data(), lm_dense_b_.data(),
+                      lm_dense, T, d, d);
+    }
   }
   float* lm_gelu = ws.allocate<float>(Td);
   {
@@ -1011,8 +1016,18 @@ void Model::QuantizeWeights() {
     QuantizeLinear(w.fc1_w, ffn, d, &w.fc1_w_int8);
     QuantizeLinear(w.fc2_w, d, ffn, &w.fc2_w_int8);
   }
-  // lm_head.dense / lm_head.layer_norm stay FP32 (Slice 5 escape list).
-  // The tied lm_head decoder uses embed_, which also stays FP32.
+  // Phase 7 Slice 8: optionally quantize lm_head.dense to INT8 (opt-in
+  // via ESM_QUANTIZE_LM_HEAD=on). Default keeps FP32 — the original
+  // Phase 2 Slice 5 escape list rationale stands until PPPL says
+  // otherwise. lm_head.layer_norm and the tied decoder stay FP32
+  // regardless: LN params don't quantize, and the decoder shares
+  // embed_ which we don't touch.
+  if (const char* env = std::getenv("ESM_QUANTIZE_LM_HEAD");
+      env && *env && std::string(env) != "0" &&
+      std::string(env) != "off") {
+    QuantizeLinear(lm_dense_w_, d, d, &lm_dense_w_int8_);
+    cfg_.lm_head_dense_quantized = true;
+  }
   cfg_.weights_quantized = true;
 }
 

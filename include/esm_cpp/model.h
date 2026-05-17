@@ -36,6 +36,12 @@ struct Config {
   // mitigation per research-report §"Recommended INT8 quantization
   // recipe" when SmoothQuant alone doesn't close the PPPL gap.
   bool first_block_fc1_fp16 = false;
+  // Phase 7 Slice 8: when true, the lm_head.dense projection routes
+  // through LinearInt8 against lm_dense_w_int8_. Off by default —
+  // quantizing the final-layer dense adds end-of-graph precision noise
+  // that requires PPPL re-validation. Opt in via ESM_QUANTIZE_LM_HEAD=on
+  // at QuantizeWeights time.
+  bool lm_head_dense_quantized = false;
 };
 
 struct LayerWeights {
@@ -197,6 +203,10 @@ class Model {
   std::vector<float> lm_dense_w_, lm_dense_b_;
   std::vector<float> lm_ln_w_, lm_ln_b_;
   std::vector<float> lm_decoder_bias_;  // [vocab_size]
+  // Phase 7 Slice 8: optional INT8 form of lm_dense_w_. Populated by
+  // QuantizeWeights when cfg_.lm_head_dense_quantized is true (set
+  // from the ESM_QUANTIZE_LM_HEAD env var at quantize time).
+  esm::quant::QuantizedTensor lm_dense_w_int8_;
   // lm_head.decoder.weight is tied to embed_ — we reuse embed_ directly.
 
   // Per-Model scratch arena. Mutable because Forward is logically const
