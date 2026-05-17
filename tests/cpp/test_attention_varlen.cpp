@@ -221,6 +221,14 @@ TEST(AttentionVarlenAvx512, MatchesRefAcrossEsmHeadDims) {
       {4, 16, 17, 23}, {4, 64, 11, 31},
       // Larger seq to exercise the 16-wide j-stride
       {4, 32, 48, 0}, {4, 64, 64, 0},
+      // Slice 4 (Phase 7) tile-rewrite coverage:
+      //   - 650M headline shape (H=20, dh=64, L=256)
+      //   - 35M dh=24 (head_dim not a multiple of 16) — masked head_dim tail
+      //   - Odd seq_len (L=37) — exercises the j-chunk tail in the multi-acc kernel
+      //   - Single-token edge (L=1) — entire kernel is the seq_len tail
+      {20, 64, 256, 0}, {20, 64, 128, 128},
+      {20, 24, 128, 0}, {20, 24, 37, 100},
+      {20, 64, 37, 0}, {20, 64, 1, 1},
   };
   for (const auto& c : cases) {
     const int T = c.L1 + c.L2;
