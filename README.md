@@ -15,9 +15,19 @@ Target workloads:
 
 ## Status: v0.1.0
 
-ESM-2 at 8M, 35M, 150M, 650M, 3B. The W8A8 INT8 path with SmoothQuant ships for 150M and above; smaller models stay FP32. Both safetensors (HF native) and GGUF (esm.cpp native) load paths.
+ESM-2 at 8M, 35M, 150M, 650M, 3B. W8A8 INT8 with SmoothQuant ships for 150M and above; smaller models stay FP32. Both safetensors (HF native) and GGUF (esm.cpp native) load paths.
 
-The Phase 3 ship includes the cu_seqlens packed-batch scheduler, the public benchmark harness, and the GGUF reader/writer. The headline VNNI/AMX SIMD microkernels are scaffolded; the production x86 perf numbers are a gate-machine hand-off — see [docs/benchmarks.md](docs/benchmarks.md) for the dev-host baseline and the reproduction commands for the gate run.
+**Headline performance** (Intel Xeon 8481C Sapphire Rapids, AMX-INT8, 22 vCPUs, ESM-2-650M):
+
+| Workload | esm-cpp-int8 | hf-eager-fp32 | Speedup |
+|---|---:|---:|---:|
+| Variable-length 256-seq (OAS-shape) | **12.4 s** | 115.1 s | **9.31× HF** |
+| Variable-length + opt-in env vars   | 11.5 s | 115.0 s | **10.04× HF** |
+| Uniform 8-seq × 256-tokens          | 0.92 s | 3.42 s | 4.09× HF |
+
+The variable-length advantage comes from the `cu_seqlens` packed-batch forward: HuggingFace pads every sequence in a batch to `max(len)` and processes the resulting padded tensor uniformly; esm.cpp packs sequences back-to-back along the token axis and isolates per-sequence attention via `cu_seqlens`. On antibody-shaped data (mean ~120 residues, max ~250) that saves ~3× of HF's attention compute and ~2× of its FFN compute on top of the INT8/AMX baseline.
+
+Reproduction commands + raw JSON results in [docs/benchmarks.md](docs/benchmarks.md). Phase-by-phase technical retrospectives live in `notes/phase{4..7}.md`.
 
 ## Install
 
