@@ -14,6 +14,11 @@
 #include <string>
 #include <vector>
 
+#if (defined(__x86_64__) || defined(_M_X64)) && \
+    (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
+#endif
+
 #include "esm_cpp/cpu_features.h"
 #include "esm_cpp/kernels.h"
 
@@ -24,6 +29,21 @@ bool HostHasAvx512() {
   const esm::Isa isa = esm::HostIsa();
   return isa == esm::Isa::Avx512 || isa == esm::Isa::Avx512Vnni ||
          isa == esm::Isa::Amx;
+}
+
+// AVX-512 BF16 (VDPBF16PS / VCVTNE2PS2PBH) is a separate CPUID feature
+// from base AVX-512. Cooper Lake and Sapphire Rapids have it; Skylake-
+// server doesn't. GitHub Actions x86 runners are Skylake-class, so the
+// BF16 attention test must skip on them or it traps SIGILL on the
+// first BF16 instruction. CPUID leaf 7, sub-leaf 1, EAX bit 5.
+bool HostHasAvx512Bf16() {
+#if defined(__GNUC__) || defined(__clang__)
+  unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+  if (!__get_cpuid_count(7, 1, &eax, &ebx, &ecx, &edx)) return false;
+  return (eax & (1u << 5)) != 0;
+#else
+  return false;
+#endif
 }
 
 class ForceIsa {
@@ -210,7 +230,8 @@ void AttentionVarlenAvx512Bf16(const float* q, const float* k, const float* v,
 }  // namespace esm::kernels
 
 TEST(AttentionVarlenAvx512Bf16, MatchesRefAtBf16Tolerance) {
-  if (!HostHasAvx512()) GTEST_SKIP() << "host lacks AVX-512";
+  if (!HostHasAvx512Bf16())
+    GTEST_SKIP() << "host lacks AVX-512 BF16 (VDPBF16PS)";
   // The BF16 variant only supports head_dim multiples of 32 (BF16 zmm
   // chunk size). At BF16 precision the per-element error is ~1 ULP of
   // BF16 ≈ 1/128 ≈ 0.008 — call it 1e-2 absolute, scaled by element
