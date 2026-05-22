@@ -1,0 +1,40 @@
+{
+  "description": "Phase 10 Task 1: 650M-INT8 baseline + ESM_PROFILE breakdown + thread-topology sweep + FP32-AMX datapoint on Apple M3 Pro. Sets the bottleneck ranking and the threading default before any Phase 10 change.",
+  "hardware": "Apple M3 Pro (6 P-cores + 6 E-cores, 12 logical), 18 GB, macOS 26.3.1",
+  "model": "facebook/esm2_t33_650M_UR50D",
+  "shape": "uniform batch=8 len=256 (M = 2048 tokens/GEMM)",
+  "isa": "neoni8mm (SDOT default; SMMLA opt-in)",
+  "profile_breakdown_uniform_int8_pct": {
+    "attention": 27.2,
+    "fc1": 22.8,
+    "fc2": 22.6,
+    "qkv_proj": 17.3,
+    "attn_out_proj": 5.7,
+    "gelu": 1.8,
+    "q_scale_rope": 1.0,
+    "residual": 0.6,
+    "lm_dense": 0.5,
+    "layernorms+lm_head+embed": 1.0,
+    "GEMM_bucket_total": 68.4,
+    "note": "GEMM (fc1+fc2+qkv+out) ~68%, attention ~27%, glue ~4%. Confirms the P9 GEMM-bound finding. AMX-INT8 (the headline lever) attacks the 68% bucket; PV attention (T6) attacks the 27%."
+  },
+  "thread_sweep_uniform_int8_p50_ms": {
+    "6_threads_P_cores_only": 3030,
+    "8_threads": 2919,
+    "12_threads_all_cores": 2826,
+    "finding": "All 12 cores (incl. E-cores) is FASTEST. The P-core-only hypothesis is WRONG on M3 Pro for this workload: grain-4/6 parallel_for over M=2048 creates enough chunks to load-balance across heterogeneous cores, so E-cores add net throughput rather than bottlenecking. The current default (hardware_concurrency=12) is already optimal. T7 = doc fix + recorded negative result; QoS-bias-to-P-cores would likely regress."
+  },
+  "fp32_amx_vs_int8_sdot_uniform_p50_ms": {
+    "int8_sdot_12threads": 2826,
+    "fp32_amx_cblas_12threads": 2846,
+    "hf_eager_fp32_p9": 3879,
+    "finding": "FP32+AMX (already wired via ESM_APPLE_AMX=on) is e2e on par with INT8 SDOT (within 1%), confirming the spike at the model level. So FP32+AMX is a viable quality-preserving Mac path but NOT faster. A material speedup requires AMX-INT8 (BNNSGraph) — projected ~2x on the 68% GEMM bucket -> ~1.5x e2e."
+  },
+  "baseline_to_beat_p9": {
+    "uniform_p50_ms": 2962,
+    "uniform_speedup_vs_hf": 1.30,
+    "varlen_p50_ms": 37828,
+    "varlen_speedup_vs_hf": 3.97,
+    "note": "P9 varlen/HF baselines reused (no code change yet; HF varlen is ~150s/iter and unchanged). This run measured uniform INT8 at 2826ms p50 (slightly faster than P9's 2962, within run-to-run variance)."
+  }
+}
