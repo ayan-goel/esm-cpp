@@ -1,0 +1,7 @@
+{
+  "model": "esm2_t33_650M",
+  "isa": "neoni8mm",
+  "min_logit_correlation": 0.9995629698293347,
+  "argmax_agreement": 1.0,
+  "any_nan": false
+}
