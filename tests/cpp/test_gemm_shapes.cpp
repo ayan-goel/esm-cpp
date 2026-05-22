@@ -256,3 +256,58 @@ TEST(GemmShapes, Avx512Fp32DispatchMatchesRefAcrossEsmShapes) {
   }
 }
 #endif  // x86_64
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+namespace {
+
+// Shapes spanning the NEON SDOT microkernel paths:
+//   - M >= 4 multiples (full 4-row blocks) and M < 4 (M-tail)
+//   - N multiple of 16 (4x16 hot path), N multiple of 4 not 16 (panel mop-up),
+//     and N not a multiple of 4 (partial last panel, e.g. lm_head's 33)
+//   - K not a multiple of 4 (K-tail with zero-padded weights)
+const std::vector<Shape>& NeonInt8Shapes() {
+  static const std::vector<Shape> shapes = {
+      {1, 4, 4},     {3, 8, 8},      {4, 16, 16},   {8, 32, 32},
+      {5, 16, 64},   {4, 20, 128},   {7, 33, 64},   {64, 32, 13},
+      {64, 17, 19},  {64, 33, 320},
+      // ESM-2-8M shapes (d=320, ffn=1280)
+      {32, 320, 320}, {32, 1280, 320}, {32, 320, 1280},
+      // 650M-shaped (d=1280, ffn=5120) — small M to keep the test fast
+      {18, 1280, 1280}, {18, 5120, 1280}, {18, 1280, 5120},
+  };
+  return shapes;
+}
+
+void RunNeonInt8Shape(const Shape& s, bool with_bias) {
+  ForceIsa guard("neondotprod");
+  const std::size_t Msz = static_cast<std::size_t>(s.M);
+  const std::size_t Nsz = static_cast<std::size_t>(s.N);
+  const std::size_t Ksz = static_cast<std::size_t>(s.K);
+  auto A = RandomVec(Msz * Ksz, 0x2468);
+  auto W = RandomVec(Nsz * Ksz, 0x1357);
+  auto bias = with_bias ? RandomVec(Nsz, 0xACE1) : std::vector<float>{};
+  const float* bias_ptr = with_bias ? bias.data() : nullptr;
+  esm::quant::QuantizedTensor qt;
+  esm::quant::Quantize(W.data(), s.N, s.K, &qt);
+  std::vector<float> ref(Msz * Nsz);
+  std::vector<float> got(Msz * Nsz);
+  esm::kernels::LinearInt8Ref(A.data(), qt, bias_ptr, ref.data(), s.M, s.N, s.K);
+  esm::kernels::LinearInt8(A.data(), qt, bias_ptr, got.data(), s.M, s.N, s.K);
+  // INT8 cross-check tolerance (CLAUDE.md): rtol=1e-3 atol=1. Never widened.
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float diff = std::fabs(ref[i] - got[i]);
+    ASSERT_LE(diff, 1.0f + 1e-3f * std::fabs(ref[i]))
+        << "shape=[" << s.M << "," << s.N << "," << s.K << "] bias=" << with_bias
+        << " i=" << i << " ref=" << ref[i] << " got=" << got[i];
+  }
+}
+
+}  // namespace
+
+TEST(GemmShapes, NeonDotProdInt8DispatchMatchesRef) {
+  for (const auto& s : NeonInt8Shapes()) {
+    RunNeonInt8Shape(s, /*with_bias=*/false);
+    RunNeonInt8Shape(s, /*with_bias=*/true);
+  }
+}
+#endif  // aarch64

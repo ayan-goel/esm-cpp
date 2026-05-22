@@ -15,6 +15,8 @@ namespace esm::kernels {
 #if defined(__aarch64__) || defined(_M_ARM64)
 void LinearNeon(const float* A, const float* W, const float* bias, float* C,
                 int M, int N, int K);
+void LinearNeonDotProd(const float* A, const esm::quant::QuantizedTensor& W,
+                       const float* bias, float* C, int M, int N, int K);
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -72,6 +74,11 @@ void LinearInt8(const float* A, const esm::quant::QuantizedTensor& W,
       return LinearAmx(A, W, bias, C, M, N, K);
     case Isa::Avx512Vnni:
       return LinearVnni(A, W, bias, C, M, N, K);
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::NeonI8mm:
+    case Isa::NeonDotProd:
+      return LinearNeonDotProd(A, W, bias, C, M, N, K);
 #endif
     default:
       return LinearInt8Ref(A, W, bias, C, M, N, K);
