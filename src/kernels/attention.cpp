@@ -903,22 +903,51 @@ void AttentionVarlenBhNeon(const float* q, const float* k, const float* v,
       scores[js] = e;
       sum += e;
     }
+    // Normalize the weights once, then the V-weighted sum. Register-resident:
+    // tile the output over head_dim in 16-float chunks and hold each chunk's
+    // four accumulators in registers across all keys, writing out_row once per
+    // chunk — instead of the per-key load-modify-store of out_row. V is read
+    // once per element; the chunk's strided V slice stays L1-resident across
+    // the key sweep.
     const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    const float32x4_t vinv = vdupq_n_f32(inv_sum);
+    int jn = 0;
+    for (; jn + 4 <= seq_len; jn += 4)
+      vst1q_f32(scores + jn, vmulq_f32(vld1q_f32(scores + jn), vinv));
+    for (; jn < seq_len; ++jn) scores[jn] *= inv_sum;
+
     float* out_row = out + (t_q * num_heads + h) * head_dim;
+    const long v_stride = static_cast<long>(num_heads) * head_dim;
+    const float* v_base =
+        v + (static_cast<long>(seq_start) * num_heads + h) * head_dim;
     int d = 0;
-    for (; d + 4 <= head_dim; d += 4) vst1q_f32(out_row + d, vdupq_n_f32(0.0f));
-    for (; d < head_dim; ++d) out_row[d] = 0.0f;
-    for (int jv = 0; jv < seq_len; ++jv) {
-      const float w = scores[jv] * inv_sum;
-      if (w == 0.0f) continue;
-      const float* vj =
-          v + ((static_cast<long>(seq_start) + jv) * num_heads + h) * head_dim;
-      d = 0;
-      for (; d + 4 <= head_dim; d += 4) {
-        vst1q_f32(out_row + d,
-                  vfmaq_n_f32(vld1q_f32(out_row + d), vld1q_f32(vj + d), w));
+    for (; d + 16 <= head_dim; d += 16) {
+      float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+      const float* vp = v_base + d;
+      for (int jv = 0; jv < seq_len; ++jv, vp += v_stride) {
+        const float w = scores[jv];
+        a0 = vfmaq_n_f32(a0, vld1q_f32(vp + 0), w);
+        a1 = vfmaq_n_f32(a1, vld1q_f32(vp + 4), w);
+        a2 = vfmaq_n_f32(a2, vld1q_f32(vp + 8), w);
+        a3 = vfmaq_n_f32(a3, vld1q_f32(vp + 12), w);
       }
-      for (; d < head_dim; ++d) out_row[d] += w * vj[d];
+      vst1q_f32(out_row + d + 0, a0);
+      vst1q_f32(out_row + d + 4, a1);
+      vst1q_f32(out_row + d + 8, a2);
+      vst1q_f32(out_row + d + 12, a3);
+    }
+    for (; d + 4 <= head_dim; d += 4) {
+      float32x4_t a = vdupq_n_f32(0.0f);
+      const float* vp = v_base + d;
+      for (int jv = 0; jv < seq_len; ++jv, vp += v_stride)
+        a = vfmaq_n_f32(a, vld1q_f32(vp), scores[jv]);
+      vst1q_f32(out_row + d, a);
+    }
+    for (; d < head_dim; ++d) {
+      float a = 0.0f;
+      const float* vp = v_base + d;
+      for (int jv = 0; jv < seq_len; ++jv, vp += v_stride) a += scores[jv] * *vp;
+      out_row[d] = a;
     }
   }
 }

@@ -1,0 +1,11 @@
+{
+  "description": "Phase 10 T6: register-resident PV in NEON attention (AttentionVarlenBhNeon). Holds each 16-float output chunk's accumulators in registers across all keys, writes out_row once per chunk (was a per-key load-modify-store). Weights prescaled by inv_sum once. ESM_PROFILE attention-section, 650M uniform 8x256, M3 Pro.",
+  "hardware": "Apple M3 Pro",
+  "attention_section_ms": {
+    "t1_baseline_old_pv": "710-744 (avg ~727)",
+    "t6_register_resident_pv": "512-533 (avg ~522)",
+    "reduction": "~28% on the attention section (~27% of forward) -> ~7-8% e2e"
+  },
+  "correctness": "All 7 attention cross-checks green (AttentionVarlenNeon vs Ref across ESM head_dims 16/24/32/64 + large-score guard) at the unchanged 1e-4 tolerance; full ctest 125/125.",
+  "note": "PV memory ops cut ~3x (no per-key out_row load+store). Helps every ARM host and scales with sequence length. e2e total-wall is dominated by +-10% thermal variance (2520-2826ms across runs) so the profile section is the clean signal."
+}
