@@ -431,6 +431,23 @@ TEST(GeluNeon, MatchesRefOnDenseSweep) {
   }
 }
 
+TEST(GeluNeon, LargeMagnitudeStaysFiniteAndMatchesRef) {
+  // Guards the ExpNeon input clamp on the gelu path: ErfNeon computes
+  // ExpNeon(-x*x), so |x| > ~9.3 drives the argument below ExpNeon's -87 clamp.
+  // Without the clamp the 2^n exponent-bit path wraps to garbage — the same
+  // class of bug as the P9 attention NaN (which a timing-only bench hid). fc1
+  // outputs can be large, so gelu must stay finite and match the scalar ref.
+  std::vector<float> x = {-100.0f, -50.0f, -30.0f, -9.5f, -5.0f, 0.0f,
+                          5.0f,    9.5f,   30.0f,  50.0f,  100.0f};
+  std::vector<float> ref(x.size()), got(x.size());
+  esm::kernels::GeluRef(x.data(), ref.data(), x.size());
+  esm::kernels::GeluNeon(x.data(), got.data(), x.size());
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    EXPECT_TRUE(std::isfinite(got[i])) << "x=" << x[i] << " got=" << got[i];
+    EXPECT_NEAR(got[i], ref[i], 1e-4f * (1.0f + std::fabs(ref[i]))) << "x=" << x[i];
+  }
+}
+
 TEST(ResidualAddInplaceNeon, MatchesRefOnDenseSweep) {
   for (std::size_t n : {1u, 4u, 15u, 64u, 4097u}) {
     std::vector<float> y_ref(n), y_got(n), x(n);
