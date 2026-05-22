@@ -11,7 +11,6 @@ option(ESM_BUILD_TESTS "Build C++ tests" ON)
 option(ESM_BUILD_PYTHON "Build pybind11 Python module" OFF)
 option(ESM_BUILD_BENCH "Build Google Benchmark microbenchmarks" OFF)
 option(ESM_SANITIZERS "Enable ASan+UBSan on Debug" OFF)
-option(ESM_ARM_USE_ACCELERATE "Use Apple Accelerate for NEON FP32 GEMM (dev backend)" OFF)
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
@@ -101,12 +100,14 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
   target_link_libraries(esm_cpp_kernels_neon PRIVATE esm_warnings)
   target_compile_features(esm_cpp_kernels_neon PUBLIC cxx_std_20)
   # The default NEON FP32 path is the hand-written FMLA microkernel, so the
-  # engine runs on Linux ARM/Graviton where Accelerate does not exist. Opt in
-  # to Apple's Accelerate (AMX-backed) cblas_sgemm as a dev backend instead.
-  if(APPLE AND ESM_ARM_USE_ACCELERATE)
+  # engine runs on Linux ARM/Graviton where Accelerate does not exist. On
+  # Apple (where Accelerate is a system framework) we link it and compile the
+  # AMX path in; it is selected only at runtime via ESM_APPLE_AMX=on, so the
+  # default behaviour stays the portable hand-written kernel.
+  if(APPLE)
     target_link_libraries(esm_cpp_kernels_neon PUBLIC "-framework Accelerate")
     target_compile_definitions(esm_cpp_kernels_neon PRIVATE
-      ESM_ARM_USE_ACCELERATE ACCELERATE_NEW_LAPACK)
+      ESM_APPLE_AMX_AVAILABLE ACCELERATE_NEW_LAPACK)
   endif()
   list(APPEND ESM_KERNEL_OBJECT_LIBS esm_cpp_kernels_neon)
 

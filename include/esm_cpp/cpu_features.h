@@ -35,6 +35,14 @@ std::string_view IsaToString(Isa isa);
 // Parses the names emitted by IsaToString. Case-sensitive; nullopt otherwise.
 std::optional<Isa> StringToIsa(std::string_view s);
 
+// Whether to route FP32 GEMM through Apple's Accelerate (AMX coprocessor)
+// instead of the hand-written NEON FMLA kernel. Apple-only, opt-in via
+// ESM_APPLE_AMX=on (Accelerate is a closed lib with no scalar cross-check;
+// the hand-written NEON path stays the portable default and the only path on
+// Linux ARM / Graviton). Measured ~3.75-6.2x faster than NEON FMLA on M3.
+// Re-read on each call; returns false on non-Apple builds.
+bool ArmUseAppleAmx();
+
 // Whether the ARM i8mm (SMMLA) INT8 kernel should engage. SMMLA is opt-in:
 // it does not beat the SDOT kernel on Apple M3 (measured), so an auto-detected
 // NeonI8mm host uses SDOT by default. SMMLA engages only on an explicit request

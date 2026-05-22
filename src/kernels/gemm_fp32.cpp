@@ -7,8 +7,10 @@
 
 #include "esm_cpp/thread_pool.h"
 
-#ifdef ESM_ARM_USE_ACCELERATE
+#ifdef ESM_APPLE_AMX_AVAILABLE
 #include <Accelerate/Accelerate.h>
+
+#include "esm_cpp/cpu_features.h"
 #endif
 #endif
 
@@ -126,20 +128,25 @@ void ComputeRowsNeon(const float* A, const float* W, const float* bias,
 
 void LinearNeon(const float* A, const float* W, const float* bias, float* C,
                 int M, int N, int K) {
-#ifdef ESM_ARM_USE_ACCELERATE
-  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0f, A, K, W,
-              K, 0.0f, C, N);
-  if (bias) {
-    for (int m = 0; m < M; ++m) {
-      float* C_row = C + static_cast<long>(m) * N;
-      for (int n = 0; n < N; ++n) C_row[n] += bias[n];
-    }
-  }
-#else
   if (M <= 0 || N <= 0 || K <= 0) return;
-  // Parallelize across M-row-blocks. Grain of 4 keeps full 4-row microkernel
-  // blocks together per worker; the InGlobalPoolWorker guard prevents a
-  // nested parallel_for deadlock when called from inside a pool task.
+#ifdef ESM_APPLE_AMX_AVAILABLE
+  // Opt-in Apple AMX (Accelerate) FP32 GEMM — ~3.75-6.2x the hand-written
+  // NEON FMLA on M-series. Apple-only, off by default (ESM_APPLE_AMX=on).
+  if (esm::ArmUseAppleAmx()) {
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0f, A, K, W,
+                K, 0.0f, C, N);
+    if (bias) {
+      for (int m = 0; m < M; ++m) {
+        float* C_row = C + static_cast<long>(m) * N;
+        for (int n = 0; n < N; ++n) C_row[n] += bias[n];
+      }
+    }
+    return;
+  }
+#endif
+  // Default portable path. Parallelize across M-row-blocks; grain of 4 keeps
+  // full 4-row microkernel blocks together; the InGlobalPoolWorker guard
+  // prevents a nested parallel_for deadlock when called from inside a task.
   auto run = [&](int begin, int end) {
     ComputeRowsNeon(A, W, bias, C, N, K, begin, end);
   };
@@ -150,7 +157,6 @@ void LinearNeon(const float* A, const float* W, const float* bias, float* C,
   } else {
     run(0, M);
   }
-#endif
 }
 
 #endif  // ESM_KERNEL_NEON

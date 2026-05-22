@@ -311,6 +311,25 @@ TEST(GemmShapes, NeonDotProdInt8DispatchMatchesRef) {
   }
 }
 
+// Apple-AMX FP32 path (Accelerate, opt-in). Forces ESM_APPLE_AMX=on: on Apple
+// this routes FP32 Linear through cblas_sgemm and must match Ref within FMA
+// tolerance; on non-Apple the flag is ignored (hand-written path), still
+// matching Ref. Black-box backend, so this is the model-level parity guard.
+TEST(GemmShapes, AppleAmxFp32MatchesRef) {
+  const char* prev = std::getenv("ESM_APPLE_AMX");
+  std::string saved = prev ? prev : "";
+  ::setenv("ESM_APPLE_AMX", "on", 1);
+  for (const auto& s : EsmShapes()) {
+    RunShape("neon", s, /*with_bias=*/false, 1e-4f);
+    RunShape("neon", s, /*with_bias=*/true, 1e-4f);
+  }
+  if (prev) {
+    ::setenv("ESM_APPLE_AMX", saved.c_str(), 1);
+  } else {
+    ::unsetenv("ESM_APPLE_AMX");
+  }
+}
+
 namespace {
 bool HostHasI8mm() { return esm::HostIsa() == esm::Isa::NeonI8mm; }
 
