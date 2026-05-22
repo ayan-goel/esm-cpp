@@ -841,11 +841,49 @@ void AttentionVarlenBhNeon(const float* q, const float* k, const float* v,
   for (int i = 0; i < seq_len; ++i) {
     const long t_q = static_cast<long>(seq_start) + i;
     const float* qi = q + (t_q * num_heads + h) * head_dim;
-    float max_score = -std::numeric_limits<float>::infinity();
-    for (int j = 0; j < seq_len; ++j) {
-      const float* kj =
-          k + ((static_cast<long>(seq_start) + j) * num_heads + h) * head_dim;
-      const float dot = DotHdNeon(qi, kj, head_dim);
+    // Pass 1: scores[j] = qi . kj. Process 4 K-rows at a time with 4
+    // independent accumulators, reduced together via vpaddq into one 4-score
+    // vector (one reduction per 4 keys instead of a horizontal reduce per
+    // key), and track the row max in a vector. K-rows are num_heads*head_dim
+    // apart in the token-major layout.
+    const long k_stride = static_cast<long>(num_heads) * head_dim;
+    const float* k_base =
+        k + (static_cast<long>(seq_start) * num_heads + h) * head_dim;
+    float32x4_t vmax_acc = vdupq_n_f32(-std::numeric_limits<float>::infinity());
+    int j = 0;
+    for (; j + 4 <= seq_len; j += 4) {
+      const float* k0 = k_base + static_cast<long>(j) * k_stride;
+      const float* k1 = k0 + k_stride;
+      const float* k2 = k1 + k_stride;
+      const float* k3 = k2 + k_stride;
+      float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+      int d = 0;
+      for (; d + 4 <= head_dim; d += 4) {
+        const float32x4_t qd = vld1q_f32(qi + d);
+        a0 = vfmaq_f32(a0, qd, vld1q_f32(k0 + d));
+        a1 = vfmaq_f32(a1, qd, vld1q_f32(k1 + d));
+        a2 = vfmaq_f32(a2, qd, vld1q_f32(k2 + d));
+        a3 = vfmaq_f32(a3, qd, vld1q_f32(k3 + d));
+      }
+      float32x4_t s = vpaddq_f32(vpaddq_f32(a0, a1), vpaddq_f32(a2, a3));
+      if (d < head_dim) {
+        float t[4] = {0, 0, 0, 0};
+        for (int dd = d; dd < head_dim; ++dd) {
+          const float qd = qi[dd];
+          t[0] += qd * k0[dd];
+          t[1] += qd * k1[dd];
+          t[2] += qd * k2[dd];
+          t[3] += qd * k3[dd];
+        }
+        s = vaddq_f32(s, vld1q_f32(t));
+      }
+      vst1q_f32(scores + j, s);
+      vmax_acc = vmaxq_f32(vmax_acc, s);
+    }
+    float max_score = vmaxvq_f32(vmax_acc);
+    for (; j < seq_len; ++j) {
+      const float dot =
+          DotHdNeon(qi, k_base + static_cast<long>(j) * k_stride, head_dim);
       scores[j] = dot;
       if (dot > max_score) max_score = dot;
     }
@@ -870,11 +908,11 @@ void AttentionVarlenBhNeon(const float* q, const float* k, const float* v,
     int d = 0;
     for (; d + 4 <= head_dim; d += 4) vst1q_f32(out_row + d, vdupq_n_f32(0.0f));
     for (; d < head_dim; ++d) out_row[d] = 0.0f;
-    for (int j = 0; j < seq_len; ++j) {
-      const float w = scores[j] * inv_sum;
+    for (int jv = 0; jv < seq_len; ++jv) {
+      const float w = scores[jv] * inv_sum;
       if (w == 0.0f) continue;
       const float* vj =
-          v + ((static_cast<long>(seq_start) + j) * num_heads + h) * head_dim;
+          v + ((static_cast<long>(seq_start) + jv) * num_heads + h) * head_dim;
       d = 0;
       for (; d + 4 <= head_dim; d += 4) {
         vst1q_f32(out_row + d,
