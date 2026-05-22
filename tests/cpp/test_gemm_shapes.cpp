@@ -117,13 +117,16 @@ TEST(GemmShapes, RefDispatchMatchesRef) {
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 TEST(GemmShapes, NeonDispatchMatchesRefWithinFmaTolerance) {
-  for (const auto& s : EsmShapes()) {
-    // BLAS FMA reordering produces relative drift on the order of
-    // eps * sqrt(K) per element. 1e-4 comfortably covers K up to ~10^4
-    // with random [-1, 1] inputs and is still tighter than the Phase 0
-    // hidden-state envelope of rtol=1e-3.
-    RunShape("neon", s, /*with_bias=*/false, 1e-4f);
-    RunShape("neon", s, /*with_bias=*/true, 1e-4f);
+  // All three ARM tiers route FP32 Linear to the same NEON FMLA kernel.
+  for (const char* isa : {"neon", "neondotprod", "neoni8mm"}) {
+    for (const auto& s : EsmShapes()) {
+      // FMLA reordering produces relative drift on the order of
+      // eps * sqrt(K) per element. 1e-4 comfortably covers K up to ~10^4
+      // with random [-1, 1] inputs and is still tighter than the Phase 0
+      // hidden-state envelope of rtol=1e-3.
+      RunShape(isa, s, /*with_bias=*/false, 1e-4f);
+      RunShape(isa, s, /*with_bias=*/true, 1e-4f);
+    }
   }
 }
 #endif

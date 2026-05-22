@@ -11,6 +11,7 @@ option(ESM_BUILD_TESTS "Build C++ tests" ON)
 option(ESM_BUILD_PYTHON "Build pybind11 Python module" OFF)
 option(ESM_BUILD_BENCH "Build Google Benchmark microbenchmarks" OFF)
 option(ESM_SANITIZERS "Enable ASan+UBSan on Debug" OFF)
+option(ESM_ARM_USE_ACCELERATE "Use Apple Accelerate for NEON FP32 GEMM (dev backend)" OFF)
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
@@ -99,13 +100,13 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
   target_compile_definitions(esm_cpp_kernels_neon PRIVATE ESM_KERNEL_NEON)
   target_link_libraries(esm_cpp_kernels_neon PRIVATE esm_warnings)
   target_compile_features(esm_cpp_kernels_neon PUBLIC cxx_std_20)
-  if(APPLE)
-    # Dev-fallback: wrap Apple Accelerate for cblas_sgemm. NEON is not a
-    # supported ship target; see CLAUDE.md and tasks/plan.md.
+  # The default NEON FP32 path is the hand-written FMLA microkernel, so the
+  # engine runs on Linux ARM/Graviton where Accelerate does not exist. Opt in
+  # to Apple's Accelerate (AMX-backed) cblas_sgemm as a dev backend instead.
+  if(APPLE AND ESM_ARM_USE_ACCELERATE)
     target_link_libraries(esm_cpp_kernels_neon PUBLIC "-framework Accelerate")
-    # Opt in to the post-macOS-13.3 cblas interface so cblas_sgemm isn't
-    # flagged as deprecated. ILP64 isn't needed; our M, N, K are int32.
-    target_compile_definitions(esm_cpp_kernels_neon PRIVATE ACCELERATE_NEW_LAPACK)
+    target_compile_definitions(esm_cpp_kernels_neon PRIVATE
+      ESM_ARM_USE_ACCELERATE ACCELERATE_NEW_LAPACK)
   endif()
   list(APPEND ESM_KERNEL_OBJECT_LIBS esm_cpp_kernels_neon)
 endif()
