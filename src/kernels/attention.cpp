@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "esm_cpp/thread_pool.h"
+#include "simd_neon.h"
 #endif
 
 namespace esm::kernels {
@@ -848,10 +849,20 @@ void AttentionVarlenBhNeon(const float* q, const float* k, const float* v,
       scores[j] = dot;
       if (dot > max_score) max_score = dot;
     }
-    float sum = 0.0f;
-    for (int j = 0; j < seq_len; ++j) {
-      const float e = std::exp(scores[j] - max_score);
-      scores[j] = e;
+    // Vectorized softmax: exp(score - max) via the NEON polynomial exp, FP32
+    // accumulator. exp dominates the attention cost at scale.
+    const float32x4_t vmax = vdupq_n_f32(max_score);
+    float32x4_t vsum = vdupq_n_f32(0.0f);
+    int js = 0;
+    for (; js + 4 <= seq_len; js += 4) {
+      float32x4_t e = simd::ExpNeon(vsubq_f32(vld1q_f32(scores + js), vmax));
+      vst1q_f32(scores + js, e);
+      vsum = vaddq_f32(vsum, e);
+    }
+    float sum = vaddvq_f32(vsum);
+    for (; js < seq_len; ++js) {
+      const float e = std::exp(scores[js] - max_score);
+      scores[js] = e;
       sum += e;
     }
     const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
