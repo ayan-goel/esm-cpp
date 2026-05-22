@@ -1,0 +1,20 @@
+{
+  "description": "Phase 10 T8: SDOT Kernel4x16 K-tail branch hoist. Split the inner k-loop into a branchless K_main (K&~3, unconditional 4-byte activation load) + a zero-padded tail. Removed LoadA4's per-k call+branch+stack-fallback from the hot SDOT pipe. Apple M3 Pro.",
+  "hardware": "Apple M3 Pro",
+  "sdot_microbench_ms_before_after": {
+    "int8_qkv_d1280_L300": [2.74, 2.05],
+    "int8_fc1_d1280_L300": [3.61, 2.71],
+    "int8_fc2_d1280_L300": [3.42, 2.89],
+    "int8_qkv_d1280_BL4800": [29.5, 22.9],
+    "int8_fc1_d1280_BL4800": [39.6, 30.4],
+    "int8_fc2_d1280_BL4800": [39.6, 30.8],
+    "delta": "~15-24% faster across all d1280 SDOT shapes; stable across repeats (not thermal)"
+  },
+  "e2e_650m_uniform_8x256_p50_ms": {
+    "t1_baseline": 2826,
+    "t6_plus_t8_stacked": 2170,
+    "speedup_vs_hf": 1.79,
+    "note": "T6 (attention PV) + T8 (SDOT hoist) stacked. GEMM bucket per profile: fc1 595->497, fc2 589->509, qkv 452->392, out 149->131. vs HF eager 3879ms -> 1.79x (P9 was 1.30x). Both are certain, cross-checked, pure-NEON wins that also help Graviton/Linux ARM."
+  },
+  "correctness": "GemmShapes (incl NeonDotProd/NeonI8mm dispatch) + full ctest 125/125 green; INT8 tolerance rtol=1e-3 atol=1 unchanged."
+}

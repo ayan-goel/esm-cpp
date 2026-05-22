@@ -653,7 +653,23 @@ inline void Kernel4x16(const std::int8_t* a_s8, const std::int8_t* packed,
   int32x4_t acc[4][4];
   for (int r = 0; r < 4; ++r)
     for (int p = 0; p < 4; ++p) acc[r][p] = vdupq_n_s32(0);
-  for (int kb = 0; kb < K; kb += 4) {
+  // Hoist the K-tail branch out of the hot loop: K_main is a multiple of 4 so
+  // the activation 4-byte load is unconditional (all production K = d / 4d are
+  // multiples of 4, so the tail below never runs). Weight tiles are zero-padded
+  // past K (BuildArmCache), so the tail's LoadA4 zero-pad keeps it exact.
+  const int K_main = K & ~3;
+  int kb = 0;
+  for (; kb < K_main; kb += 4) {
+    int8x16_t wv[4];
+    for (int p = 0; p < 4; ++p) wv[p] = vld1q_s8(panel[p] + kb * 4);
+    for (int r = 0; r < 4; ++r) {
+      std::int32_t a4;
+      std::memcpy(&a4, a_row[r] + kb, 4);
+      const int8x16_t av = vreinterpretq_s8_s32(vdupq_n_s32(a4));
+      for (int p = 0; p < 4; ++p) acc[r][p] = vdotq_s32(acc[r][p], av, wv[p]);
+    }
+  }
+  if (kb < K) {
     int8x16_t wv[4];
     for (int p = 0; p < 4; ++p) wv[p] = vld1q_s8(panel[p] + kb * 4);
     for (int r = 0; r < 4; ++r) {
