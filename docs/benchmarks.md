@@ -56,40 +56,61 @@ HF eager FP32 on the 256-sequence OAS-distribution dataset
 
 | Variant | esm-cpp-int8 | hf-eager-fp32 | Speedup |
 |---|---:|---:|---:|
-| 650M / varlen | 37.8 s | 150.1 s | **3.97× HF** |
+| 650M / uniform 8×256 (post-Phase-10) | **2.17 s** | 3.88 s | **1.79× HF** |
+| 650M / uniform 8×256 (Phase-9) | 2.92 s | 3.80 s | 1.45× HF |
+| 650M / varlen (Phase-9) | 37.8 s | 150.1 s | **3.97× HF** |
 | 35M / varlen | 3.20 s | 9.46 s | **2.95× HF** |
 | 8M / varlen  | 1.02 s | 3.28 s | **3.21× HF** |
-| 650M / uniform 8×256 | 2.92 s | 3.80 s | 1.45× HF |
 | 35M / uniform 8×100 | 78.5 ms | 99.8 ms | 1.27× HF |
 | 8M / uniform 8×100  | 30.5 ms | 34.5 ms | 1.13× HF |
+
+Phase 10 re-benched 650M uniform after two pure-NEON kernel wins (below): **2.92 →
+2.17 s, 1.45× → 1.79× HF**. The varlen kernels (shared) improve identically but the
+~150 s HF varlen baseline was not re-run, so that row stays the Phase-9 measurement.
 
 Raw JSON: `benchmarks/results/dev_m3_pro_*_neon_*.json`. Reproduce with the
 same `esm-cpp-bench` commands below (any ESM-2 safetensors checkpoint;
 ISA is auto-detected). Notes:
 
-- **650M is GEMM-bound on M3.** The `ESM_PROFILE` breakdown is ~64% INT8 GEMM,
-  ~32% attention. The Phase-9 attention work (vectorized softmax exp +
-  multi-accumulator QKᵀ) cut the attention section ~25%, but the e2e is GEMM-
-  bound so the headline ratio is gated on the INT8 GEMM. The biggest remaining
-  M3 lever is Apple-AMX INT8 (BNNS), which projects ~2× over our SDOT but needs
-  the BNNSGraph API (not yet wired). The x86-parity ratio (≈4×/9×) is expected on
-  Graviton3, where HF uses generic BLAS and the SMMLA/i8mm tier engages.
-- **`ESM_APPLE_AMX=on`** (Apple-only, opt-in) routes FP32 GEMM through Accelerate's
-  AMX-backed cblas (~3.75–6.2× the NEON FMLA; 8M FP32 forward 94 → 66 ms).
-  Hand-written NEON stays the default and the only Linux-ARM path.
-- **Quality (650M):** INT8-vs-FP32 logit correlation 0.9997, masked-marginal
-  argmax agreement 0.994.
+- **650M is GEMM-bound on M3** (`ESM_PROFILE`: ~68% INT8 GEMM, ~27% attention, ~4%
+  glue). Phase 10 landed two pure-NEON wins on these buckets:
+  - **SDOT branch-hoist** — splitting the `Kernel4x16` k-loop into a branchless
+    `K_main` + a zero-padded tail removed a per-k call/branch/stack-fallback that was
+    bottlenecking the SDOT pipe: **~15–24% faster** per GEMM shape (helps M3 *and*
+    Graviton/Linux ARM).
+  - **Register-resident attention PV** — holding each 16-float output chunk's
+    accumulators in registers across all keys (vs a per-key load-modify-store of
+    `out_row`) cut the attention section **~28%** (~3× fewer PV memory ops).
 
+  Stacked: 650M uniform 8×256 **2826 → 2170 ms p50, 1.79× HF** (was 1.45×).
+- **Apple-AMX INT8 is a dead end; fp16 is the AMX lever (Phase 10 spike).** Via
+  CoreML/BNNS (the only non-deprecated AMX route) int8 W8A8 (14.0 ms) is *slower*
+  than fp16 (11.3 ms) at the fc1 650M shape M=2048 — BNNS dequantizes int8 to fp16
+  and runs a float kernel, so int8 adds only overhead (the deprecated `BNNSMatMul`
+  int8 also returns `rc=-1`). **fp16 on AMX is ~2× our SDOT**; the C++
+  `BNNSGraphCompileFromFile`+`Execute` path is proven at **10.4 ms** (bit-matches the
+  CoreML reference). It is reachable only via a compiled-graph (mlmodelc) pipeline —
+  no `cblas` half-precision GEMM exists — so a per-Linear fp16 mlmodelc + BNNSGraph
+  runtime under `ESM_APPLE_AMX`, with an fp16 PPPL/ProteinGym gate, is the scoped
+  fast-follow (foundation: `tools/spike_fp16_mlmodelc_gen.py`,
+  `tools/spike_bnns_graph_execute.cpp`).
+- **`ESM_APPLE_AMX=on`** (Apple-only, opt-in) routes FP32 GEMM through Accelerate's
+  AMX-backed cblas (~3.75–6.2× the NEON FMLA; 8M FP32 forward 94 → 66 ms; at 650M
+  e2e ≈ on par with INT8 SDOT). Hand-written NEON stays the default and the only
+  Linux-ARM path.
 - **SMMLA/i8mm is opt-in** (`ESM_NEON_I8MM=on`). On Apple M3 it does not
-  out-throughput SDOT (fc1 GEMM: 4.2 ms SMMLA vs 3.3 ms SDOT), so SDOT is
-  the default; SMMLA is expected to win on Graviton3-class i8mm units and
-  stays validated against the scalar reference.
-- **Quality:** INT8-vs-FP32 logit correlation 0.9999 with 100% masked-
-  marginal argmax agreement on M3 (`dev_m3_pro_int8_quality.json`). The
-  W8A8 recipe is unchanged from x86; the formal PPPL (<0.1) / ProteinGym
-  (<0.01) gates at 150M/650M use that same recipe.
-- 150M/650M ARM numbers and an AWS Graviton3 run are the remaining
-  measurements (those checkpoints were not cached in the dev environment).
+  out-throughput SDOT, so SDOT is the default; SMMLA is expected to win on
+  Graviton3-class i8mm units and stays validated against the scalar reference.
+- **Quality (650M, post-Phase-10):** INT8-vs-FP32 logit correlation **0.99956**,
+  masked-marginal argmax agreement **1.0**, no NaN
+  (`dev_m3_pro_650m_p10_t10_quality.json`) — the kernel wins preserve the unchanged
+  W8A8 recipe. The formal PPPL (<0.1) / ProteinGym (<0.01) gates at 150M/650M and an
+  AWS Graviton3 run remain the carry-forward (those checkpoints were not cached in
+  the dev environment).
+- **Threads:** the default (all logical cores, incl. M-series E-cores) measured
+  fastest for this GEMM-bound forward — the grain-based `parallel_for` load-balances
+  across heterogeneous P/E cores, so a P-core-only default regresses (12c 2826 ms <
+  6 P-only 3030 ms).
 
 ## Hardware
 

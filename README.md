@@ -35,12 +35,14 @@ esm.cpp also runs on AArch64 with a hand-written NEON kernel stack — FMLA FP32
 
 | Workload | esm-cpp-int8 | hf-eager-fp32 | Speedup |
 |---|---:|---:|---:|
-| Variable-length 256-seq (OAS-shape), 8M | **1.02 s** | 3.28 s | **3.21× HF** |
+| Variable-length 256-seq (OAS-shape), 650M | **37.8 s** | 150.1 s | **3.97× HF** |
 | Variable-length 256-seq (OAS-shape), 35M | **3.20 s** | 9.46 s | **2.95× HF** |
-| Uniform 8-seq × 100-tokens, 8M | 30.5 ms | 34.5 ms | 1.13× HF |
+| Variable-length 256-seq (OAS-shape), 8M | **1.02 s** | 3.28 s | **3.21× HF** |
+| Uniform 8-seq × 256-tokens, 650M | 2.17 s | 3.88 s | **1.79× HF** |
 | Uniform 8-seq × 100-tokens, 35M | 78.5 ms | 99.8 ms | 1.27× HF |
+| Uniform 8-seq × 100-tokens, 8M | 30.5 ms | 34.5 ms | 1.13× HF |
 
-The SMMLA/i8mm tier is opt-in (`ESM_NEON_I8MM=on`): on Apple M3 it does not out-throughput SDOT, but it is expected to win on Graviton3-class cores with stronger i8mm units. INT8 quality on ARM matches FP32 — 0.9999 logit correlation, 100% masked-marginal argmax agreement.
+The 650M uniform number reflects two Phase-10 pure-NEON kernel wins (a SDOT inner-loop branch-hoist, ~15–24% per GEMM; register-resident attention PV, ~28% off attention) — 1.45× → 1.79× HF. The SMMLA/i8mm tier is opt-in (`ESM_NEON_I8MM=on`): on Apple M3 it does not out-throughput SDOT, but it is expected to win on Graviton3-class cores with stronger i8mm units. On Apple, `ESM_APPLE_AMX=on` routes FP32 GEMM through Accelerate's AMX-backed BLAS (a measured fp16-via-BNNSGraph path is ~2× SDOT and is a scoped follow-up; int8-on-AMX gives no speedup — BNNS dequantizes to fp16). INT8 quality on ARM matches FP32 — 0.9996 logit correlation, 1.0 masked-marginal argmax agreement.
 
 ## Install
 
