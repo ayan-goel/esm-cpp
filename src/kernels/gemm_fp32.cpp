@@ -3,7 +3,13 @@
 #include <cstddef>
 
 #ifdef ESM_KERNEL_NEON
+#include <arm_neon.h>
+
+#include "esm_cpp/thread_pool.h"
+
+#ifdef ESM_ARM_USE_ACCELERATE
 #include <Accelerate/Accelerate.h>
+#endif
 #endif
 
 #ifdef ESM_KERNEL_AVX512
@@ -35,16 +41,92 @@ void LinearRef(const float* A, const float* W, const float* bias, float* C,
 
 #ifdef ESM_KERNEL_NEON
 
-// Dev fallback: wrap Apple Accelerate's cblas_sgemm. NEON is documented
-// as a dev-iteration backend only (CLAUDE.md); the canonical Phase 1
-// SIMD path is AVX-512+VNNI on x86. We're not staffing a hand-tuned
-// NEON microkernel here.
-//
-// Our Linear contract: C[m, n] = sum_k A[m, k] * W[n, k] + bias[n]
+// Hand-written NEON FMLA SGEMM. Linear contract:
+//   C[m, n] = sum_k A[m, k] * W[n, k] + bias[n]
 //   A: row-major [M, K], W: row-major [N, K] (PyTorch out_features x in_features).
-// In cblas terms that's C = A * W^T (NoTrans for A, Trans for W).
+// W rows are contiguous, so the computation is M·N independent length-K dot
+// products (C = A·Wᵀ). Apple Accelerate (which taps the AMX coprocessor) is
+// available behind ESM_ARM_USE_ACCELERATE as a dev backend, but the default
+// path is this microkernel so the engine also runs fast on Linux ARM/Graviton
+// where Accelerate does not exist.
+
+namespace {
+
+// 4-wide-accumulated dot product, used for the M/N tail rows/cols.
+inline float DotNeon(const float* a, const float* w, int K) {
+  float32x4_t acc = vdupq_n_f32(0.0f);
+  int k = 0;
+  for (; k + 4 <= K; k += 4) {
+    acc = vfmaq_f32(acc, vld1q_f32(a + k), vld1q_f32(w + k));
+  }
+  float s = vaddvq_f32(acc);
+  for (; k < K; ++k) s += a[k] * w[k];
+  return s;
+}
+
+// 4 rows × 4 cols register-blocked microkernel: 16 float32x4_t accumulators
+// hold the K-lane partial sums for C[m..m+3][n..n+3]; horizontally reduced at
+// the end. 16 acc + 8 load registers fit the 32 AArch64 vector registers.
+inline void Micro4x4(const float* A, const float* W, const float* bias,
+                     float* C, int N, int K, int m, int n) {
+  const float* a[4] = {A + static_cast<long>(m + 0) * K,
+                       A + static_cast<long>(m + 1) * K,
+                       A + static_cast<long>(m + 2) * K,
+                       A + static_cast<long>(m + 3) * K};
+  const float* w[4] = {W + static_cast<long>(n + 0) * K,
+                       W + static_cast<long>(n + 1) * K,
+                       W + static_cast<long>(n + 2) * K,
+                       W + static_cast<long>(n + 3) * K};
+  float32x4_t acc[4][4];
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j) acc[i][j] = vdupq_n_f32(0.0f);
+  int k = 0;
+  for (; k + 4 <= K; k += 4) {
+    float32x4_t av[4], wv[4];
+    for (int i = 0; i < 4; ++i) av[i] = vld1q_f32(a[i] + k);
+    for (int j = 0; j < 4; ++j) wv[j] = vld1q_f32(w[j] + k);
+    for (int i = 0; i < 4; ++i)
+      for (int j = 0; j < 4; ++j) acc[i][j] = vfmaq_f32(acc[i][j], av[i], wv[j]);
+  }
+  for (int i = 0; i < 4; ++i) {
+    for (int j = 0; j < 4; ++j) {
+      float s = vaddvq_f32(acc[i][j]);
+      for (int kk = k; kk < K; ++kk) s += a[i][kk] * w[j][kk];
+      C[static_cast<long>(m + i) * N + (n + j)] = s + (bias ? bias[n + j] : 0.0f);
+    }
+  }
+}
+
+// Compute output rows [m_begin, m_end). 4×4 blocks where they fit; scalar
+// (4-wide) dot products for the N-tail (N % 4) and the M-tail (< 4 rows).
+void ComputeRowsNeon(const float* A, const float* W, const float* bias,
+                     float* C, int N, int K, int m_begin, int m_end) {
+  int m = m_begin;
+  for (; m + 4 <= m_end; m += 4) {
+    int n = 0;
+    for (; n + 4 <= N; n += 4) Micro4x4(A, W, bias, C, N, K, m, n);
+    for (; n < N; ++n) {
+      for (int i = 0; i < 4; ++i) {
+        float s = DotNeon(A + static_cast<long>(m + i) * K,
+                          W + static_cast<long>(n) * K, K);
+        C[static_cast<long>(m + i) * N + n] = s + (bias ? bias[n] : 0.0f);
+      }
+    }
+  }
+  for (; m < m_end; ++m) {
+    for (int n = 0; n < N; ++n) {
+      float s = DotNeon(A + static_cast<long>(m) * K,
+                        W + static_cast<long>(n) * K, K);
+      C[static_cast<long>(m) * N + n] = s + (bias ? bias[n] : 0.0f);
+    }
+  }
+}
+
+}  // namespace
+
 void LinearNeon(const float* A, const float* W, const float* bias, float* C,
                 int M, int N, int K) {
+#ifdef ESM_ARM_USE_ACCELERATE
   cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0f, A, K, W,
               K, 0.0f, C, N);
   if (bias) {
@@ -53,6 +135,22 @@ void LinearNeon(const float* A, const float* W, const float* bias, float* C,
       for (int n = 0; n < N; ++n) C_row[n] += bias[n];
     }
   }
+#else
+  if (M <= 0 || N <= 0 || K <= 0) return;
+  // Parallelize across M-row-blocks. Grain of 4 keeps full 4-row microkernel
+  // blocks together per worker; the InGlobalPoolWorker guard prevents a
+  // nested parallel_for deadlock when called from inside a pool task.
+  auto run = [&](int begin, int end) {
+    ComputeRowsNeon(A, W, bias, C, N, K, begin, end);
+  };
+  constexpr long kParallelThreshold = 64L * 1024L;
+  if (M > 4 && !esm::InGlobalPoolWorker() &&
+      static_cast<long>(M) * N * K >= kParallelThreshold) {
+    esm::GlobalPool().parallel_for(0, M, /*grain=*/4, run);
+  } else {
+    run(0, M);
+  }
+#endif
 }
 
 #endif  // ESM_KERNEL_NEON

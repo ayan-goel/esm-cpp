@@ -117,6 +117,31 @@ TEST(Dispatch, AttentionFacadeMatchesRef) {
   ExpectAllClose(out_ref, out_facade, 0.0f);
 }
 
+// Every ISA tier the platform can be forced into must yield Ref-correct
+// output from the FP32 facades. On ARM this exercises the neon/neondotprod/
+// neoni8mm dispatch arms (which all share the FP32 NEON kernel); on x86 the
+// ARM tiers degrade to the Ref default. Guards against an ARM host tier
+// silently falling through to the wrong (or no) implementation.
+TEST(Dispatch, Fp32FacadesMatchRefAcrossArmTiers) {
+  const int M = 6, N = 8, K = 5;
+  auto A = RandomVec(M * K, 101);
+  auto W = RandomVec(N * K, 102);
+  auto bias = RandomVec(N, 103);
+  std::vector<float> c_ref(M * N);
+  {
+    ForceIsa ref_guard("ref");
+    esm::kernels::LinearRef(A.data(), W.data(), bias.data(), c_ref.data(), M, N,
+                            K);
+  }
+  for (const char* tier : {"neon", "neondotprod", "neoni8mm"}) {
+    ForceIsa guard(tier);
+    SCOPED_TRACE(tier);
+    std::vector<float> c(M * N);
+    esm::kernels::Linear(A.data(), W.data(), bias.data(), c.data(), M, N, K);
+    ExpectAllClose(c_ref, c, 1e-5f);
+  }
+}
+
 TEST(Dispatch, FacadeRespectsForceIsaRef) {
   ForceIsa guard("ref");
   EXPECT_EQ(esm::CurrentIsa(), esm::Isa::Ref);

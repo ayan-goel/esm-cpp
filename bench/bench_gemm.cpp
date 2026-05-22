@@ -25,6 +25,7 @@
 
 #include "esm_cpp/cpu_features.h"
 #include "esm_cpp/kernels.h"
+#include "esm_cpp/quant.h"
 
 namespace {
 
@@ -51,6 +52,30 @@ void BM_Linear(benchmark::State& state, Shape s) {
   for (auto _ : state) {
     esm::kernels::Linear(A.data(), W.data(), bias.data(), C.data(), s.M, s.N,
                          s.K);
+    benchmark::DoNotOptimize(C);
+  }
+  const double flops = 2.0 * static_cast<double>(Msz) *
+                       static_cast<double>(Nsz) * static_cast<double>(Ksz);
+  state.counters["GFLOPs"] = benchmark::Counter(
+      flops, benchmark::Counter::kIsIterationInvariantRate,
+      benchmark::Counter::OneK::kIs1000);
+  state.SetLabel(std::string("isa=") +
+                 std::string(esm::IsaToString(esm::CurrentIsa())));
+}
+
+void BM_LinearInt8(benchmark::State& state, Shape s) {
+  const auto Msz = static_cast<std::size_t>(s.M);
+  const auto Nsz = static_cast<std::size_t>(s.N);
+  const auto Ksz = static_cast<std::size_t>(s.K);
+  auto A = RandomVec(Msz * Ksz, 0x1234);
+  auto W = RandomVec(Nsz * Ksz, 0x5678);
+  auto bias = RandomVec(Nsz, 0x9abc);
+  esm::quant::QuantizedTensor qt;
+  esm::quant::Quantize(W.data(), s.N, s.K, &qt);
+  std::vector<float> C(Msz * Nsz);
+  for (auto _ : state) {
+    esm::kernels::LinearInt8(A.data(), qt, bias.data(), C.data(), s.M, s.N,
+                             s.K);
     benchmark::DoNotOptimize(C);
   }
   const double flops = 2.0 * static_cast<double>(Msz) *
@@ -94,6 +119,9 @@ struct RegisterShapes {
     };
     for (const auto& e : entries) {
       benchmark::RegisterBenchmark(e.label, BM_Linear, e.s)
+          ->Unit(benchmark::kMillisecond);
+      benchmark::RegisterBenchmark(std::string("int8_") + e.label,
+                                   BM_LinearInt8, e.s)
           ->Unit(benchmark::kMillisecond);
     }
   }

@@ -10,6 +10,12 @@
 #include "esm_cpp/thread_pool.h"
 #endif
 
+#ifdef ESM_KERNEL_NEON
+#include <arm_neon.h>
+
+#include "esm_cpp/thread_pool.h"
+#endif
+
 namespace esm::kernels {
 
 #ifdef ESM_KERNEL_REFERENCE
@@ -143,5 +149,73 @@ void LayerNormAvx512(const float* x, const float* gamma, const float* beta,
 }
 
 #endif  // ESM_KERNEL_AVX512
+
+#ifdef ESM_KERNEL_NEON
+
+// Three-pass NEON LayerNorm mirroring the AVX-512 path: 4 independent
+// float32x4 accumulators per pass keep partial-sum round-off well under the
+// 1e-5 cross-check tolerance for d up to 5120. Parallelized across rows.
+void LayerNormNeon(const float* x, const float* gamma, const float* beta,
+                   float eps, float* out, int num_rows, int d) {
+  const float inv_d = 1.0f / static_cast<float>(d);
+  auto compute_row = [&](int r) {
+    const float* xr = x + static_cast<long>(r) * d;
+    float* yr = out + static_cast<long>(r) * d;
+
+    float32x4_t s0 = vdupq_n_f32(0.0f), s1 = s0, s2 = s0, s3 = s0;
+    int i = 0;
+    for (; i + 16 <= d; i += 16) {
+      s0 = vaddq_f32(s0, vld1q_f32(xr + i));
+      s1 = vaddq_f32(s1, vld1q_f32(xr + i + 4));
+      s2 = vaddq_f32(s2, vld1q_f32(xr + i + 8));
+      s3 = vaddq_f32(s3, vld1q_f32(xr + i + 12));
+    }
+    float sum = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
+    for (; i < d; ++i) sum += xr[i];
+    const float mean = sum * inv_d;
+
+    const float32x4_t mv = vdupq_n_f32(mean);
+    float32x4_t v0 = vdupq_n_f32(0.0f), v1 = v0, v2 = v0, v3 = v0;
+    i = 0;
+    for (; i + 16 <= d; i += 16) {
+      float32x4_t d0 = vsubq_f32(vld1q_f32(xr + i), mv);
+      float32x4_t d1 = vsubq_f32(vld1q_f32(xr + i + 4), mv);
+      float32x4_t d2 = vsubq_f32(vld1q_f32(xr + i + 8), mv);
+      float32x4_t d3 = vsubq_f32(vld1q_f32(xr + i + 12), mv);
+      v0 = vfmaq_f32(v0, d0, d0);
+      v1 = vfmaq_f32(v1, d1, d1);
+      v2 = vfmaq_f32(v2, d2, d2);
+      v3 = vfmaq_f32(v3, d3, d3);
+    }
+    float var_sum =
+        vaddvq_f32(vaddq_f32(vaddq_f32(v0, v1), vaddq_f32(v2, v3)));
+    for (; i < d; ++i) {
+      const float diff = xr[i] - mean;
+      var_sum += diff * diff;
+    }
+    const float inv_std = 1.0f / std::sqrt(var_sum * inv_d + eps);
+
+    const float32x4_t iv = vdupq_n_f32(inv_std);
+    i = 0;
+    for (; i + 4 <= d; i += 4) {
+      float32x4_t normed = vmulq_f32(vsubq_f32(vld1q_f32(xr + i), mv), iv);
+      vst1q_f32(yr + i,
+                vfmaq_f32(vld1q_f32(beta + i), normed, vld1q_f32(gamma + i)));
+    }
+    for (; i < d; ++i) {
+      yr[i] = (xr[i] - mean) * inv_std * gamma[i] + beta[i];
+    }
+  };
+  if (num_rows > 1 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(
+        0, num_rows, /*grain=*/1, [&](int begin, int end) {
+          for (int r = begin; r < end; ++r) compute_row(r);
+        });
+  } else {
+    for (int r = 0; r < num_rows; ++r) compute_row(r);
+  }
+}
+
+#endif  // ESM_KERNEL_NEON
 
 }  // namespace esm::kernels

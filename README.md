@@ -27,6 +27,21 @@ ESM-2 at 8M, 35M, 150M, 650M, 3B. W8A8 INT8 with SmoothQuant ships for 150M and 
 
 The variable-length advantage comes from the `cu_seqlens` packed-batch forward: HuggingFace pads every sequence in a batch to `max(len)` and processes the resulting padded tensor uniformly; esm.cpp packs sequences back-to-back along the token axis and isolates per-sequence attention via `cu_seqlens`. On antibody-shaped data (mean ~120 residues, max ~250) that saves ~3× of HF's attention compute and ~2× of its FFN compute on top of the INT8/AMX baseline.
 
+### ARM (Apple Silicon / Linux ARM)
+
+esm.cpp also runs on AArch64 with a hand-written NEON kernel stack — FMLA FP32, SDOT INT8 (the VNNI analog), and an opt-in SMMLA/i8mm path (the AMX analog) — runtime-dispatched the same way as x86. No Apple Accelerate dependency in the default build, so it runs on Linux ARM / AWS Graviton too.
+
+**Apple M3 Pro, ESM-2, esm-cpp-int8 (NEON SDOT) vs HF eager FP32:**
+
+| Workload | esm-cpp-int8 | hf-eager-fp32 | Speedup |
+|---|---:|---:|---:|
+| Variable-length 256-seq (OAS-shape), 8M | **1.02 s** | 3.28 s | **3.21× HF** |
+| Variable-length 256-seq (OAS-shape), 35M | **3.20 s** | 9.46 s | **2.95× HF** |
+| Uniform 8-seq × 100-tokens, 8M | 30.5 ms | 34.5 ms | 1.13× HF |
+| Uniform 8-seq × 100-tokens, 35M | 78.5 ms | 99.8 ms | 1.27× HF |
+
+The SMMLA/i8mm tier is opt-in (`ESM_NEON_I8MM=on`): on Apple M3 it does not out-throughput SDOT, but it is expected to win on Graviton3-class cores with stronger i8mm units. INT8 quality on ARM matches FP32 — 0.9999 logit correlation, 100% masked-marginal argmax agreement.
+
 ## Install
 
 ```bash

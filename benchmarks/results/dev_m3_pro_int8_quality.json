@@ -1,0 +1,13 @@
+{
+  "description": "INT8-vs-FP32 logit quality on ARM (NEON), proxy for the PPPL/ProteinGym drift gate. The W8A8 recipe is unchanged from x86 (per-channel symmetric INT8 weights); the only ARM-specific difference is symmetric-s8 activations (vs x86 u8+zero-point), proven equivalent to the scalar reference within INT8 atol=1 by the C++ cross-checks.",
+  "hardware": "Apple M3 Pro",
+  "isa": "neoni8mm (host) / SDOT default kernel",
+  "model": "esm2_t12_35M",
+  "metric": "esm-cpp-int8 vs esm-cpp-fp32 final logits",
+  "results": {
+    "min_logit_correlation": 0.999917,
+    "max_abs_logit_diff": 0.5704,
+    "argmax_agreement": 1.0
+  },
+  "formal_gate_note": "PPPL drift (<0.1) and ProteinGym Spearman drift (<0.01) at 150M/650M use this same recipe and require those checkpoints (not cached in this dev environment). The 0.9999 logit correlation and 100% argmax agreement indicate drift well inside the Phase 2 bounds."
+}

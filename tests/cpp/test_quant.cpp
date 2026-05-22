@@ -50,6 +50,7 @@ TEST(QuantPack, RoundTripMaxAbsBoundedByPerChannelStep) {
   }
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
 TEST(QuantPack, BuildVnniCachePopulatesPackedAndColSum) {
   // After Quantize, packed_vnni + col_sum derived fields must be populated
   // so that LinearVnni can skip per-call PackWeight + col_sum recomputation.
@@ -102,6 +103,81 @@ TEST(QuantPack, BuildVnniCacheIdempotent) {
   EXPECT_EQ(qt.packed_vnni, packed_vnni_1);
   EXPECT_EQ(qt.col_sum, col_sum_1);
 }
+#endif  // x86_64
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+TEST(QuantPack, BuildArmCachePopulatesPackedArm) {
+  // After Quantize on ARM, packed_arm holds SDOT tiles: each 4-N panel has
+  // K_pad/4 tiles of 16 bytes laid out [n0:k0..k3, n1:.., n2:.., n3:..].
+  // N_pad rounds N up to 4, K_pad rounds K up to 4; tails are zero-padded.
+  const int N = 19, K = 37;  // N tail (% 4 != 0) and K tail (% 4 != 0)
+  auto W = RandomVec(N * K, 0xa401);
+  esm::quant::QuantizedTensor qt;
+  esm::quant::Quantize(W.data(), N, K, &qt);
+  // Build the SDOT cache explicitly: which cache Quantize builds by default
+  // depends on the host tier (NeonI8mm builds SMMLA instead). BuildArmCache
+  // is pure C++ and callable on any host.
+  esm::quant::BuildArmCache(&qt);
+  const int K_pad = (K + 3) & ~3;
+  const int N_pad = (N + 3) & ~3;
+  ASSERT_EQ(static_cast<int>(qt.packed_arm.size()), N_pad * K_pad);
+  EXPECT_TRUE(qt.packed_vnni.empty());  // x86 cache not built on ARM
+  for (int nb = 0; nb < N_pad; nb += 4) {
+    const std::int8_t* panel = qt.packed_arm.data() + nb * K_pad;
+    for (int kb = 0; kb < K_pad; kb += 4) {
+      const std::int8_t* tile = panel + kb * 4;
+      for (int nn = 0; nn < 4; ++nn) {
+        for (int kk = 0; kk < 4; ++kk) {
+          const bool real = (nb + nn < N) && (kb + kk < K);
+          const std::int8_t expect =
+              real ? qt.packed[(nb + nn) * K + (kb + kk)] : std::int8_t{0};
+          EXPECT_EQ(tile[nn * 4 + kk], expect)
+              << "nb=" << nb << " kb=" << kb << " nn=" << nn << " kk=" << kk;
+        }
+      }
+    }
+  }
+}
+
+TEST(QuantPack, BuildArmCacheIdempotent) {
+  const int N = 7, K = 13;
+  auto W = RandomVec(N * K, 0xa402);
+  esm::quant::QuantizedTensor qt;
+  esm::quant::Quantize(W.data(), N, K, &qt);
+  esm::quant::BuildArmCache(&qt);
+  auto packed_arm_1 = qt.packed_arm;
+  esm::quant::BuildArmCache(&qt);
+  EXPECT_EQ(qt.packed_arm, packed_arm_1);
+}
+
+TEST(QuantPack, BuildI8mmCachePopulatesPacked) {
+  // SMMLA tiles: each 2-col pair holds K_pad8/8 tiles of 16 bytes laid out
+  // [n0:k0..k7, n1:k0..k7]. N_pad2 rounds N up to 2, K_pad8 rounds K to 8.
+  const int N = 19, K = 37;  // N tail (% 2 != 0) and K tail (% 8 != 0)
+  auto W = RandomVec(N * K, 0xa403);
+  esm::quant::QuantizedTensor qt;
+  esm::quant::Quantize(W.data(), N, K, &qt);
+  esm::quant::BuildI8mmCache(&qt);  // pure C++, callable on any host
+  const int K_pad8 = (K + 7) & ~7;
+  const int N_pad2 = (N + 1) & ~1;
+  ASSERT_EQ(static_cast<int>(qt.packed_arm_i8mm.size()), N_pad2 * K_pad8);
+  for (int nb = 0; nb < N_pad2; nb += 2) {
+    const std::int8_t* pair = qt.packed_arm_i8mm.data() + nb * K_pad8;
+    for (int kb = 0; kb < K_pad8; kb += 8) {
+      const std::int8_t* tile = pair + kb * 2;
+      for (int nn = 0; nn < 2; ++nn) {
+        for (int kk = 0; kk < 8; ++kk) {
+          const bool real = (nb + nn < N) && (kb + kk < K);
+          const std::int8_t expect =
+              real ? qt.packed[(nb + nn) * K + (kb + kk)] : std::int8_t{0};
+          EXPECT_EQ(tile[nn * 8 + kk], expect)
+              << "nb=" << nb << " kb=" << kb << " nn=" << nn << " kk=" << kk;
+        }
+      }
+    }
+  }
+}
+#endif  // aarch64
 
 TEST(QuantPack, AllZeroRowGetsZeroScaleAndZeroPacked) {
   const int N = 2, K = 5;

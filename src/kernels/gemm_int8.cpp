@@ -19,6 +19,19 @@
 #include "esm_cpp/thread_pool.h"
 #endif
 
+#ifdef ESM_KERNEL_NEON
+#include <arm_neon.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+#include "esm_cpp/thread_pool.h"
+#endif
+
 namespace esm::kernels {
 
 #ifdef ESM_KERNEL_REFERENCE
@@ -542,5 +555,257 @@ void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
 }
 
 #endif  // ESM_KERNEL_AVX512
+
+#ifdef ESM_KERNEL_NEON
+
+// NEON SDOT W8A8 path. SDOT is signed x signed, so activations are quantized
+// to symmetric s8 ([-127, 127], no zero-point) and there is no col_sum
+// correction — the s32 accumulator is just rescaled by act_scale *
+// weight_scale[n] + bias at write-out. Forward decl for the symmetric ref
+// cross-check lives in quant.h.
+
+namespace {
+
+// Round-to-nearest-even, clamp to [-127, 127], narrow to s8. Input is 16
+// floats already multiplied by inv_scale.
+inline int8x16_t QuantizeRound16(float32x4_t s0, float32x4_t s1,
+                                 float32x4_t s2, float32x4_t s3) {
+  const int32x4_t lo = vdupq_n_s32(-127);
+  const int32x4_t hi = vdupq_n_s32(127);
+  int32x4_t q0 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(s0), lo), hi);
+  int32x4_t q1 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(s1), lo), hi);
+  int32x4_t q2 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(s2), lo), hi);
+  int32x4_t q3 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(s3), lo), hi);
+  int16x8_t q01 = vcombine_s16(vmovn_s32(q0), vmovn_s32(q1));
+  int16x8_t q23 = vcombine_s16(vmovn_s32(q2), vmovn_s32(q3));
+  return vcombine_s8(vmovn_s16(q01), vmovn_s16(q23));
+}
+
+float AbsmaxSerial(const float* A, std::size_t begin, std::size_t end) {
+  float32x4_t m0 = vdupq_n_f32(0.0f), m1 = m0, m2 = m0, m3 = m0;
+  std::size_t i = begin;
+  for (; i + 16 <= end; i += 16) {
+    m0 = vmaxq_f32(m0, vabsq_f32(vld1q_f32(A + i)));
+    m1 = vmaxq_f32(m1, vabsq_f32(vld1q_f32(A + i + 4)));
+    m2 = vmaxq_f32(m2, vabsq_f32(vld1q_f32(A + i + 8)));
+    m3 = vmaxq_f32(m3, vabsq_f32(vld1q_f32(A + i + 12)));
+  }
+  float local = vmaxvq_f32(vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3)));
+  for (; i < end; ++i) local = std::max(local, std::fabs(A[i]));
+  return local;
+}
+
+void QuantizeSerial(const float* A, std::size_t begin, std::size_t end,
+                    float inv_scale, std::int8_t* a_s8) {
+  std::size_t i = begin;
+  for (; i + 16 <= end; i += 16) {
+    const float32x4_t s = vdupq_n_f32(inv_scale);
+    int8x16_t q = QuantizeRound16(vmulq_f32(vld1q_f32(A + i), s),
+                                  vmulq_f32(vld1q_f32(A + i + 4), s),
+                                  vmulq_f32(vld1q_f32(A + i + 8), s),
+                                  vmulq_f32(vld1q_f32(A + i + 12), s));
+    vst1q_s8(a_s8 + i, q);
+  }
+  for (; i < end; ++i) {
+    float v = std::nearbyint(A[i] * inv_scale);
+    if (v > 127.0f) v = 127.0f;
+    if (v < -127.0f) v = -127.0f;
+    a_s8[i] = static_cast<std::int8_t>(static_cast<int>(v));
+  }
+}
+
+// Per-thread s8 activation staging buffer. Sized on demand, never shrunk;
+// keeps the forward loop allocation-free. Weight tiles live on the
+// QuantizedTensor (packed_arm); only the activation staging is per-call.
+thread_local std::vector<std::int8_t> g_a_s8;
+
+// Load 4 activation bytes a_row[kb..kb+3] as an int32, zero-padding the
+// K-tail. Weight tail bytes are already zero (BuildArmCache), so padded
+// activation lanes contribute nothing to the SDOT accumulation.
+inline std::int32_t LoadA4(const std::int8_t* a_row, int kb, int K) {
+  std::int32_t v;
+  if (kb + 4 <= K) {
+    std::memcpy(&v, a_row + kb, 4);
+  } else {
+    std::int8_t tmp[4] = {0, 0, 0, 0};
+    for (int kk = 0; kk < K - kb; ++kk) tmp[kk] = a_row[kb + kk];
+    std::memcpy(&v, tmp, 4);
+  }
+  return v;
+}
+
+// Hot path: 4 rows × 16 cols (4 SDOT panels). 16 int32x4 accumulators; each
+// k-step broadcasts 4 activation bytes per row and runs 16 vdotq_s32. Caller
+// guarantees m+4 <= M and n+16 <= N, so the finalize uses vector loads of
+// w_scale / bias safely.
+inline void Kernel4x16(const std::int8_t* a_s8, const std::int8_t* packed,
+                       const float* w_scale, const float* bias, float act_scale,
+                       int N, int K, int K_pad, float* C, int m, int n) {
+  const std::int8_t* panel[4] = {
+      packed + static_cast<long>(n + 0) * K_pad,
+      packed + static_cast<long>(n + 4) * K_pad,
+      packed + static_cast<long>(n + 8) * K_pad,
+      packed + static_cast<long>(n + 12) * K_pad};
+  const std::int8_t* a_row[4] = {a_s8 + static_cast<long>(m + 0) * K,
+                                 a_s8 + static_cast<long>(m + 1) * K,
+                                 a_s8 + static_cast<long>(m + 2) * K,
+                                 a_s8 + static_cast<long>(m + 3) * K};
+  int32x4_t acc[4][4];
+  for (int r = 0; r < 4; ++r)
+    for (int p = 0; p < 4; ++p) acc[r][p] = vdupq_n_s32(0);
+  for (int kb = 0; kb < K; kb += 4) {
+    int8x16_t wv[4];
+    for (int p = 0; p < 4; ++p) wv[p] = vld1q_s8(panel[p] + kb * 4);
+    for (int r = 0; r < 4; ++r) {
+      const int8x16_t av =
+          vreinterpretq_s8_s32(vdupq_n_s32(LoadA4(a_row[r], kb, K)));
+      for (int p = 0; p < 4; ++p) acc[r][p] = vdotq_s32(acc[r][p], av, wv[p]);
+    }
+  }
+  for (int r = 0; r < 4; ++r) {
+    for (int p = 0; p < 4; ++p) {
+      float32x4_t f = vcvtq_f32_s32(acc[r][p]);
+      float32x4_t comb = vmulq_n_f32(vld1q_f32(w_scale + n + 4 * p), act_scale);
+      float32x4_t out = vmulq_f32(f, comb);
+      if (bias) out = vaddq_f32(out, vld1q_f32(bias + n + 4 * p));
+      vst1q_f32(C + static_cast<long>(m + r) * N + n + 4 * p, out);
+    }
+  }
+}
+
+// Flexible mop-up: mr rows (1..4) × one panel of nc cols (1..4) at column n
+// (a multiple of 4). Handles the M-tail, the N-tail, and the partial last
+// panel (cols past N are zero in packed_arm; we just don't store them).
+inline void ComputeBlock(const std::int8_t* a_s8, const std::int8_t* packed,
+                         const float* w_scale, const float* bias,
+                         float act_scale, int N, int K, int K_pad, float* C,
+                         int m, int mr, int n, int nc) {
+  const std::int8_t* panel = packed + static_cast<long>(n) * K_pad;
+  int32x4_t acc[4];
+  for (int r = 0; r < mr; ++r) acc[r] = vdupq_n_s32(0);
+  for (int kb = 0; kb < K; kb += 4) {
+    const int8x16_t wv = vld1q_s8(panel + kb * 4);
+    for (int r = 0; r < mr; ++r) {
+      const int8x16_t av = vreinterpretq_s8_s32(
+          vdupq_n_s32(LoadA4(a_s8 + static_cast<long>(m + r) * K, kb, K)));
+      acc[r] = vdotq_s32(acc[r], av, wv);
+    }
+  }
+  for (int r = 0; r < mr; ++r) {
+    float lanes[4];
+    vst1q_f32(lanes, vmulq_n_f32(vcvtq_f32_s32(acc[r]), act_scale));
+    for (int j = 0; j < nc; ++j) {
+      C[static_cast<long>(m + r) * N + n + j] =
+          lanes[j] * w_scale[n + j] + (bias ? bias[n + j] : 0.0f);
+    }
+  }
+}
+
+void ComputeRowsNeonDot(const std::int8_t* a_s8, const std::int8_t* packed,
+                        const float* w_scale, const float* bias,
+                        float act_scale, int M, int N, int K, int K_pad,
+                        float* C, int m_begin, int m_end) {
+  (void)M;
+  int m = m_begin;
+  for (; m + 4 <= m_end; m += 4) {
+    int n = 0;
+    for (; n + 16 <= N; n += 16)
+      Kernel4x16(a_s8, packed, w_scale, bias, act_scale, N, K, K_pad, C, m, n);
+    for (; n < N; n += 4)
+      ComputeBlock(a_s8, packed, w_scale, bias, act_scale, N, K, K_pad, C, m, 4,
+                   n, std::min(4, N - n));
+  }
+  if (m < m_end) {
+    const int mr = m_end - m;
+    for (int n = 0; n < N; n += 4)
+      ComputeBlock(a_s8, packed, w_scale, bias, act_scale, N, K, K_pad, C, m, mr,
+                   n, std::min(4, N - n));
+  }
+}
+
+}  // namespace
+
+// Activation prefix: per-tensor symmetric s8. act_scale = max(|A|) / 127.
+// Parallelized over MK with the same threshold + nested-pool guard as the
+// AVX-512 prefix. Public (non-anonymous) so the unit test can cross-check it.
+void QuantizeActPrefixNeon(const float* A, std::size_t MK, std::int8_t* a_s8,
+                           float* act_scale_out) {
+  constexpr std::size_t kParallelThreshold = 64 * 1024;
+  if (MK < kParallelThreshold || esm::InGlobalPoolWorker()) {
+    const float a_max = AbsmaxSerial(A, 0, MK);
+    const float act_scale = (a_max > 0.0f) ? (a_max / 127.0f) : 1.0f;
+    *act_scale_out = act_scale;
+    QuantizeSerial(A, 0, MK, 1.0f / act_scale, a_s8);
+    return;
+  }
+
+  const int n_blocks = static_cast<int>((MK + 15) / 16);
+  std::atomic<std::uint32_t> shared_bits{0};
+  esm::GlobalPool().parallel_for(
+      0, n_blocks, /*grain=*/256, [&](int block_begin, int block_end) {
+        const std::size_t begin = static_cast<std::size_t>(block_begin) * 16;
+        const std::size_t end =
+            std::min(MK, static_cast<std::size_t>(block_end) * 16);
+        const float local = AbsmaxSerial(A, begin, end);
+        std::uint32_t local_bits;
+        std::memcpy(&local_bits, &local, sizeof(float));
+        std::uint32_t prev = shared_bits.load(std::memory_order_relaxed);
+        while (local_bits > prev &&
+               !shared_bits.compare_exchange_weak(
+                   prev, local_bits, std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {}
+      });
+  std::uint32_t a_max_bits = shared_bits.load(std::memory_order_relaxed);
+  float a_max;
+  std::memcpy(&a_max, &a_max_bits, sizeof(float));
+  const float act_scale = (a_max > 0.0f) ? (a_max / 127.0f) : 1.0f;
+  const float inv_scale = 1.0f / act_scale;
+  *act_scale_out = act_scale;
+
+  esm::GlobalPool().parallel_for(
+      0, n_blocks, /*grain=*/256, [&](int block_begin, int block_end) {
+        const std::size_t begin = static_cast<std::size_t>(block_begin) * 16;
+        const std::size_t end =
+            std::min(MK, static_cast<std::size_t>(block_end) * 16);
+        QuantizeSerial(A, begin, end, inv_scale, a_s8);
+      });
+}
+
+// NEON SDOT W8A8 GEMM. Quantizes A to symmetric s8, then runs the SDOT
+// microkernel against the pre-tiled packed_arm weights. Parallelized over
+// M-row-blocks (grain 4 keeps full 4-row microkernel blocks together); the
+// nested-pool guard mirrors LinearVnni.
+void LinearNeonDotProd(const float* A, const esm::quant::QuantizedTensor& W,
+                       const float* bias, float* C, int M, int N, int K) {
+  if (K <= 0 || M <= 0 || N <= 0) {
+    if (M > 0 && N > 0 && C) {
+      std::memset(C, 0,
+                  static_cast<std::size_t>(M) * static_cast<std::size_t>(N) *
+                      sizeof(float));
+    }
+    return;
+  }
+  const std::size_t MK =
+      static_cast<std::size_t>(M) * static_cast<std::size_t>(K);
+  if (g_a_s8.size() < MK) g_a_s8.resize(MK);
+  std::int8_t* a_s8 = g_a_s8.data();
+  float act_scale = 1.0f;
+  QuantizeActPrefixNeon(A, MK, a_s8, &act_scale);
+
+  const int K_pad = (K + 3) & ~3;
+  const std::int8_t* packed = W.packed_arm.data();
+  const float* w_scale = W.per_channel_scales.data();
+  auto run = [&](int begin, int end) {
+    ComputeRowsNeonDot(a_s8, packed, w_scale, bias, act_scale, M, N, K, K_pad, C,
+                       begin, end);
+  };
+  if (M > 4 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(0, M, /*grain=*/4, run);
+  } else {
+    run(0, M);
+  }
+}
+
+#endif  // ESM_KERNEL_NEON
 
 }  // namespace esm::kernels

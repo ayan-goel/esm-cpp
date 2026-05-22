@@ -38,8 +38,9 @@ class IsaEnvGuard {
 }  // namespace
 
 TEST(CpuFeatures, IsaToStringRoundTrip) {
-  for (auto isa : {esm::Isa::Ref, esm::Isa::Neon, esm::Isa::Avx2,
-                   esm::Isa::Avx512, esm::Isa::Avx512Vnni, esm::Isa::Amx}) {
+  for (auto isa : {esm::Isa::Ref, esm::Isa::Neon, esm::Isa::NeonDotProd,
+                   esm::Isa::NeonI8mm, esm::Isa::Avx2, esm::Isa::Avx512,
+                   esm::Isa::Avx512Vnni, esm::Isa::Amx}) {
     auto s = esm::IsaToString(isa);
     auto parsed = esm::StringToIsa(s);
     ASSERT_TRUE(parsed.has_value()) << "round trip failed for " << s;
@@ -50,10 +51,20 @@ TEST(CpuFeatures, IsaToStringRoundTrip) {
 TEST(CpuFeatures, IsaToStringStableNames) {
   EXPECT_EQ(esm::IsaToString(esm::Isa::Ref), "ref");
   EXPECT_EQ(esm::IsaToString(esm::Isa::Neon), "neon");
+  EXPECT_EQ(esm::IsaToString(esm::Isa::NeonDotProd), "neondotprod");
+  EXPECT_EQ(esm::IsaToString(esm::Isa::NeonI8mm), "neoni8mm");
   EXPECT_EQ(esm::IsaToString(esm::Isa::Avx2), "avx2");
   EXPECT_EQ(esm::IsaToString(esm::Isa::Avx512), "avx512");
   EXPECT_EQ(esm::IsaToString(esm::Isa::Avx512Vnni), "avx512vnni");
   EXPECT_EQ(esm::IsaToString(esm::Isa::Amx), "amx");
+}
+
+TEST(CpuFeatures, ForceIsaNeonTiersAcceptedRegardlessOfHost) {
+  IsaEnvGuard guard("ESM_FORCE_ISA");
+  guard.Set("neondotprod");
+  EXPECT_EQ(esm::CurrentIsa(), esm::Isa::NeonDotProd);
+  guard.Set("neoni8mm");
+  EXPECT_EQ(esm::CurrentIsa(), esm::Isa::NeonI8mm);
 }
 
 TEST(CpuFeatures, StringToIsaRejectsUnknown) {
@@ -67,7 +78,11 @@ TEST(CpuFeatures, StringToIsaRejectsUnknown) {
 TEST(CpuFeatures, HostIsaIsConsistentForBuildTarget) {
   auto host = esm::HostIsa();
 #if defined(__aarch64__) || defined(_M_ARM64)
-  EXPECT_EQ(host, esm::Isa::Neon);
+  // Detection picks the best ARM tier the host supports: Neon (FMLA only),
+  // NeonDotProd (FEAT_DotProd), or NeonI8mm (FEAT_I8MM). All are valid.
+  EXPECT_TRUE(host == esm::Isa::Neon || host == esm::Isa::NeonDotProd ||
+              host == esm::Isa::NeonI8mm)
+      << "unexpected ARM host ISA: " << esm::IsaToString(host);
 #elif defined(__x86_64__) || defined(_M_X64)
   EXPECT_NE(host, esm::Isa::Neon);
   EXPECT_GE(static_cast<int>(host), static_cast<int>(esm::Isa::Ref));

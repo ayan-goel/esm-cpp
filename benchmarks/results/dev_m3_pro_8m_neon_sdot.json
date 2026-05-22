@@ -1,0 +1,58 @@
+{
+  "config": {
+    "model": "facebook/esm2_t6_8M_UR50D",
+    "model_source": {
+      "kind": "safetensors",
+      "path": "/Users/ayangoel/.cache/huggingface/hub/models--facebook--esm2_t6_8M_UR50D/snapshots/c731040fcd8d73dceaa04b0a8e6329b345b0f5df/model.safetensors",
+      "hf_id": "facebook/esm2_t6_8M_UR50D"
+    },
+    "dataset": "synthetic(seed=0, batch=8, len=100)",
+    "num_sequences": 8,
+    "warmup": 2,
+    "iters": 5,
+    "modes": [
+      "esm-cpp-fp32",
+      "esm-cpp-int8",
+      "hf-eager-fp32"
+    ]
+  },
+  "hardware": {
+    "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "python": "3.14.4",
+    "esm_cpp_host_isa": "neoni8mm",
+    "esm_cpp_current_isa": "neoni8mm",
+    "esm_cpp_num_threads": 12,
+    "cpu_model": "Apple M3 Pro",
+    "cpu_threads": 12,
+    "ram_gb": 18.0
+  },
+  "results": {
+    "esm-cpp-fp32": {
+      "iters": 5,
+      "p50_ms": 128.1176246702671,
+      "p99_ms": 130.43026952072978,
+      "mean_ms": 128.07583343237638,
+      "throughput_seqs_per_s": 62.46299388107416,
+      "isa": "neoni8mm"
+    },
+    "esm-cpp-int8": {
+      "iters": 5,
+      "p50_ms": 116.1030838266015,
+      "p99_ms": 116.5118420124054,
+      "mean_ms": 115.93038346618414,
+      "throughput_seqs_per_s": 69.00693123587854,
+      "isa": "neoni8mm"
+    },
+    "hf-eager-fp32": {
+      "iters": 5,
+      "p50_ms": 30.368207953870296,
+      "p99_ms": 32.30154637247324,
+      "mean_ms": 30.346908420324326,
+      "throughput_seqs_per_s": 263.61828655475614,
+      "torch_intra_threads": 6
+    }
+  },
+  "speedup_fp32_vs_hf": 0.23694484437102953,
+  "speedup_int8_vs_hf": 0.261768377822853
+}

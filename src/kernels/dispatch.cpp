@@ -15,6 +15,21 @@ namespace esm::kernels {
 #if defined(__aarch64__) || defined(_M_ARM64)
 void LinearNeon(const float* A, const float* W, const float* bias, float* C,
                 int M, int N, int K);
+void LinearNeonDotProd(const float* A, const esm::quant::QuantizedTensor& W,
+                       const float* bias, float* C, int M, int N, int K);
+void LinearNeonI8mm(const float* A, const esm::quant::QuantizedTensor& W,
+                    const float* bias, float* C, int M, int N, int K);
+void GeluNeon(const float* x, float* out, std::size_t n);
+void LayerNormNeon(const float* x, const float* gamma, const float* beta,
+                   float eps, float* out, int num_rows, int d);
+void ResidualAddInplaceNeon(float* y, const float* x, std::size_t n);
+void ScaleInplaceNeon(float* x, std::size_t n, float scale);
+void RopeApplyVarlenNeon(float* x, const float* cos, const float* sin,
+                         const int* cu_seqlens, int batch_size, int num_heads,
+                         int head_dim);
+void AttentionVarlenNeon(const float* q, const float* k, const float* v,
+                         const int* cu_seqlens, int batch_size, int num_heads,
+                         int head_dim, float* out);
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -26,7 +41,11 @@ void Linear(const float* A, const float* W, const float* bias, float* C,
             int M, int N, int K) {
   switch (esm::CurrentIsa()) {
 #if defined(__aarch64__) || defined(_M_ARM64)
+    // All ARM tiers share the FP32 NEON kernel; the DotProd/i8mm tiers only
+    // change the INT8 path (LinearInt8), not FP32 GEMM.
     case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
       return LinearNeon(A, W, bias, C, M, N, K);
 #endif
 #if defined(__x86_64__) || defined(_M_X64)
@@ -69,6 +88,15 @@ void LinearInt8(const float* A, const esm::quant::QuantizedTensor& W,
     case Isa::Avx512Vnni:
       return LinearVnni(A, W, bias, C, M, N, K);
 #endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::NeonI8mm:
+      // SMMLA is opt-in (slower than SDOT on Apple M3); default to SDOT
+      // unless explicitly requested. See esm::ArmUseSmmla.
+      if (esm::ArmUseSmmla()) return LinearNeonI8mm(A, W, bias, C, M, N, K);
+      return LinearNeonDotProd(A, W, bias, C, M, N, K);
+    case Isa::NeonDotProd:
+      return LinearNeonDotProd(A, W, bias, C, M, N, K);
+#endif
     default:
       return LinearInt8Ref(A, W, bias, C, M, N, K);
   }
@@ -83,6 +111,12 @@ void LayerNorm(const float* x, const float* gamma, const float* beta,
     case Isa::Amx:
       return LayerNormAvx512(x, gamma, beta, eps, out, num_rows, d);
 #endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
+      return LayerNormNeon(x, gamma, beta, eps, out, num_rows, d);
+#endif
     default:
       return LayerNormRef(x, gamma, beta, eps, out, num_rows, d);
   }
@@ -95,6 +129,12 @@ void Gelu(const float* x, float* out, std::size_t n) {
     case Isa::Avx512Vnni:
     case Isa::Amx:
       return GeluAvx512(x, out, n);
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
+      return GeluNeon(x, out, n);
 #endif
     default:
       return GeluRef(x, out, n);
@@ -109,6 +149,12 @@ void ResidualAddInplace(float* y, const float* x, std::size_t n) {
     case Isa::Amx:
       return ResidualAddInplaceAvx512(y, x, n);
 #endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
+      return ResidualAddInplaceNeon(y, x, n);
+#endif
     default:
       return ResidualAddInplaceRef(y, x, n);
   }
@@ -121,6 +167,12 @@ void ScaleInplace(float* x, std::size_t n, float scale) {
     case Isa::Avx512Vnni:
     case Isa::Amx:
       return ScaleInplaceAvx512(x, n, scale);
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
+      return ScaleInplaceNeon(x, n, scale);
 #endif
     default:
       return ScaleInplaceRef(x, n, scale);
@@ -145,6 +197,13 @@ void RopeApplyVarlen(float* x, const float* cos, const float* sin,
     case Isa::Amx:
       return RopeApplyVarlenAvx512(x, cos, sin, cu_seqlens, batch_size,
                                     num_heads, head_dim);
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
+      return RopeApplyVarlenNeon(x, cos, sin, cu_seqlens, batch_size, num_heads,
+                                 head_dim);
 #endif
     default:
       return RopeApplyVarlenRef(x, cos, sin, cu_seqlens, batch_size,
@@ -176,6 +235,13 @@ inline void AttentionVarlenBody(const float* q, const float* k,
     case Isa::Amx:
       return AttentionVarlenAvx512(q, k, v, cu_seqlens, batch_size,
                                     num_heads, head_dim, out);
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
+      return AttentionVarlenNeon(q, k, v, cu_seqlens, batch_size, num_heads,
+                                 head_dim, out);
 #endif
     default:
       return AttentionVarlenRef(q, k, v, cu_seqlens, batch_size, num_heads,

@@ -12,6 +12,11 @@ enum class Isa : int {
   Avx512 = 3,
   Avx512Vnni = 4,
   Amx = 5,
+  // ARM INT8 tiers (v0.2). Appended to keep the x86 values stable.
+  // NeonDotProd: ARMv8.2 FEAT_DotProd (SDOT) — the VNNI analog.
+  // NeonI8mm:    ARMv8.6 FEAT_I8MM (SMMLA) — the AMX analog.
+  NeonDotProd = 6,
+  NeonI8mm = 7,
 };
 
 // Best ISA available on the current host, probed once via __builtin_cpu_supports
@@ -23,11 +28,20 @@ Isa HostIsa();
 // Unknown values are ignored (fall through to HostIsa()).
 Isa CurrentIsa();
 
-// Stable lowercase names: "ref", "neon", "avx2", "avx512", "avx512vnni", "amx".
+// Stable lowercase names: "ref", "neon", "neondotprod", "neoni8mm", "avx2",
+// "avx512", "avx512vnni", "amx".
 std::string_view IsaToString(Isa isa);
 
 // Parses the names emitted by IsaToString. Case-sensitive; nullopt otherwise.
 std::optional<Isa> StringToIsa(std::string_view s);
+
+// Whether the ARM i8mm (SMMLA) INT8 kernel should engage. SMMLA is opt-in:
+// it does not beat the SDOT kernel on Apple M3 (measured), so an auto-detected
+// NeonI8mm host uses SDOT by default. SMMLA engages only on an explicit request
+// — ESM_FORCE_ISA=neoni8mm or ESM_NEON_I8MM=on — and is expected to win on
+// hardware with stronger SMMLA throughput (e.g. AWS Graviton3). Re-read on
+// each call. Returns false on non-ARM builds.
+bool ArmUseSmmla();
 
 // Log "esm.cpp: ISA = <name>\n" to stderr at most once per process when
 // ESM_LOG_ISA=1. Intended to be called by Model::load; safe to call repeatedly.

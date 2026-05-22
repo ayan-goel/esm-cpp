@@ -10,6 +10,15 @@
 #include <cpuid.h>
 #endif
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
+#endif
+
 namespace esm {
 
 namespace {
@@ -28,6 +37,35 @@ bool HasAmxInt8() {
 }
 #endif
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+#if defined(__APPLE__)
+bool SysctlArmFeature(const char* name) {
+  int value = 0;
+  std::size_t size = sizeof(value);
+  if (sysctlbyname(name, &value, &size, nullptr, 0) != 0) return false;
+  return value != 0;
+}
+bool HasNeonDotProd() { return SysctlArmFeature("hw.optional.arm.FEAT_DotProd"); }
+bool HasNeonI8mm() { return SysctlArmFeature("hw.optional.arm.FEAT_I8MM"); }
+#elif defined(__linux__)
+// HWCAP bits are stable in the Linux ABI; define them if the toolchain's
+// <asm/hwcap.h> predates FEAT_DotProd / FEAT_I8MM.
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1u << 20)
+#endif
+#ifndef HWCAP2_I8MM
+#define HWCAP2_I8MM (1u << 13)
+#endif
+bool HasNeonDotProd() {
+  return (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+}
+bool HasNeonI8mm() { return (getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0; }
+#else
+bool HasNeonDotProd() { return false; }
+bool HasNeonI8mm() { return false; }
+#endif
+#endif  // aarch64
+
 Isa DetectHostIsa() {
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(__GNUC__) || defined(__clang__)
@@ -39,6 +77,9 @@ Isa DetectHostIsa() {
 #endif
   return Isa::Ref;
 #elif defined(__aarch64__) || defined(_M_ARM64)
+  // i8mm (ARMv8.6) implies dotprod (ARMv8.2), so probe the top tier first.
+  if (HasNeonI8mm()) return Isa::NeonI8mm;
+  if (HasNeonDotProd()) return Isa::NeonDotProd;
   return Isa::Neon;
 #else
   return Isa::Ref;
@@ -58,6 +99,10 @@ std::string_view IsaToString(Isa isa) {
       return "ref";
     case Isa::Neon:
       return "neon";
+    case Isa::NeonDotProd:
+      return "neondotprod";
+    case Isa::NeonI8mm:
+      return "neoni8mm";
     case Isa::Avx2:
       return "avx2";
     case Isa::Avx512:
@@ -73,6 +118,8 @@ std::string_view IsaToString(Isa isa) {
 std::optional<Isa> StringToIsa(std::string_view s) {
   if (s == "ref") return Isa::Ref;
   if (s == "neon") return Isa::Neon;
+  if (s == "neondotprod") return Isa::NeonDotProd;
+  if (s == "neoni8mm") return Isa::NeonI8mm;
   if (s == "avx2") return Isa::Avx2;
   if (s == "avx512") return Isa::Avx512;
   if (s == "avx512vnni") return Isa::Avx512Vnni;
@@ -85,6 +132,18 @@ Isa CurrentIsa() {
     if (auto parsed = StringToIsa(env)) return *parsed;
   }
   return HostIsa();
+}
+
+bool ArmUseSmmla() {
+  if (const char* f = std::getenv("ESM_FORCE_ISA");
+      f && std::string_view(f) == "neoni8mm") {
+    return true;
+  }
+  if (const char* e = std::getenv("ESM_NEON_I8MM");
+      e && std::string_view(e) == "on") {
+    return true;
+  }
+  return false;
 }
 
 void MaybeLogIsaOnce() {
