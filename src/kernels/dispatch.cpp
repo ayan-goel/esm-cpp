@@ -25,6 +25,9 @@ void ScaleInplaceNeon(float* x, std::size_t n, float scale);
 void RopeApplyVarlenNeon(float* x, const float* cos, const float* sin,
                          const int* cu_seqlens, int batch_size, int num_heads,
                          int head_dim);
+void AttentionVarlenNeon(const float* q, const float* k, const float* v,
+                         const int* cu_seqlens, int batch_size, int num_heads,
+                         int head_dim, float* out);
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -226,6 +229,13 @@ inline void AttentionVarlenBody(const float* q, const float* k,
     case Isa::Amx:
       return AttentionVarlenAvx512(q, k, v, cu_seqlens, batch_size,
                                     num_heads, head_dim, out);
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
+      return AttentionVarlenNeon(q, k, v, cu_seqlens, batch_size, num_heads,
+                                 head_dim, out);
 #endif
     default:
       return AttentionVarlenRef(q, k, v, cu_seqlens, batch_size, num_heads,

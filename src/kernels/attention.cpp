@@ -23,6 +23,14 @@
 #include "esm_cpp/thread_pool.h"
 #endif
 
+#ifdef ESM_KERNEL_NEON
+#include <arm_neon.h>
+
+#include <vector>
+
+#include "esm_cpp/thread_pool.h"
+#endif
+
 namespace esm::kernels {
 
 #ifdef ESM_KERNEL_REFERENCE
@@ -802,5 +810,96 @@ void AttentionVarlenAvx512(const float* q, const float* k, const float* v,
 }
 
 #endif  // ESM_KERNEL_AVX512
+
+#ifdef ESM_KERNEL_NEON
+
+namespace {
+
+// Per-worker softmax scratch; sized on demand, never shrunk.
+thread_local std::vector<float> g_scores_neon;
+
+inline float DotHdNeon(const float* a, const float* b, int hd) {
+  float32x4_t acc = vdupq_n_f32(0.0f);
+  int d = 0;
+  for (; d + 4 <= hd; d += 4)
+    acc = vfmaq_f32(acc, vld1q_f32(a + d), vld1q_f32(b + d));
+  float s = vaddvq_f32(acc);
+  for (; d < hd; ++d) s += a[d] * b[d];
+  return s;
+}
+
+// One (b, h) pair: per-query softmax over the sequence with an FP32
+// accumulator (mandatory — never FP16), then the V weighted sum. q/k/v and
+// out are token-major [T, num_heads, head_dim]; Q is pre-scaled by caller.
+void AttentionVarlenBhNeon(const float* q, const float* k, const float* v,
+                           int seq_start, int seq_len, int num_heads,
+                           int head_dim, int h, float* out) {
+  if (static_cast<int>(g_scores_neon.size()) < seq_len)
+    g_scores_neon.resize(static_cast<std::size_t>(seq_len));
+  float* scores = g_scores_neon.data();
+  for (int i = 0; i < seq_len; ++i) {
+    const long t_q = static_cast<long>(seq_start) + i;
+    const float* qi = q + (t_q * num_heads + h) * head_dim;
+    float max_score = -std::numeric_limits<float>::infinity();
+    for (int j = 0; j < seq_len; ++j) {
+      const float* kj =
+          k + ((static_cast<long>(seq_start) + j) * num_heads + h) * head_dim;
+      const float dot = DotHdNeon(qi, kj, head_dim);
+      scores[j] = dot;
+      if (dot > max_score) max_score = dot;
+    }
+    float sum = 0.0f;
+    for (int j = 0; j < seq_len; ++j) {
+      const float e = std::exp(scores[j] - max_score);
+      scores[j] = e;
+      sum += e;
+    }
+    const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    float* out_row = out + (t_q * num_heads + h) * head_dim;
+    int d = 0;
+    for (; d + 4 <= head_dim; d += 4) vst1q_f32(out_row + d, vdupq_n_f32(0.0f));
+    for (; d < head_dim; ++d) out_row[d] = 0.0f;
+    for (int j = 0; j < seq_len; ++j) {
+      const float w = scores[j] * inv_sum;
+      if (w == 0.0f) continue;
+      const float* vj =
+          v + ((static_cast<long>(seq_start) + j) * num_heads + h) * head_dim;
+      d = 0;
+      for (; d + 4 <= head_dim; d += 4) {
+        vst1q_f32(out_row + d,
+                  vfmaq_n_f32(vld1q_f32(out_row + d), vld1q_f32(vj + d), w));
+      }
+      for (; d < head_dim; ++d) out_row[d] += w * vj[d];
+    }
+  }
+}
+
+}  // namespace
+
+// NEON varlen attention. Self-parallelizes across (batch x num_heads), same
+// fan-out as the AVX-512 kernel; FP32 softmax accumulator throughout.
+void AttentionVarlenNeon(const float* q, const float* k, const float* v,
+                         const int* cu_seqlens, int batch_size, int num_heads,
+                         int head_dim, float* out) {
+  const int total_bh = batch_size * num_heads;
+  auto worker = [&](int bh_begin, int bh_end) {
+    for (int bh = bh_begin; bh < bh_end; ++bh) {
+      const int b = bh / num_heads;
+      const int h = bh % num_heads;
+      const int seq_start = cu_seqlens[b];
+      const int seq_len = cu_seqlens[b + 1] - seq_start;
+      if (seq_len <= 0) continue;
+      AttentionVarlenBhNeon(q, k, v, seq_start, seq_len, num_heads, head_dim, h,
+                            out);
+    }
+  };
+  if (total_bh > 1 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(0, total_bh, /*grain=*/1, worker);
+  } else {
+    worker(0, total_bh);
+  }
+}
+
+#endif  // ESM_KERNEL_NEON
 
 }  // namespace esm::kernels
