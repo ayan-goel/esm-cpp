@@ -26,7 +26,11 @@ void Linear(const float* A, const float* W, const float* bias, float* C,
             int M, int N, int K) {
   switch (esm::CurrentIsa()) {
 #if defined(__aarch64__) || defined(_M_ARM64)
+    // All ARM tiers share the FP32 NEON kernel; the DotProd/i8mm tiers only
+    // change the INT8 path (LinearInt8), not FP32 GEMM.
     case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
       return LinearNeon(A, W, bias, C, M, N, K);
 #endif
 #if defined(__x86_64__) || defined(_M_X64)
