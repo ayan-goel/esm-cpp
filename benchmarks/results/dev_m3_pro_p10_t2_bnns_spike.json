@@ -1,0 +1,29 @@
+{
+  "description": "Phase 10 T2 spike: does Apple-AMX INT8 (via CoreML/BNNS, the only non-deprecated AMX route) beat our SDOT? Decisive answer: NO. CoreML predict latency, CPU_ONLY (= BNNS -> AMX), fc1 650M shape M=2048 K=1280 N=5120, fresh random input per call (no prediction caching).",
+  "hardware": "Apple M3 Pro, macOS 26.3.1, coremltools 9.0 (py3.12)",
+  "shape": "fc1: M=2048, K=1280, N=5120",
+  "coreml_predict_p50_ms": {
+    "fp32_pinned": 20.61,
+    "fp16": 11.30,
+    "weight_only_int8": 10.88,
+    "w8a8_int8_act_and_weight": 13.95
+  },
+  "our_kernels_same_shape_est_ms": {
+    "sdot_int8": 25.6,
+    "cblas_amx_fp32": 20.6,
+    "note": "P9 amx_spike (M=512): SDOT 6.41, cblas-fp32 4.95; x4 for M=2048 -> ~25.6 / ~20.6, consistent with the fp32-pinned 20.61 measured here."
+  },
+  "findings": {
+    "amx_int8_verdict": "DEAD. W8A8 (13.95ms) is SLOWER than fp16 (11.30) and weight-only-int8 (10.88). BNNS dequantizes int8 to fp16 and runs a float kernel; activation int8 quant/dequant just adds overhead. There is no int8 matmul speedup on Apple AMX through any accessible path (deprecated BNNSMatMul int8 = rc=-1 in P9; BNNSGraph = CoreML-artifact runtime that dequantizes).",
+    "amx_fp16_finding": "fp16 (11.30ms) is ~1.8x our cblas-fp32 (20.6) and ~2.3x our SDOT (~25.6). CoreML downcasts to fp16 by default (fp32-pinned 20.61 vs fp16 11.30 confirms AMX-fp16 ~1.8x AMX-fp32). fp16 is the real AMX lever — NOT int8.",
+    "fp16_accessibility": "Accelerate exposes NO half-precision GEMM (cblas_{s,d,c,z}gemm only). The fp16 AMX win is reachable only via the heavy CoreML/BNNSGraph artifact pipeline (per-shape mlmodelc + BNNSGraphContextExecute) + fp16 numerical validation. No trivial cblas_hgemm shortcut.",
+    "implication": "The committed 'BNNSGraph AMX-INT8' headline cannot deliver — int8 gives zero AMX speedup. The only AMX speedup is fp16 (~2.3x vs SDOT), at the cost of the same heavy pipeline + fp16 quality risk. Escalated to the user; user chose to build the fp16 pipeline."
+  },
+  "direct_c_api_fp16_probes_ms_M2048": {
+    "cblas_sgemm_fp32": 19.6,
+    "BNNSMatMul_fp16": 17.3,
+    "BNNSFilterCreateLayerFullyConnected_fp16": "NULL (unsupported; fp32 FC create succeeds)",
+    "coreml_bnnsgraph_fp16": 11.3,
+    "conclusion": "The fast ~11ms fp16 AMX path is reachable ONLY via the CoreML->mlmodelc->BNNSGraph compiled-graph pipeline. Direct C calls don't reach it: BNNSMatMul fp16 works but doesn't pre-pack the weight (17.3ms, only 1.13x cblas); the classic FullyConnected filter (which WOULD pre-pack) returns NULL for fp16 (fp32-only). So weights must be graph constants in a compiled mlmodelc for BNNS to pre-pack into AMX layout. No direct-call shortcut. Remaining linchpin to prove: C++ BNNSGraphCompileFromFile + BNNSGraphContextExecute hits ~11ms."
+  }
+}
