@@ -38,8 +38,9 @@ class IsaEnvGuard {
 }  // namespace
 
 TEST(CpuFeatures, IsaToStringRoundTrip) {
-  for (auto isa : {esm::Isa::Ref, esm::Isa::Neon, esm::Isa::Avx2,
-                   esm::Isa::Avx512, esm::Isa::Avx512Vnni, esm::Isa::Amx}) {
+  for (auto isa : {esm::Isa::Ref, esm::Isa::Neon, esm::Isa::NeonDotProd,
+                   esm::Isa::NeonI8mm, esm::Isa::Avx2, esm::Isa::Avx512,
+                   esm::Isa::Avx512Vnni, esm::Isa::Amx}) {
     auto s = esm::IsaToString(isa);
     auto parsed = esm::StringToIsa(s);
     ASSERT_TRUE(parsed.has_value()) << "round trip failed for " << s;
@@ -50,10 +51,20 @@ TEST(CpuFeatures, IsaToStringRoundTrip) {
 TEST(CpuFeatures, IsaToStringStableNames) {
   EXPECT_EQ(esm::IsaToString(esm::Isa::Ref), "ref");
   EXPECT_EQ(esm::IsaToString(esm::Isa::Neon), "neon");
+  EXPECT_EQ(esm::IsaToString(esm::Isa::NeonDotProd), "neondotprod");
+  EXPECT_EQ(esm::IsaToString(esm::Isa::NeonI8mm), "neoni8mm");
   EXPECT_EQ(esm::IsaToString(esm::Isa::Avx2), "avx2");
   EXPECT_EQ(esm::IsaToString(esm::Isa::Avx512), "avx512");
   EXPECT_EQ(esm::IsaToString(esm::Isa::Avx512Vnni), "avx512vnni");
   EXPECT_EQ(esm::IsaToString(esm::Isa::Amx), "amx");
+}
+
+TEST(CpuFeatures, ForceIsaNeonTiersAcceptedRegardlessOfHost) {
+  IsaEnvGuard guard("ESM_FORCE_ISA");
+  guard.Set("neondotprod");
+  EXPECT_EQ(esm::CurrentIsa(), esm::Isa::NeonDotProd);
+  guard.Set("neoni8mm");
+  EXPECT_EQ(esm::CurrentIsa(), esm::Isa::NeonI8mm);
 }
 
 TEST(CpuFeatures, StringToIsaRejectsUnknown) {

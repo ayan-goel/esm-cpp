@@ -58,6 +58,10 @@ std::string_view IsaToString(Isa isa) {
       return "ref";
     case Isa::Neon:
       return "neon";
+    case Isa::NeonDotProd:
+      return "neondotprod";
+    case Isa::NeonI8mm:
+      return "neoni8mm";
     case Isa::Avx2:
       return "avx2";
     case Isa::Avx512:
@@ -73,6 +77,8 @@ std::string_view IsaToString(Isa isa) {
 std::optional<Isa> StringToIsa(std::string_view s) {
   if (s == "ref") return Isa::Ref;
   if (s == "neon") return Isa::Neon;
+  if (s == "neondotprod") return Isa::NeonDotProd;
+  if (s == "neoni8mm") return Isa::NeonI8mm;
   if (s == "avx2") return Isa::Avx2;
   if (s == "avx512") return Isa::Avx512;
   if (s == "avx512vnni") return Isa::Avx512Vnni;
