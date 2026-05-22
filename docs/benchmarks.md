@@ -42,6 +42,40 @@ skip):
 | 150M / uniform / default | 403 ms | 1071 ms | 2.66× HF |
 | 8M / uniform / default   | 22 ms | 24 ms | 1.13× HF |
 
+## ARM (Apple Silicon / Linux ARM) — v0.2
+
+The AArch64 kernel stack mirrors x86's three tiers — NEON FMLA (FP32),
+NEON SDOT (INT8, the VNNI analog), and an opt-in NEON SMMLA/i8mm path
+(the AMX analog) — runtime-dispatched via `sysctl`/`getauxval` feature
+detection. The default build links no Apple Accelerate, so the same
+binary runs on Linux ARM / AWS Graviton.
+
+Measured on **Apple M3 Pro** (12 threads), `esm-cpp-int8` (NEON SDOT) vs
+HF eager FP32 on the 256-sequence OAS-distribution dataset
+(`benchmarks/data/synthetic_varlen_v1.fasta`) and on uniform 8×100:
+
+| Variant | esm-cpp-int8 | hf-eager-fp32 | Speedup |
+|---|---:|---:|---:|
+| 35M / varlen | 3.20 s | 9.46 s | **2.95× HF** |
+| 8M / varlen  | 1.02 s | 3.28 s | **3.21× HF** |
+| 35M / uniform 8×100 | 78.5 ms | 99.8 ms | 1.27× HF |
+| 8M / uniform 8×100  | 30.5 ms | 34.5 ms | 1.13× HF |
+
+Raw JSON: `benchmarks/results/dev_m3_pro_*_neon_*.json`. Reproduce with the
+same `esm-cpp-bench` commands below (any ESM-2 safetensors checkpoint;
+ISA is auto-detected). Notes:
+
+- **SMMLA/i8mm is opt-in** (`ESM_NEON_I8MM=on`). On Apple M3 it does not
+  out-throughput SDOT (fc1 GEMM: 4.2 ms SMMLA vs 3.3 ms SDOT), so SDOT is
+  the default; SMMLA is expected to win on Graviton3-class i8mm units and
+  stays validated against the scalar reference.
+- **Quality:** INT8-vs-FP32 logit correlation 0.9999 with 100% masked-
+  marginal argmax agreement on M3 (`dev_m3_pro_int8_quality.json`). The
+  W8A8 recipe is unchanged from x86; the formal PPPL (<0.1) / ProteinGym
+  (<0.01) gates at 150M/650M use that same recipe.
+- 150M/650M ARM numbers and an AWS Graviton3 run are the remaining
+  measurements (those checkpoints were not cached in the dev environment).
+
 ## Hardware
 
 - **CPU:** Intel Xeon Platinum 8481C (Sapphire Rapids), 11 physical cores / 22 vCPUs at 2.7 GHz, AVX-512 + AVX-512-VNNI + AVX-512-BF16 + AMX-INT8.

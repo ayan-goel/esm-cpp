@@ -12,11 +12,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14]
+        os: [ubuntu-22.04, ubuntu-24.04-arm, macos-14]
         compiler: [gcc, clang]
         build_type: [Debug, Release]
         exclude:
           - os: macos-14
+            compiler: gcc
+          # Linux ARM (Graviton-class) job uses clang only — validates the
+          # getauxval feature-detection path + the no-Accelerate NEON build.
+          - os: ubuntu-24.04-arm
             compiler: gcc
     steps:
       - uses: actions/checkout@v4
@@ -56,11 +60,24 @@ jobs:
           ESM_LOG_ISA: "1"
         run: ctest --test-dir build --output-on-failure -R "Dispatch|CpuFeatures|LinearRef|LayerNormRef|GeluRef|RopeApply|AttentionRef"
       - name: Test (forced avx512 ISA, x86 only)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && runner.arch == 'X64'
         env:
           ESM_FORCE_ISA: avx512
           ESM_LOG_ISA: "1"
         run: ctest --test-dir build --output-on-failure -R "Dispatch|CpuFeatures"
+      - name: Test (forced neondotprod ISA, ARM only)
+        if: runner.arch == 'ARM64'
+        env:
+          ESM_FORCE_ISA: neondotprod
+          ESM_LOG_ISA: "1"
+        run: ctest --test-dir build --output-on-failure -R "Dispatch|CpuFeatures|GemmShapes"
+      - name: Test (forced neoni8mm ISA, ARM only)
+        if: runner.arch == 'ARM64'
+        env:
+          ESM_FORCE_ISA: neoni8mm
+          ESM_NEON_I8MM: "on"
+          ESM_LOG_ISA: "1"
+        run: ctest --test-dir build --output-on-failure -R "Dispatch|CpuFeatures|GemmShapes"
 
   python:
     name: Python ${{ matrix.os }}
