@@ -46,6 +46,42 @@ void BuildVnniCache(QuantizedTensor* out) {
   }
 }
 
+void BuildArmCache(QuantizedTensor* out) {
+  const int N = out->N;
+  const int K = out->K;
+  const int K_pad = (K + 3) & ~3;
+  const int N_pad = (N + 3) & ~3;
+  out->packed_arm.assign(static_cast<std::size_t>(N_pad) *
+                             static_cast<std::size_t>(K_pad),
+                         std::int8_t{0});
+  // Each 4-N panel holds K_pad/4 tiles of 16 bytes; panel stride is K_pad*4
+  // bytes = nb*K_pad from panel index nb/4. Tile t (k in [4t, 4t+4)) is
+  // [n0:k0..k3, n1:k0..k3, n2:.., n3:..]; broadcasting a[m][4t..4t+3] and
+  // vdotq against it produces 4 column dot-products in one int32x4.
+  for (int nb = 0; nb < N; nb += 4) {
+    const int n_block = std::min(4, N - nb);
+    std::int8_t* panel = out->packed_arm.data() + static_cast<long>(nb) * K_pad;
+    for (int kb = 0; kb < K; kb += 4) {
+      std::int8_t* tile = panel + static_cast<long>(kb) * 4;
+      const int k_step = std::min(4, K - kb);
+      for (int nn = 0; nn < n_block; ++nn) {
+        for (int kk = 0; kk < k_step; ++kk) {
+          tile[nn * 4 + kk] =
+              out->packed[static_cast<std::size_t>(nb + nn) * K + (kb + kk)];
+        }
+      }
+    }
+  }
+}
+
+void BuildKernelCache(QuantizedTensor* out) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  BuildArmCache(out);
+#else
+  BuildVnniCache(out);
+#endif
+}
+
 void QuantizeActivationRef(const float* x, std::size_t n, float scale,
                             std::uint8_t* q) {
   if (scale == 0.0f) {
@@ -103,7 +139,7 @@ void Quantize(const float* W_fp32, int N, int K, QuantizedTensor* out) {
           static_cast<std::int8_t>(q);
     }
   }
-  BuildVnniCache(out);
+  BuildKernelCache(out);
 }
 
 }  // namespace esm::quant

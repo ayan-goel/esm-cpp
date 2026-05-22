@@ -33,6 +33,17 @@ struct QuantizedTensor {
   //   col_sum[n]   = sum_k packed[n, k], int32, for zero-point correction.
   std::vector<std::int8_t> packed_vnni;
   std::vector<std::int32_t> col_sum;
+
+  // Derived data for the ARM NEON SDOT / i8mm paths. Populated by
+  // BuildArmCache. No col_sum: SDOT/SMMLA are signed x signed, so symmetric
+  // s8 activations need no zero-point correction.
+  //   packed_arm = `packed` repacked into 16-byte SDOT tiles. For each 4-N
+  //                panel and each 4-K tile, layout is [n0:k0,k1,k2,k3,
+  //                n1:k0..k3, n2:.., n3:..]. K_pad rounds K up to a multiple
+  //                of 4; N_pad rounds N up to a multiple of 4. Tail bytes are
+  //                zero. Built on ARM only (empty on x86, and vice versa for
+  //                packed_vnni).
+  std::vector<std::int8_t> packed_arm;
 };
 
 // Quantize an FP32 row-major [N, K] weight tensor into a per-channel
@@ -46,6 +57,17 @@ void Quantize(const float* W_fp32, int N, int K, QuantizedTensor* out);
 // from `out->packed` + `out->N` + `out->K`. Idempotent; called by Quantize
 // and by the GGUF loader after it materializes the int8 block.
 void BuildVnniCache(QuantizedTensor* out);
+
+// ARM analog of BuildVnniCache: populate `packed_arm` (SDOT-tiled) from
+// `out->packed`. Idempotent. Pure C++ (no intrinsics), so it is callable on
+// any host for tests, but at load/quantize time only the build target's cache
+// is populated (see BuildKernelCache).
+void BuildArmCache(QuantizedTensor* out);
+
+// Build the derived weight cache for the build target's kernel path: the VNNI
+// cache on x86, the ARM SDOT cache on AArch64. The other stays empty so no
+// per-arch dead allocation occurs at load time.
+void BuildKernelCache(QuantizedTensor* out);
 
 // Per-tensor symmetric activation quantizer (FP32 -> u8 with zero-point 128).
 //   q[i] = clamp(round(x[i] / scale), -127, 127) + 128
