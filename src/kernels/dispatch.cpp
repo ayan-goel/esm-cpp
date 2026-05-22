@@ -17,6 +17,14 @@ void LinearNeon(const float* A, const float* W, const float* bias, float* C,
                 int M, int N, int K);
 void LinearNeonDotProd(const float* A, const esm::quant::QuantizedTensor& W,
                        const float* bias, float* C, int M, int N, int K);
+void GeluNeon(const float* x, float* out, std::size_t n);
+void LayerNormNeon(const float* x, const float* gamma, const float* beta,
+                   float eps, float* out, int num_rows, int d);
+void ResidualAddInplaceNeon(float* y, const float* x, std::size_t n);
+void ScaleInplaceNeon(float* x, std::size_t n, float scale);
+void RopeApplyVarlenNeon(float* x, const float* cos, const float* sin,
+                         const int* cu_seqlens, int batch_size, int num_heads,
+                         int head_dim);
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -94,6 +102,12 @@ void LayerNorm(const float* x, const float* gamma, const float* beta,
     case Isa::Amx:
       return LayerNormAvx512(x, gamma, beta, eps, out, num_rows, d);
 #endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
+      return LayerNormNeon(x, gamma, beta, eps, out, num_rows, d);
+#endif
     default:
       return LayerNormRef(x, gamma, beta, eps, out, num_rows, d);
   }
@@ -106,6 +120,12 @@ void Gelu(const float* x, float* out, std::size_t n) {
     case Isa::Avx512Vnni:
     case Isa::Amx:
       return GeluAvx512(x, out, n);
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
+      return GeluNeon(x, out, n);
 #endif
     default:
       return GeluRef(x, out, n);
@@ -120,6 +140,12 @@ void ResidualAddInplace(float* y, const float* x, std::size_t n) {
     case Isa::Amx:
       return ResidualAddInplaceAvx512(y, x, n);
 #endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
+      return ResidualAddInplaceNeon(y, x, n);
+#endif
     default:
       return ResidualAddInplaceRef(y, x, n);
   }
@@ -132,6 +158,12 @@ void ScaleInplace(float* x, std::size_t n, float scale) {
     case Isa::Avx512Vnni:
     case Isa::Amx:
       return ScaleInplaceAvx512(x, n, scale);
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
+      return ScaleInplaceNeon(x, n, scale);
 #endif
     default:
       return ScaleInplaceRef(x, n, scale);
@@ -156,6 +188,13 @@ void RopeApplyVarlen(float* x, const float* cos, const float* sin,
     case Isa::Amx:
       return RopeApplyVarlenAvx512(x, cos, sin, cu_seqlens, batch_size,
                                     num_heads, head_dim);
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    case Isa::Neon:
+    case Isa::NeonDotProd:
+    case Isa::NeonI8mm:
+      return RopeApplyVarlenNeon(x, cos, sin, cu_seqlens, batch_size, num_heads,
+                                 head_dim);
 #endif
     default:
       return RopeApplyVarlenRef(x, cos, sin, cu_seqlens, batch_size,

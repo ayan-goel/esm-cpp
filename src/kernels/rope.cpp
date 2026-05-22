@@ -8,6 +8,12 @@
 #include "esm_cpp/thread_pool.h"
 #endif
 
+#ifdef ESM_KERNEL_NEON
+#include <arm_neon.h>
+
+#include "esm_cpp/thread_pool.h"
+#endif
+
 namespace esm::kernels {
 
 #ifdef ESM_KERNEL_REFERENCE
@@ -146,5 +152,60 @@ void RopeApplyVarlenAvx512(float* x, const float* cos, const float* sin,
 }
 
 #endif  // ESM_KERNEL_AVX512
+
+#ifdef ESM_KERNEL_NEON
+
+// Packed-varlen RoPE in [T, H, dh] layout. half-then-half (Llama/GPT-NeoX),
+// NOT interleaved (CLAUDE.md, esm/rotary_embedding.py):
+//   new_lo = x_lo * c - x_hi * s
+//   new_hi = x_hi * c + x_lo * s
+// vfmsq_f32(a, b, c) = a - b*c gives new_lo; vfmaq_f32(a, b, c) = a + b*c
+// gives new_hi. Parallelized across (batch x num_heads).
+void RopeApplyVarlenNeon(float* x, const float* cos, const float* sin,
+                         const int* cu_seqlens, int batch_size, int num_heads,
+                         int head_dim) {
+  const int half = head_dim / 2;
+
+  auto run_one_pos = [&](int t_global, int p, int h) {
+    const float* crow = cos + static_cast<long>(p) * head_dim;
+    const float* srow = sin + static_cast<long>(p) * head_dim;
+    float* xrow = x + (static_cast<long>(t_global) * num_heads + h) * head_dim;
+    int i = 0;
+    for (; i + 4 <= half; i += 4) {
+      float32x4_t x_lo = vld1q_f32(xrow + i);
+      float32x4_t x_hi = vld1q_f32(xrow + i + half);
+      float32x4_t c = vld1q_f32(crow + i);
+      float32x4_t s = vld1q_f32(srow + i);
+      float32x4_t new_lo = vfmsq_f32(vmulq_f32(x_lo, c), x_hi, s);
+      float32x4_t new_hi = vfmaq_f32(vmulq_f32(x_hi, c), x_lo, s);
+      vst1q_f32(xrow + i, new_lo);
+      vst1q_f32(xrow + i + half, new_hi);
+    }
+    for (; i < half; ++i) {
+      const float x1 = xrow[i];
+      const float x2 = xrow[i + half];
+      xrow[i] = x1 * crow[i] - x2 * srow[i];
+      xrow[i + half] = x2 * crow[i + half] + x1 * srow[i + half];
+    }
+  };
+
+  const int total_bh = batch_size * num_heads;
+  auto worker = [&](int bh_begin, int bh_end) {
+    for (int bh = bh_begin; bh < bh_end; ++bh) {
+      const int b = bh / num_heads;
+      const int h = bh % num_heads;
+      const int seq_start = cu_seqlens[b];
+      const int seq_len = cu_seqlens[b + 1] - seq_start;
+      for (int p = 0; p < seq_len; ++p) run_one_pos(seq_start + p, p, h);
+    }
+  };
+  if (total_bh > 1 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(0, total_bh, /*grain=*/1, worker);
+  } else {
+    worker(0, total_bh);
+  }
+}
+
+#endif  // ESM_KERNEL_NEON
 
 }  // namespace esm::kernels

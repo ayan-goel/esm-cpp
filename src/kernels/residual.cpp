@@ -8,6 +8,14 @@
 #include "esm_cpp/thread_pool.h"
 #endif
 
+#ifdef ESM_KERNEL_NEON
+#include <arm_neon.h>
+
+#include <algorithm>
+
+#include "esm_cpp/thread_pool.h"
+#endif
+
 namespace esm::kernels {
 
 #ifdef ESM_KERNEL_REFERENCE
@@ -123,5 +131,76 @@ void ScaleInplaceAvx512(float* x, std::size_t n, float scale) {
 }
 
 #endif  // ESM_KERNEL_AVX512
+
+#ifdef ESM_KERNEL_NEON
+
+namespace {
+
+constexpr std::size_t kElemsPerChunk = 4096;
+
+void ResidualAddChunk(float* y, const float* x, std::size_t start,
+                      std::size_t end) {
+  std::size_t i = start;
+  for (; i + 16 <= end; i += 16) {
+    vst1q_f32(y + i, vaddq_f32(vld1q_f32(y + i), vld1q_f32(x + i)));
+    vst1q_f32(y + i + 4, vaddq_f32(vld1q_f32(y + i + 4), vld1q_f32(x + i + 4)));
+    vst1q_f32(y + i + 8, vaddq_f32(vld1q_f32(y + i + 8), vld1q_f32(x + i + 8)));
+    vst1q_f32(y + i + 12,
+              vaddq_f32(vld1q_f32(y + i + 12), vld1q_f32(x + i + 12)));
+  }
+  for (; i + 4 <= end; i += 4)
+    vst1q_f32(y + i, vaddq_f32(vld1q_f32(y + i), vld1q_f32(x + i)));
+  for (; i < end; ++i) y[i] += x[i];
+}
+
+void ScaleChunk(float* x, std::size_t start, std::size_t end, float32x4_t s) {
+  std::size_t i = start;
+  for (; i + 16 <= end; i += 16) {
+    vst1q_f32(x + i, vmulq_f32(s, vld1q_f32(x + i)));
+    vst1q_f32(x + i + 4, vmulq_f32(s, vld1q_f32(x + i + 4)));
+    vst1q_f32(x + i + 8, vmulq_f32(s, vld1q_f32(x + i + 8)));
+    vst1q_f32(x + i + 12, vmulq_f32(s, vld1q_f32(x + i + 12)));
+  }
+  for (; i + 4 <= end; i += 4)
+    vst1q_f32(x + i, vmulq_f32(s, vld1q_f32(x + i)));
+  for (; i < end; ++i) x[i] *= vgetq_lane_f32(s, 0);
+}
+
+}  // namespace
+
+void ResidualAddInplaceNeon(float* y, const float* x, std::size_t n) {
+  const int total_chunks =
+      static_cast<int>((n + kElemsPerChunk - 1) / kElemsPerChunk);
+  if (total_chunks > 1 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(
+        0, total_chunks, /*grain=*/1, [&](int begin, int end) {
+          for (int c = begin; c < end; ++c) {
+            const std::size_t s = static_cast<std::size_t>(c) * kElemsPerChunk;
+            ResidualAddChunk(y, x, s, std::min(s + kElemsPerChunk, n));
+          }
+        });
+  } else {
+    ResidualAddChunk(y, x, 0, n);
+  }
+}
+
+void ScaleInplaceNeon(float* x, std::size_t n, float scale) {
+  const float32x4_t s = vdupq_n_f32(scale);
+  const int total_chunks =
+      static_cast<int>((n + kElemsPerChunk - 1) / kElemsPerChunk);
+  if (total_chunks > 1 && !esm::InGlobalPoolWorker()) {
+    esm::GlobalPool().parallel_for(
+        0, total_chunks, /*grain=*/1, [&](int begin, int end) {
+          for (int c = begin; c < end; ++c) {
+            const std::size_t off = static_cast<std::size_t>(c) * kElemsPerChunk;
+            ScaleChunk(x, off, std::min(off + kElemsPerChunk, n), s);
+          }
+        });
+  } else {
+    ScaleChunk(x, 0, n, s);
+  }
+}
+
+#endif  // ESM_KERNEL_NEON
 
 }  // namespace esm::kernels

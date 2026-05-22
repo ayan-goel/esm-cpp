@@ -378,3 +378,84 @@ TEST(AttentionRef, MaskZeroesOutAttention) {
   EXPECT_NEAR(out[0], 5.0f, 1e-5f);
   EXPECT_NEAR(out[1], 5.0f, 1e-5f);
 }
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+namespace esm::kernels {
+void LayerNormNeon(const float* x, const float* gamma, const float* beta,
+                   float eps, float* out, int num_rows, int d);
+void GeluNeon(const float* x, float* out, std::size_t n);
+void ResidualAddInplaceNeon(float* y, const float* x, std::size_t n);
+void ScaleInplaceNeon(float* x, std::size_t n, float scale);
+}  // namespace esm::kernels
+
+TEST(LayerNormNeon, MatchesRefAcrossEsmDims) {
+  for (int d : {17, 47, 320, 480, 640, 1280, 2560, 5120}) {
+    constexpr int kRows = 4;
+    std::vector<float> x(static_cast<std::size_t>(kRows) * d);
+    std::vector<float> gamma(d), beta(d);
+    for (int i = 0; i < d * kRows; ++i) {
+      x[static_cast<std::size_t>(i)] =
+          0.5f * std::sin(static_cast<float>(i) * 0.013f) +
+          0.2f * std::cos(static_cast<float>(i) * 0.007f);
+    }
+    for (int j = 0; j < d; ++j) {
+      gamma[static_cast<std::size_t>(j)] =
+          1.0f + 0.1f * std::sin(static_cast<float>(j) * 0.31f);
+      beta[static_cast<std::size_t>(j)] =
+          0.05f * std::cos(static_cast<float>(j) * 0.17f);
+    }
+    std::vector<float> ref(static_cast<std::size_t>(kRows) * d);
+    std::vector<float> got(static_cast<std::size_t>(kRows) * d);
+    esm::kernels::LayerNormRef(x.data(), gamma.data(), beta.data(), 1e-5f,
+                               ref.data(), kRows, d);
+    esm::kernels::LayerNormNeon(x.data(), gamma.data(), beta.data(), 1e-5f,
+                                got.data(), kRows, d);
+    for (int i = 0; i < kRows * d; ++i) {
+      EXPECT_NEAR(got[static_cast<std::size_t>(i)],
+                  ref[static_cast<std::size_t>(i)], 1e-5f)
+          << "d=" << d << " i=" << i;
+    }
+  }
+}
+
+TEST(GeluNeon, MatchesRefOnDenseSweep) {
+  constexpr int kN = 8195;  // odd so the scalar tail runs
+  std::vector<float> x(kN), ref(kN), got(kN);
+  for (int i = 0; i < kN; ++i) {
+    x[i] = -5.0f + 10.0f * (static_cast<float>(i) / static_cast<float>(kN - 1));
+  }
+  esm::kernels::GeluRef(x.data(), ref.data(), kN);
+  esm::kernels::GeluNeon(x.data(), got.data(), kN);
+  for (int i = 0; i < kN; ++i) {
+    EXPECT_NEAR(got[i], ref[i], 1e-5f) << "i=" << i << " x=" << x[i];
+  }
+}
+
+TEST(ResidualAddInplaceNeon, MatchesRefOnDenseSweep) {
+  for (std::size_t n : {1u, 4u, 15u, 64u, 4097u}) {
+    std::vector<float> y_ref(n), y_got(n), x(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      y_ref[i] = y_got[i] = std::sin(static_cast<float>(i) * 0.1f);
+      x[i] = std::cos(static_cast<float>(i) * 0.2f);
+    }
+    esm::kernels::ResidualAddInplaceRef(y_ref.data(), x.data(), n);
+    esm::kernels::ResidualAddInplaceNeon(y_got.data(), x.data(), n);
+    for (std::size_t i = 0; i < n; ++i)
+      EXPECT_NEAR(y_got[i], y_ref[i], 1e-6f) << "n=" << n << " i=" << i;
+  }
+}
+
+TEST(ScaleInplaceNeon, MatchesRefAcrossScalesAndSizes) {
+  for (std::size_t n : {1u, 7u, 16u, 4099u}) {
+    for (float scale : {0.0f, 0.88f, -2.5f}) {
+      std::vector<float> x_ref(n), x_got(n);
+      for (std::size_t i = 0; i < n; ++i)
+        x_ref[i] = x_got[i] = std::sin(static_cast<float>(i) * 0.05f);
+      esm::kernels::ScaleInplaceRef(x_ref.data(), n, scale);
+      esm::kernels::ScaleInplaceNeon(x_got.data(), n, scale);
+      for (std::size_t i = 0; i < n; ++i)
+        EXPECT_NEAR(x_got[i], x_ref[i], 1e-6f) << "n=" << n << " i=" << i;
+    }
+  }
+}
+#endif  // aarch64

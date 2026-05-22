@@ -377,3 +377,39 @@ TEST(AttentionVarlenAvx512, MatchesRefAcrossEsmHeadDims) {
   }
 }
 #endif  // x86_64
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+namespace esm::kernels {
+void RopeApplyVarlenNeon(float* x, const float* cos, const float* sin,
+                         const int* cu_seqlens, int batch_size, int num_heads,
+                         int head_dim);
+}  // namespace esm::kernels
+
+TEST(RopeApplyVarlenNeon, MatchesRefAcrossEsmHeadDims) {
+  // ESM head_dim values 16/24/32/64 plus odd dh (tail past the 4-wide loop).
+  struct Case { int H, dh, L1, L2; };
+  const Case cases[] = {
+      {2, 6, 5, 0},   {4, 16, 32, 0},  {4, 24, 9, 0},   {4, 32, 17, 0},
+      {20, 64, 33, 0}, {4, 16, 17, 23}, {20, 64, 128, 128}, {4, 18, 7, 0},
+  };
+  for (const auto& c : cases) {
+    const int T = c.L1 + c.L2;
+    const int max_seqlen = std::max(c.L1, c.L2 > 0 ? c.L2 : c.L1);
+    auto x_ref = RandomVec(static_cast<std::size_t>(T) * c.H * c.dh, 0xD1D2);
+    auto x_neon = x_ref;
+    std::vector<float> cos(static_cast<std::size_t>(max_seqlen) * c.dh);
+    std::vector<float> sin(static_cast<std::size_t>(max_seqlen) * c.dh);
+    esm::kernels::RopeBuildTables(max_seqlen, c.dh, cos.data(), sin.data());
+    std::vector<int> cu = c.L2 > 0 ? std::vector<int>{0, c.L1, T}
+                                   : std::vector<int>{0, c.L1};
+    const int batch_size = static_cast<int>(cu.size()) - 1;
+    esm::kernels::RopeApplyVarlenRef(x_ref.data(), cos.data(), sin.data(),
+                                     cu.data(), batch_size, c.H, c.dh);
+    esm::kernels::RopeApplyVarlenNeon(x_neon.data(), cos.data(), sin.data(),
+                                      cu.data(), batch_size, c.H, c.dh);
+    for (std::size_t i = 0; i < x_ref.size(); ++i)
+      EXPECT_NEAR(x_neon[i], x_ref[i], 1e-5f)
+          << "H=" << c.H << " dh=" << c.dh << " i=" << i;
+  }
+}
+#endif  // aarch64
