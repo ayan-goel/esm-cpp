@@ -1,0 +1,14 @@
+{
+  "description": "Phase 9 Task 1 spike: Apple AMX (Accelerate cblas_sgemm FP32) vs hand-written NEON FMLA (FP32) and SDOT (INT8) on the four critical 650M GEMM shapes, M=512, Apple M3 Pro.",
+  "ms": {
+    "qkv_3d_d": {"amx_fp32": 3.904, "neon_fp32": 23.128, "sdot_int8": 4.665},
+    "out_d_d":  {"amx_fp32": 1.355, "neon_fp32": 5.081,  "sdot_int8": 1.543},
+    "fc1_4d_d": {"amx_fp32": 4.949, "neon_fp32": 30.669, "sdot_int8": 6.413},
+    "fc2_d_4d": {"amx_fp32": 6.637, "neon_fp32": 29.698, "sdot_int8": 6.097}
+  },
+  "findings": {
+    "amx_fp32_vs_neon_fp32": "3.75x-6.2x faster",
+    "amx_fp32_vs_sdot_int8": "0.77x-1.09x (roughly on par)",
+    "implication": "AMX-INT8 (BNNS, ~2x AMX-FP32) projects to ~2x our SDOT -> Task 5.5 (opt-in Apple-AMX backend) is a GO for Mac. Our NEON FMLA FP32 has large headroom too."
+  }
+}
