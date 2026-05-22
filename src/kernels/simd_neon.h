@@ -13,6 +13,11 @@ namespace esm::kernels::simd {
 // 5-term series. Same form as the AVX-512 path; FP32-accurate to ~3e-7 over
 // the reduced range. Used by GELU's erf and by the attention softmax.
 inline float32x4_t ExpNeon(float32x4_t x) {
+  // Clamp to the representable range. Below ~-87 the 2^n exponent-bit path
+  // underflows (n + 127 < 0 wraps to a garbage/negative float); above ~88 it
+  // overflows. Softmax feeds large-negative inputs (score - max), so this is
+  // load-bearing — without it exp(-90) returns garbage, not ~0.
+  x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-87.0f)), vdupq_n_f32(88.0f));
   const float32x4_t log2e = vdupq_n_f32(1.44269504088896340736f);
   const float32x4_t ln2_hi = vdupq_n_f32(6.93145752e-1f);
   const float32x4_t ln2_lo = vdupq_n_f32(1.42860677e-6f);

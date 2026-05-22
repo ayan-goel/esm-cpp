@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -412,6 +413,7 @@ TEST(RopeApplyVarlenNeon, MatchesRefAcrossEsmHeadDims) {
           << "H=" << c.H << " dh=" << c.dh << " i=" << i;
   }
 }
+
 #endif  // aarch64
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -451,6 +453,38 @@ TEST(AttentionVarlenNeon, MatchesRefAcrossEsmHeadDims) {
       EXPECT_NEAR(out_neon[i], out_ref[i], 1e-4f * (1.0f + ref_mag))
           << "H=" << c.H << " dh=" << c.dh << " L1=" << c.L1 << " L2=" << c.L2
           << " i=" << i;
+    }
+  }
+}
+
+// Guard for the ExpNeon large-negative-input bug (Phase 9): real 650M
+// attention produces wide score spreads, so softmax feeds exp very negative
+// values (score - max). With UNSCALED Q/K the QK^T dots reach ~head_dim
+// magnitude; the non-max softmax inputs go to ~-head_dim, which the
+// pre-clamp ExpNeon mishandled (returned garbage -> NaN). This case (no
+// 1/sqrt(dh) prescale) exercises that regime and must stay finite + match Ref.
+TEST(AttentionVarlenNeon, LargeScoresStayFiniteAndMatchRef) {
+  struct Case { int H, dh, L1, L2; };
+  const Case cases[] = {{4, 64, 64, 0}, {20, 64, 200, 0}, {8, 32, 96, 40}};
+  for (const auto& c : cases) {
+    const int T = c.L1 + c.L2;
+    auto Q = RandomVec(static_cast<std::size_t>(T) * c.H * c.dh, 0xE1E2);
+    auto K = RandomVec(static_cast<std::size_t>(T) * c.H * c.dh, 0xE3E4);
+    auto V = RandomVec(static_cast<std::size_t>(T) * c.H * c.dh, 0xE5E6);
+    // No prescale: scores reach O(head_dim) so softmax inputs span O(-dh).
+    std::vector<int> cu = c.L2 > 0 ? std::vector<int>{0, c.L1, T}
+                                   : std::vector<int>{0, c.L1};
+    const int bs = static_cast<int>(cu.size()) - 1;
+    std::vector<float> out_ref(static_cast<std::size_t>(T) * c.H * c.dh);
+    std::vector<float> out_neon(static_cast<std::size_t>(T) * c.H * c.dh);
+    esm::kernels::AttentionVarlenRef(Q.data(), K.data(), V.data(), cu.data(), bs,
+                                     c.H, c.dh, out_ref.data());
+    esm::kernels::AttentionVarlenNeon(Q.data(), K.data(), V.data(), cu.data(),
+                                      bs, c.H, c.dh, out_neon.data());
+    for (std::size_t i = 0; i < out_neon.size(); ++i) {
+      ASSERT_TRUE(std::isfinite(out_neon[i])) << "non-finite at i=" << i;
+      EXPECT_NEAR(out_neon[i], out_ref[i], 1e-4f * (1.0f + std::fabs(out_ref[i])))
+          << "H=" << c.H << " dh=" << c.dh << " i=" << i;
     }
   }
 }
