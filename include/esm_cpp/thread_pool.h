@@ -18,7 +18,8 @@ namespace esm {
 // parallel_for fan-out / fan-in.
 //
 // One process-global pool initialized lazily at first Model::load; size
-// taken from ESM_NUM_THREADS (defaults to physical-core count if unset).
+// taken from ESM_NUM_THREADS (defaults to all logical cores via
+// std::thread::hardware_concurrency() if unset).
 class ThreadPool {
  public:
   explicit ThreadPool(std::size_t num_threads);
@@ -60,8 +61,12 @@ class ThreadPool {
 };
 
 // Process-global pool, lazily initialized at first call. Sized from
-// ESM_NUM_THREADS (default physical-core count) at first construction.
-// Subsequent env-var changes are not honored.
+// ESM_NUM_THREADS (default: all logical cores, hardware_concurrency) at first
+// construction. Subsequent env-var changes are not honored.
+// NOTE: on Apple Silicon, including the E-cores measured fastest for the
+// GEMM-bound forward — the grain-based parallel_for load-balances across
+// heterogeneous P/E cores, so a P-core-only default regresses (Phase 10 T1:
+// M3 Pro 650M uniform 12 cores 2826ms < 8 2919 < 6 P-only 3030).
 ThreadPool& GlobalPool();
 
 // True iff the current thread is a worker inside GlobalPool(). Use this
