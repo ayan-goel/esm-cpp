@@ -44,6 +44,15 @@ struct QuantizedTensor {
   //                zero. Built on ARM only (empty on x86, and vice versa for
   //                packed_vnni).
   std::vector<std::int8_t> packed_arm;
+
+  // Derived data for the ARM i8mm (SMMLA) path. Populated by BuildI8mmCache.
+  //   packed_arm_i8mm = `packed` repacked into 16-byte SMMLA tiles. For each
+  //                     2-N (column) pair and each 8-K block, layout is
+  //                     [n0:k0..k7, n1:k0..k7] — the 2x8 right-hand operand
+  //                     of vmmlaq_s32. K_pad8 rounds K up to a multiple of 8;
+  //                     N_pad2 rounds N up to 2. Built only when the host tier
+  //                     is NeonI8mm.
+  std::vector<std::int8_t> packed_arm_i8mm;
 };
 
 // Quantize an FP32 row-major [N, K] weight tensor into a per-channel
@@ -64,9 +73,14 @@ void BuildVnniCache(QuantizedTensor* out);
 // is populated (see BuildKernelCache).
 void BuildArmCache(QuantizedTensor* out);
 
-// Build the derived weight cache for the build target's kernel path: the VNNI
-// cache on x86, the ARM SDOT cache on AArch64. The other stays empty so no
-// per-arch dead allocation occurs at load time.
+// ARM i8mm analog: populate `packed_arm_i8mm` (SMMLA-tiled) from `out->packed`.
+// Idempotent, pure C++.
+void BuildI8mmCache(QuantizedTensor* out);
+
+// Build the derived weight cache for the current kernel path, keyed on
+// esm::CurrentIsa(): VNNI on x86, SMMLA on a NeonI8mm host, SDOT on the other
+// ARM tiers. Only the selected cache is allocated, so there is no per-arch
+// dead allocation at load time.
 void BuildKernelCache(QuantizedTensor* out);
 
 // Per-tensor symmetric activation quantizer (FP32 -> u8 with zero-point 128).

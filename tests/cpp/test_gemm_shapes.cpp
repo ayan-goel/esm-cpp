@@ -310,4 +310,39 @@ TEST(GemmShapes, NeonDotProdInt8DispatchMatchesRef) {
     RunNeonInt8Shape(s, /*with_bias=*/true);
   }
 }
+
+namespace {
+bool HostHasI8mm() { return esm::HostIsa() == esm::Isa::NeonI8mm; }
+
+void RunNeonI8mmShape(const Shape& s, bool with_bias) {
+  ForceIsa guard("neoni8mm");
+  const std::size_t Msz = static_cast<std::size_t>(s.M);
+  const std::size_t Nsz = static_cast<std::size_t>(s.N);
+  const std::size_t Ksz = static_cast<std::size_t>(s.K);
+  auto A = RandomVec(Msz * Ksz, 0x2468);
+  auto W = RandomVec(Nsz * Ksz, 0x1357);
+  auto bias = with_bias ? RandomVec(Nsz, 0xACE1) : std::vector<float>{};
+  const float* bias_ptr = with_bias ? bias.data() : nullptr;
+  esm::quant::QuantizedTensor qt;
+  esm::quant::Quantize(W.data(), s.N, s.K, &qt);  // builds SMMLA cache (forced)
+  std::vector<float> ref(Msz * Nsz);
+  std::vector<float> got(Msz * Nsz);
+  esm::kernels::LinearInt8Ref(A.data(), qt, bias_ptr, ref.data(), s.M, s.N, s.K);
+  esm::kernels::LinearInt8(A.data(), qt, bias_ptr, got.data(), s.M, s.N, s.K);
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float diff = std::fabs(ref[i] - got[i]);
+    ASSERT_LE(diff, 1.0f + 1e-3f * std::fabs(ref[i]))
+        << "shape=[" << s.M << "," << s.N << "," << s.K << "] bias=" << with_bias
+        << " i=" << i << " ref=" << ref[i] << " got=" << got[i];
+  }
+}
+}  // namespace
+
+TEST(GemmShapes, NeonI8mmInt8DispatchMatchesRef) {
+  if (!HostHasI8mm()) GTEST_SKIP() << "host lacks FEAT_I8MM";
+  for (const auto& s : NeonInt8Shapes()) {
+    RunNeonI8mmShape(s, /*with_bias=*/false);
+    RunNeonI8mmShape(s, /*with_bias=*/true);
+  }
+}
 #endif  // aarch64

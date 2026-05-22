@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "esm_cpp/cpu_features.h"
+
 namespace esm::quant {
 
 void BuildVnniCache(QuantizedTensor* out) {
@@ -74,9 +76,41 @@ void BuildArmCache(QuantizedTensor* out) {
   }
 }
 
+void BuildI8mmCache(QuantizedTensor* out) {
+  const int N = out->N;
+  const int K = out->K;
+  const int K_pad8 = (K + 7) & ~7;
+  const int N_pad2 = (N + 1) & ~1;
+  out->packed_arm_i8mm.assign(static_cast<std::size_t>(N_pad2) *
+                                  static_cast<std::size_t>(K_pad8),
+                              std::int8_t{0});
+  // Each 2-column pair holds K_pad8/8 tiles of 16 bytes; the col-pair index
+  // nb/2 sits at byte offset nb*K_pad8. Tile t (k in [8t, 8t+8)) is
+  // [n0:k0..k7, n1:k0..k7] — the 2x8 SMMLA right-hand operand.
+  for (int nb = 0; nb < N; nb += 2) {
+    const int n_block = std::min(2, N - nb);
+    std::int8_t* pair =
+        out->packed_arm_i8mm.data() + static_cast<long>(nb) * K_pad8;
+    for (int kb = 0; kb < K; kb += 8) {
+      std::int8_t* tile = pair + static_cast<long>(kb) * 2;
+      const int k_step = std::min(8, K - kb);
+      for (int nn = 0; nn < n_block; ++nn) {
+        for (int kk = 0; kk < k_step; ++kk) {
+          tile[nn * 8 + kk] =
+              out->packed[static_cast<std::size_t>(nb + nn) * K + (kb + kk)];
+        }
+      }
+    }
+  }
+}
+
 void BuildKernelCache(QuantizedTensor* out) {
 #if defined(__aarch64__) || defined(_M_ARM64)
-  BuildArmCache(out);
+  if (esm::CurrentIsa() == esm::Isa::NeonI8mm) {
+    BuildI8mmCache(out);
+  } else {
+    BuildArmCache(out);
+  }
 #else
   BuildVnniCache(out);
 #endif

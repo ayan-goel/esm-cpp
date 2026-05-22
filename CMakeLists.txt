@@ -109,6 +109,19 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
       ESM_ARM_USE_ACCELERATE ACCELERATE_NEW_LAPACK)
   endif()
   list(APPEND ESM_KERNEL_OBJECT_LIBS esm_cpp_kernels_neon)
+
+  # i8mm (SMMLA) path in its own TU compiled with +i8mm — the ARMv8.6 SMMLA
+  # intrinsic must not leak into the ARMv8.0 baseline NEON TU. Runtime-gated
+  # inside dispatch (NeonI8mm host only), so the OBJECT lib is always built
+  # but its instructions only execute on a FEAT_I8MM host.
+  add_library(esm_cpp_kernels_i8mm OBJECT src/kernels/gemm_i8mm.cpp)
+  target_include_directories(esm_cpp_kernels_i8mm PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+  target_compile_definitions(esm_cpp_kernels_i8mm PRIVATE ESM_KERNEL_I8MM)
+  target_compile_options(esm_cpp_kernels_i8mm PRIVATE -march=armv8.2-a+dotprod+i8mm)
+  target_link_libraries(esm_cpp_kernels_i8mm PRIVATE esm_warnings)
+  target_compile_features(esm_cpp_kernels_i8mm PUBLIC cxx_std_20)
+  list(APPEND ESM_KERNEL_OBJECT_LIBS esm_cpp_kernels_i8mm)
 endif()
 
 add_library(esm_cpp_core STATIC
