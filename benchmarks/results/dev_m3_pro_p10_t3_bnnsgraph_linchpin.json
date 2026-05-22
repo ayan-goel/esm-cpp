@@ -1,0 +1,17 @@
+{
+  "description": "Phase 10 T3 linchpin: C++ BNNSGraphCompileFromFile + BNNSGraphContextExecute on an fp16 fc1 mlmodelc (M=2048,K=1280,N=5120), Apple M3 Pro. Proves the fp16 AMX win is reachable from the engine in pure C++ (no Python/coremltools at runtime).",
+  "hardware": "Apple M3 Pro, macOS 26.3.1",
+  "result": {
+    "compile_from_file": "OK (mlmodelc 13.1 MB compiled graph)",
+    "execute_rc": 0,
+    "correctness": "output bit-matches the CoreML-predict reference (max rel err 0.0000)",
+    "bnnsgraph_fp16_execute_ms": 10.43,
+    "vs_new_sdot_ms": 20.5,
+    "vs_cblas_fp32_ms": 19.6,
+    "vs_coreml_predict_ms": 11.3,
+    "speedup_over_sdot": 1.97
+  },
+  "foundation": "tools/spike_fp16_mlmodelc_gen.py (coremltools 3.12 artifact gen) + tools/spike_bnns_graph_execute.cpp (C++ BNNSGraph runtime). Reference IO via the Python predict.",
+  "remaining_integration_scope": "Offline per-Linear fp16 mlmodelc generation at convert time (coremltools is 3.12-only; the 3.14 runtime needs NO coremltools — C++ BNNSGraph loads the compiled artifact directly); ship/cache ~132 artifacts (~1.3GB) for 650M; C++ BNNSGraph contexts cached per-Linear at Model::load and executed in the forward via the LinearInt8/Linear dispatch under ESM_APPLE_AMX; dynamic-M for varlen via BNNSGraphContextSetDynamicShapes (spike used fixed M); fp16 PPPL/ProteinGym validation at 150M+650M before ship. De-risked: compile+execute+speed+correctness all proven.",
+  "note": "T8 (SDOT branch-hoist, ~20% faster SDOT) shrank the fp16 advantage from ~2.3x to ~1.97x over the NEW SDOT, but it remains a real ~2x GEMM lever -> ~1.4x e2e on top of the certain wins."
+}
