@@ -35,6 +35,14 @@ std::string_view IsaToString(Isa isa);
 // Parses the names emitted by IsaToString. Case-sensitive; nullopt otherwise.
 std::optional<Isa> StringToIsa(std::string_view s);
 
+// Whether the ARM i8mm (SMMLA) INT8 kernel should engage. SMMLA is opt-in:
+// it does not beat the SDOT kernel on Apple M3 (measured), so an auto-detected
+// NeonI8mm host uses SDOT by default. SMMLA engages only on an explicit request
+// — ESM_FORCE_ISA=neoni8mm or ESM_NEON_I8MM=on — and is expected to win on
+// hardware with stronger SMMLA throughput (e.g. AWS Graviton3). Re-read on
+// each call. Returns false on non-ARM builds.
+bool ArmUseSmmla();
+
 // Log "esm.cpp: ISA = <name>\n" to stderr at most once per process when
 // ESM_LOG_ISA=1. Intended to be called by Model::load; safe to call repeatedly.
 void MaybeLogIsaOnce();

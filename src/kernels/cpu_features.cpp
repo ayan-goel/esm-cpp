@@ -134,6 +134,18 @@ Isa CurrentIsa() {
   return HostIsa();
 }
 
+bool ArmUseSmmla() {
+  if (const char* f = std::getenv("ESM_FORCE_ISA");
+      f && std::string_view(f) == "neoni8mm") {
+    return true;
+  }
+  if (const char* e = std::getenv("ESM_NEON_I8MM");
+      e && std::string_view(e) == "on") {
+    return true;
+  }
+  return false;
+}
+
 void MaybeLogIsaOnce() {
   static std::once_flag flag;
   std::call_once(flag, [] {

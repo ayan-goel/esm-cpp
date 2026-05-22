@@ -90,7 +90,10 @@ void LinearInt8(const float* A, const esm::quant::QuantizedTensor& W,
 #endif
 #if defined(__aarch64__) || defined(_M_ARM64)
     case Isa::NeonI8mm:
-      return LinearNeonI8mm(A, W, bias, C, M, N, K);
+      // SMMLA is opt-in (slower than SDOT on Apple M3); default to SDOT
+      // unless explicitly requested. See esm::ArmUseSmmla.
+      if (esm::ArmUseSmmla()) return LinearNeonI8mm(A, W, bias, C, M, N, K);
+      return LinearNeonDotProd(A, W, bias, C, M, N, K);
     case Isa::NeonDotProd:
       return LinearNeonDotProd(A, W, bias, C, M, N, K);
 #endif

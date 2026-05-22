@@ -106,7 +106,7 @@ void BuildI8mmCache(QuantizedTensor* out) {
 
 void BuildKernelCache(QuantizedTensor* out) {
 #if defined(__aarch64__) || defined(_M_ARM64)
-  if (esm::CurrentIsa() == esm::Isa::NeonI8mm) {
+  if (esm::CurrentIsa() == esm::Isa::NeonI8mm && esm::ArmUseSmmla()) {
     BuildI8mmCache(out);
   } else {
     BuildArmCache(out);

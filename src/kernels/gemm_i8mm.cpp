@@ -61,42 +61,60 @@ inline float Finalize(float acc_lane, float act_scale, float w_scale,
   return acc_lane * act_scale * w_scale + (bias ? bias[n] : 0.0f);
 }
 
-// Hot path: 4 rows x 4 cols (2 row-pairs x 2 col-pairs = 4 SMMLA tiles).
-// Caller guarantees m+4 <= M and n+4 <= N.
-inline void Kernel4x4(const std::int8_t* a_s8, const std::int8_t* packed,
+// Store one 2x2 SMMLA tile (acc lanes [m:n, m:n+1, m+1:n, m+1:n+1]).
+inline void StoreTile(int32x4_t acc, const float* w_scale, const float* bias,
+                      float act_scale, int N, float* C, int row, int col) {
+  float l[4];
+  vst1q_f32(l, vcvtq_f32_s32(acc));
+  C[static_cast<long>(row) * N + col] =
+      Finalize(l[0], act_scale, w_scale[col], bias, col);
+  C[static_cast<long>(row) * N + col + 1] =
+      Finalize(l[1], act_scale, w_scale[col + 1], bias, col + 1);
+  C[static_cast<long>(row + 1) * N + col] =
+      Finalize(l[2], act_scale, w_scale[col], bias, col);
+  C[static_cast<long>(row + 1) * N + col + 1] =
+      Finalize(l[3], act_scale, w_scale[col + 1], bias, col + 1);
+}
+
+// Hot path: 4 rows x 8 cols = 2 row-pairs x 4 col-pairs = 8 SMMLA tiles. The
+// two A row-pair loads are reused across all four col-pairs (amortizing the
+// vcombine), and 8 independent accumulators hide SMMLA's latency. Caller
+// guarantees m+4 <= M and n+8 <= N.
+inline void Kernel4x8(const std::int8_t* a_s8, const std::int8_t* packed,
                       const float* w_scale, const float* bias, float act_scale,
                       int N, int K, int K_pad8, float* C, int m, int n) {
-  const std::int8_t* pair0 = packed + static_cast<long>(n) * K_pad8;
-  const std::int8_t* pair1 = packed + static_cast<long>(n + 2) * K_pad8;
-  int32x4_t acc00 = vdupq_n_s32(0), acc01 = vdupq_n_s32(0);
-  int32x4_t acc10 = vdupq_n_s32(0), acc11 = vdupq_n_s32(0);
+  const std::int8_t* p0 = packed + static_cast<long>(n) * K_pad8;
+  const std::int8_t* p1 = packed + static_cast<long>(n + 2) * K_pad8;
+  const std::int8_t* p2 = packed + static_cast<long>(n + 4) * K_pad8;
+  const std::int8_t* p3 = packed + static_cast<long>(n + 6) * K_pad8;
+  int32x4_t a0c0 = vdupq_n_s32(0), a0c1 = vdupq_n_s32(0);
+  int32x4_t a0c2 = vdupq_n_s32(0), a0c3 = vdupq_n_s32(0);
+  int32x4_t a1c0 = vdupq_n_s32(0), a1c1 = vdupq_n_s32(0);
+  int32x4_t a1c2 = vdupq_n_s32(0), a1c3 = vdupq_n_s32(0);
   for (int kb = 0; kb < K; kb += 8) {
-    int8x16_t av0 = LoadArowPair(a_s8, m, 2, kb, K);
-    int8x16_t av1 = LoadArowPair(a_s8, m + 2, 2, kb, K);
-    int8x16_t wv0 = vld1q_s8(pair0 + kb * 2);
-    int8x16_t wv1 = vld1q_s8(pair1 + kb * 2);
-    acc00 = vmmlaq_s32(acc00, av0, wv0);
-    acc01 = vmmlaq_s32(acc01, av0, wv1);
-    acc10 = vmmlaq_s32(acc10, av1, wv0);
-    acc11 = vmmlaq_s32(acc11, av1, wv1);
+    const int8x16_t av0 = LoadArowPair(a_s8, m, 2, kb, K);
+    const int8x16_t av1 = LoadArowPair(a_s8, m + 2, 2, kb, K);
+    const int8x16_t w0 = vld1q_s8(p0 + kb * 2);
+    const int8x16_t w1 = vld1q_s8(p1 + kb * 2);
+    const int8x16_t w2 = vld1q_s8(p2 + kb * 2);
+    const int8x16_t w3 = vld1q_s8(p3 + kb * 2);
+    a0c0 = vmmlaq_s32(a0c0, av0, w0);
+    a0c1 = vmmlaq_s32(a0c1, av0, w1);
+    a0c2 = vmmlaq_s32(a0c2, av0, w2);
+    a0c3 = vmmlaq_s32(a0c3, av0, w3);
+    a1c0 = vmmlaq_s32(a1c0, av1, w0);
+    a1c1 = vmmlaq_s32(a1c1, av1, w1);
+    a1c2 = vmmlaq_s32(a1c2, av1, w2);
+    a1c3 = vmmlaq_s32(a1c3, av1, w3);
   }
-  float l[4];
-  const struct {
-    int32x4_t acc;
-    int row, col;
-  } tiles[4] = {{acc00, m, n}, {acc01, m, n + 2}, {acc10, m + 2, n},
-                {acc11, m + 2, n + 2}};
-  for (const auto& t : tiles) {
-    vst1q_f32(l, vcvtq_f32_s32(t.acc));
-    C[static_cast<long>(t.row) * N + t.col] =
-        Finalize(l[0], act_scale, w_scale[t.col], bias, t.col);
-    C[static_cast<long>(t.row) * N + t.col + 1] =
-        Finalize(l[1], act_scale, w_scale[t.col + 1], bias, t.col + 1);
-    C[static_cast<long>(t.row + 1) * N + t.col] =
-        Finalize(l[2], act_scale, w_scale[t.col], bias, t.col);
-    C[static_cast<long>(t.row + 1) * N + t.col + 1] =
-        Finalize(l[3], act_scale, w_scale[t.col + 1], bias, t.col + 1);
-  }
+  StoreTile(a0c0, w_scale, bias, act_scale, N, C, m, n);
+  StoreTile(a0c1, w_scale, bias, act_scale, N, C, m, n + 2);
+  StoreTile(a0c2, w_scale, bias, act_scale, N, C, m, n + 4);
+  StoreTile(a0c3, w_scale, bias, act_scale, N, C, m, n + 6);
+  StoreTile(a1c0, w_scale, bias, act_scale, N, C, m + 2, n);
+  StoreTile(a1c1, w_scale, bias, act_scale, N, C, m + 2, n + 2);
+  StoreTile(a1c2, w_scale, bias, act_scale, N, C, m + 2, n + 4);
+  StoreTile(a1c3, w_scale, bias, act_scale, N, C, m + 2, n + 6);
 }
 
 // Flexible mop-up: `rows` rows (1..4) x one col-pair of `ncols` cols (1..2)
@@ -138,8 +156,8 @@ void ComputeRowsI8mm(const std::int8_t* a_s8, const std::int8_t* packed,
   int m = m_begin;
   for (; m + 4 <= m_end; m += 4) {
     int n = 0;
-    for (; n + 4 <= N; n += 4)
-      Kernel4x4(a_s8, packed, w_scale, bias, act_scale, N, K, K_pad8, C, m, n);
+    for (; n + 8 <= N; n += 8)
+      Kernel4x8(a_s8, packed, w_scale, bias, act_scale, N, K, K_pad8, C, m, n);
     for (; n < N; n += 2)
       GeneralBlock(a_s8, packed, w_scale, bias, act_scale, N, K, K_pad8, C, m, 4,
                    n, std::min(2, N - n));
