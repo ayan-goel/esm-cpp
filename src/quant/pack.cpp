@@ -61,6 +61,21 @@ void QuantizeActivationRef(const float* x, std::size_t n, float scale,
   }
 }
 
+void QuantizeActivationSymmetricRef(const float* x, std::size_t n, float scale,
+                                    std::int8_t* q) {
+  if (scale == 0.0f) {
+    for (std::size_t i = 0; i < n; ++i) q[i] = 0;
+    return;
+  }
+  const float inv_scale = 1.0f / scale;
+  for (std::size_t i = 0; i < n; ++i) {
+    float v = std::nearbyint(x[i] * inv_scale);
+    if (v > 127.0f) v = 127.0f;
+    if (v < -127.0f) v = -127.0f;
+    q[i] = static_cast<std::int8_t>(static_cast<int>(v));
+  }
+}
+
 void Quantize(const float* W_fp32, int N, int K, QuantizedTensor* out) {
   out->N = N;
   out->K = K;

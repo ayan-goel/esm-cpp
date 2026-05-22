@@ -58,4 +58,14 @@ void BuildVnniCache(QuantizedTensor* out);
 void QuantizeActivationRef(const float* x, std::size_t n, float scale,
                             std::uint8_t* q);
 
+// Symmetric per-tensor activation quantizer (FP32 -> s8, no zero-point).
+//   q[i] = clamp(round(x[i] / scale), -127, 127)
+// scale == 0 produces all-zero output. This is the ARM (NEON SDOT / i8mm)
+// activation form: SDOT and SMMLA are signed x signed, so activations stay
+// symmetric s8 and the x86 zero-point-128 + col_sum correction is unnecessary.
+// The s32 accumulator is rescaled by (act_scale * weight_scale[n]) at
+// C-write-out, same as the VNNI path minus the zero-point term.
+void QuantizeActivationSymmetricRef(const float* x, std::size_t n, float scale,
+                                    std::int8_t* q);
+
 }  // namespace esm::quant

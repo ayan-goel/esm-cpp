@@ -19,6 +19,19 @@
 #include "esm_cpp/thread_pool.h"
 #endif
 
+#ifdef ESM_KERNEL_NEON
+#include <arm_neon.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+#include "esm_cpp/thread_pool.h"
+#endif
+
 namespace esm::kernels {
 
 #ifdef ESM_KERNEL_REFERENCE
@@ -542,5 +555,113 @@ void LinearVnni(const float* A, const esm::quant::QuantizedTensor& W,
 }
 
 #endif  // ESM_KERNEL_AVX512
+
+#ifdef ESM_KERNEL_NEON
+
+// NEON SDOT W8A8 path. SDOT is signed x signed, so activations are quantized
+// to symmetric s8 ([-127, 127], no zero-point) and there is no col_sum
+// correction — the s32 accumulator is just rescaled by act_scale *
+// weight_scale[n] + bias at write-out. Forward decl for the symmetric ref
+// cross-check lives in quant.h.
+
+namespace {
+
+// Round-to-nearest-even, clamp to [-127, 127], narrow to s8. Input is 16
+// floats already multiplied by inv_scale.
+inline int8x16_t QuantizeRound16(float32x4_t s0, float32x4_t s1,
+                                 float32x4_t s2, float32x4_t s3) {
+  const int32x4_t lo = vdupq_n_s32(-127);
+  const int32x4_t hi = vdupq_n_s32(127);
+  int32x4_t q0 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(s0), lo), hi);
+  int32x4_t q1 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(s1), lo), hi);
+  int32x4_t q2 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(s2), lo), hi);
+  int32x4_t q3 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(s3), lo), hi);
+  int16x8_t q01 = vcombine_s16(vmovn_s32(q0), vmovn_s32(q1));
+  int16x8_t q23 = vcombine_s16(vmovn_s32(q2), vmovn_s32(q3));
+  return vcombine_s8(vmovn_s16(q01), vmovn_s16(q23));
+}
+
+float AbsmaxSerial(const float* A, std::size_t begin, std::size_t end) {
+  float32x4_t m0 = vdupq_n_f32(0.0f), m1 = m0, m2 = m0, m3 = m0;
+  std::size_t i = begin;
+  for (; i + 16 <= end; i += 16) {
+    m0 = vmaxq_f32(m0, vabsq_f32(vld1q_f32(A + i)));
+    m1 = vmaxq_f32(m1, vabsq_f32(vld1q_f32(A + i + 4)));
+    m2 = vmaxq_f32(m2, vabsq_f32(vld1q_f32(A + i + 8)));
+    m3 = vmaxq_f32(m3, vabsq_f32(vld1q_f32(A + i + 12)));
+  }
+  float local = vmaxvq_f32(vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3)));
+  for (; i < end; ++i) local = std::max(local, std::fabs(A[i]));
+  return local;
+}
+
+void QuantizeSerial(const float* A, std::size_t begin, std::size_t end,
+                    float inv_scale, std::int8_t* a_s8) {
+  std::size_t i = begin;
+  for (; i + 16 <= end; i += 16) {
+    const float32x4_t s = vdupq_n_f32(inv_scale);
+    int8x16_t q = QuantizeRound16(vmulq_f32(vld1q_f32(A + i), s),
+                                  vmulq_f32(vld1q_f32(A + i + 4), s),
+                                  vmulq_f32(vld1q_f32(A + i + 8), s),
+                                  vmulq_f32(vld1q_f32(A + i + 12), s));
+    vst1q_s8(a_s8 + i, q);
+  }
+  for (; i < end; ++i) {
+    float v = std::nearbyint(A[i] * inv_scale);
+    if (v > 127.0f) v = 127.0f;
+    if (v < -127.0f) v = -127.0f;
+    a_s8[i] = static_cast<std::int8_t>(static_cast<int>(v));
+  }
+}
+
+}  // namespace
+
+// Activation prefix: per-tensor symmetric s8. act_scale = max(|A|) / 127.
+// Parallelized over MK with the same threshold + nested-pool guard as the
+// AVX-512 prefix. Public (non-anonymous) so the unit test can cross-check it.
+void QuantizeActPrefixNeon(const float* A, std::size_t MK, std::int8_t* a_s8,
+                           float* act_scale_out) {
+  constexpr std::size_t kParallelThreshold = 64 * 1024;
+  if (MK < kParallelThreshold || esm::InGlobalPoolWorker()) {
+    const float a_max = AbsmaxSerial(A, 0, MK);
+    const float act_scale = (a_max > 0.0f) ? (a_max / 127.0f) : 1.0f;
+    *act_scale_out = act_scale;
+    QuantizeSerial(A, 0, MK, 1.0f / act_scale, a_s8);
+    return;
+  }
+
+  const int n_blocks = static_cast<int>((MK + 15) / 16);
+  std::atomic<std::uint32_t> shared_bits{0};
+  esm::GlobalPool().parallel_for(
+      0, n_blocks, /*grain=*/256, [&](int block_begin, int block_end) {
+        const std::size_t begin = static_cast<std::size_t>(block_begin) * 16;
+        const std::size_t end =
+            std::min(MK, static_cast<std::size_t>(block_end) * 16);
+        const float local = AbsmaxSerial(A, begin, end);
+        std::uint32_t local_bits;
+        std::memcpy(&local_bits, &local, sizeof(float));
+        std::uint32_t prev = shared_bits.load(std::memory_order_relaxed);
+        while (local_bits > prev &&
+               !shared_bits.compare_exchange_weak(
+                   prev, local_bits, std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {}
+      });
+  std::uint32_t a_max_bits = shared_bits.load(std::memory_order_relaxed);
+  float a_max;
+  std::memcpy(&a_max, &a_max_bits, sizeof(float));
+  const float act_scale = (a_max > 0.0f) ? (a_max / 127.0f) : 1.0f;
+  const float inv_scale = 1.0f / act_scale;
+  *act_scale_out = act_scale;
+
+  esm::GlobalPool().parallel_for(
+      0, n_blocks, /*grain=*/256, [&](int block_begin, int block_end) {
+        const std::size_t begin = static_cast<std::size_t>(block_begin) * 16;
+        const std::size_t end =
+            std::min(MK, static_cast<std::size_t>(block_end) * 16);
+        QuantizeSerial(A, begin, end, inv_scale, a_s8);
+      });
+}
+
+#endif  // ESM_KERNEL_NEON
 
 }  // namespace esm::kernels
