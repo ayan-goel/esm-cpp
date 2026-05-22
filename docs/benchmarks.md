@@ -56,14 +56,29 @@ HF eager FP32 on the 256-sequence OAS-distribution dataset
 
 | Variant | esm-cpp-int8 | hf-eager-fp32 | Speedup |
 |---|---:|---:|---:|
+| 650M / varlen | 37.8 s | 150.1 s | **3.97× HF** |
 | 35M / varlen | 3.20 s | 9.46 s | **2.95× HF** |
 | 8M / varlen  | 1.02 s | 3.28 s | **3.21× HF** |
+| 650M / uniform 8×256 | 2.92 s | 3.80 s | 1.45× HF |
 | 35M / uniform 8×100 | 78.5 ms | 99.8 ms | 1.27× HF |
 | 8M / uniform 8×100  | 30.5 ms | 34.5 ms | 1.13× HF |
 
 Raw JSON: `benchmarks/results/dev_m3_pro_*_neon_*.json`. Reproduce with the
 same `esm-cpp-bench` commands below (any ESM-2 safetensors checkpoint;
 ISA is auto-detected). Notes:
+
+- **650M is GEMM-bound on M3.** The `ESM_PROFILE` breakdown is ~64% INT8 GEMM,
+  ~32% attention. The Phase-9 attention work (vectorized softmax exp +
+  multi-accumulator QKᵀ) cut the attention section ~25%, but the e2e is GEMM-
+  bound so the headline ratio is gated on the INT8 GEMM. The biggest remaining
+  M3 lever is Apple-AMX INT8 (BNNS), which projects ~2× over our SDOT but needs
+  the BNNSGraph API (not yet wired). The x86-parity ratio (≈4×/9×) is expected on
+  Graviton3, where HF uses generic BLAS and the SMMLA/i8mm tier engages.
+- **`ESM_APPLE_AMX=on`** (Apple-only, opt-in) routes FP32 GEMM through Accelerate's
+  AMX-backed cblas (~3.75–6.2× the NEON FMLA; 8M FP32 forward 94 → 66 ms).
+  Hand-written NEON stays the default and the only Linux-ARM path.
+- **Quality (650M):** INT8-vs-FP32 logit correlation 0.9997, masked-marginal
+  argmax agreement 0.994.
 
 - **SMMLA/i8mm is opt-in** (`ESM_NEON_I8MM=on`). On Apple M3 it does not
   out-throughput SDOT (fc1 GEMM: 4.2 ms SMMLA vs 3.3 ms SDOT), so SDOT is

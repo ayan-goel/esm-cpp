@@ -1,0 +1,12 @@
+{
+  "description": "Phase 9 T10: 650M INT8-vs-FP32 logit quality on Apple M3 Pro (post ExpNeon NaN fix). Proxy for the PPPL/ProteinGym drift gate; the W8A8 recipe is unchanged from x86.",
+  "hardware": "Apple M3 Pro",
+  "model": "esm2_t33_650M",
+  "metric": "esm-cpp-int8 vs esm-cpp-fp32 final logits, 5 random sequences len 60-200",
+  "results": {
+    "min_logit_correlation": 0.999694,
+    "argmax_agreement": 0.994,
+    "any_nan": false
+  },
+  "note": "Before the ExpNeon input clamp (P9 fix), 650M produced all-NaN logits via the shared attention softmax. The formal PPPL (<0.1) / ProteinGym (<0.01) gates at 150M/650M use this same recipe and remain carry-forward (tools/run_pppl_drift.py NaN bug from Phase 7 still open)."
+}
