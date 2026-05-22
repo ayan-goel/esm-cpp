@@ -78,7 +78,11 @@ TEST(CpuFeatures, StringToIsaRejectsUnknown) {
 TEST(CpuFeatures, HostIsaIsConsistentForBuildTarget) {
   auto host = esm::HostIsa();
 #if defined(__aarch64__) || defined(_M_ARM64)
-  EXPECT_EQ(host, esm::Isa::Neon);
+  // Detection picks the best ARM tier the host supports: Neon (FMLA only),
+  // NeonDotProd (FEAT_DotProd), or NeonI8mm (FEAT_I8MM). All are valid.
+  EXPECT_TRUE(host == esm::Isa::Neon || host == esm::Isa::NeonDotProd ||
+              host == esm::Isa::NeonI8mm)
+      << "unexpected ARM host ISA: " << esm::IsaToString(host);
 #elif defined(__x86_64__) || defined(_M_X64)
   EXPECT_NE(host, esm::Isa::Neon);
   EXPECT_GE(static_cast<int>(host), static_cast<int>(esm::Isa::Ref));
