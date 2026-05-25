@@ -31,6 +31,7 @@ esm-cpp-convert = "esm_cpp.convert:main"
 esm-cpp-quantize = "esm_cpp.quantize:main"
 esm-cpp-pppl = "esm_cpp.eval.pppl:main"
 esm-cpp-bench = "esm_cpp.bench.compare:main"
+esm-cpp-fetch-artifacts = "esm_cpp.fetch_artifacts:main"
 
 [tool.scikit-build]
 cmake.version = ">=3.20"
