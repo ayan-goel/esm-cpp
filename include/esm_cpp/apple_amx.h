@@ -2,11 +2,12 @@
 
 // Apple-AMX fp16 GEMM backend: per-Linear compiled BNNSGraph contexts loaded
 // from on-disk .mlmodelc artifacts at Model::load and executed in the forward
-// path under ESM_APPLE_AMX=on. The whole surface is gated behind
-// ESM_APPLE_AMX_AVAILABLE — compiled out on non-Apple builds, so the rest of
-// the engine builds cleanly on Linux ARM / Graviton with no Accelerate
-// dependency. The runtime needs zero coremltools; the artifacts are produced
-// at convert time by tools/build_amx_artifacts.py (Python 3.12 + coremltools).
+// path under ESM_APPLE_AMX=on. The actual BNNS surface is gated behind
+// ESM_APPLE_AMX_AVAILABLE — compiled out on non-Apple builds, where this
+// class is a stub (LoadFromDir always returns nullptr; Execute is unreachable
+// because no context can ever be created). The class shape is identical on
+// both platforms so unique_ptr<AppleAmxContext> in shared structs (Model,
+// LayerWeights) compiles cleanly on Linux ARM with no Accelerate dependency.
 
 #include <cstddef>
 #include <memory>
@@ -14,24 +15,15 @@
 
 #include "esm_cpp/status.h"
 
-#ifdef ESM_APPLE_AMX_AVAILABLE
-
 namespace esm {
 
-// Opaque RAII wrapper around one Linear's compiled BNNSGraph context:
-//   bnns_graph_t graph  (mmap'd from the .mlmodelc),
-//   bnns_graph_context_t ctx,
-//   workspace buffer,
-//   resolved argument positions for "x" (input) and "out" (output).
-// One-time setup at Model::load; the forward calls Execute() which only does
-// BNNSGraphContextSetDynamicShapes(M) + BNNSGraphContextExecute. No allocation
-// per forward.
 class AppleAmxContext {
  public:
   // Compile + create the context from a .mlmodelc directory. `K` is the
-  // Linear's input dim and `N` the output dim — both must match the artifact's
-  // static dims (BNNSGraph won't tell us, but the caller knows from the
-  // weight shape). Returns nullptr on failure; the caller falls back per-Linear.
+  // Linear's input dim and `N` the output dim — both must match the
+  // artifact's static dims (BNNSGraph won't tell us, but the caller knows
+  // from the weight shape). Returns nullptr on failure or on a non-Apple
+  // build; the caller falls back per-Linear.
   static std::unique_ptr<AppleAmxContext> LoadFromDir(const std::string& dir,
                                                      int K, int N);
 
@@ -47,9 +39,9 @@ class AppleAmxContext {
  private:
   AppleAmxContext() = default;
 
+#ifdef ESM_APPLE_AMX_AVAILABLE
   // Opaque pointers stored as void* to keep BNNS headers out of this header
-  // (and so the public API doesn't require linking Accelerate from non-AMX
-  // TUs). The .cpp casts back to the BNNS types.
+  // (consumers don't need to link Accelerate). The .cpp casts back.
   //
   // NOTE: workspace is NOT owned per-context. The BNNS workspace requirement
   // grows with M (e.g. ~3.8 KB / M for a [320,320] Linear), so per-context
@@ -65,8 +57,7 @@ class AppleAmxContext {
   std::size_t arg_count_ = 0;
   int k_ = 0;
   int n_ = 0;
+#endif
 };
 
 }  // namespace esm
-
-#endif  // ESM_APPLE_AMX_AVAILABLE

@@ -163,6 +163,13 @@ PYBIND11_MODULE(_core, m) {
       .def("save_to_gguf", &esm::Model::SaveToGguf, py::arg("path"),
            "Serialize the current model state to GGUF v3. FP32 weights "
            "are stored as-is; Slice 5 adds Q8_ESM for quantized state.")
+      .def("load_amx_artifacts", &esm::Model::LoadAmxArtifacts, py::arg("dir"),
+           py::call_guard<py::gil_scoped_release>(),
+           "Phase 11: load per-Linear fp16 BNNSGraph artifacts produced by "
+           "tools/build_amx_artifacts.py. Missing artifacts are silently "
+           "skipped; per-Linear fallback to the default INT8/FP32 path. "
+           "Apple-only at runtime (returns 0 elsewhere). Engaged in the "
+           "forward via ESM_APPLE_AMX=on. Returns the count of loaded contexts.")
       .def_property_readonly("config", &esm::Model::config)
       .def("set_first_block_fc1_fp16", &esm::Model::SetFirstBlockFc1Fp16,
            py::arg("enabled"),

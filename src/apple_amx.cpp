@@ -134,4 +134,21 @@ Status AppleAmxContext::Execute(const float* in, float* out, int M) {
 
 }  // namespace esm
 
+#else  // !ESM_APPLE_AMX_AVAILABLE
+
+// Non-Apple stub: the class exists (so unique_ptr<AppleAmxContext> in shared
+// structs compiles) but never holds a real context; LoadFromDir returns
+// nullptr, so Execute is unreachable.
+namespace esm {
+std::unique_ptr<AppleAmxContext> AppleAmxContext::LoadFromDir(
+    const std::string& /*dir*/, int /*K*/, int /*N*/) {
+  return nullptr;
+}
+AppleAmxContext::~AppleAmxContext() = default;
+Status AppleAmxContext::Execute(const float* /*in*/, float* /*out*/,
+                                int /*M*/) {
+  return {StatusCode::kInternal, "apple_amx: unavailable on this build"};
+}
+}  // namespace esm
+
 #endif  // ESM_APPLE_AMX_AVAILABLE

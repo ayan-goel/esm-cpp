@@ -294,6 +294,35 @@ std::unique_ptr<Model> Model::Load(const std::string& path) {
   return LoadFromSafetensors(path);
 }
 
+std::size_t Model::LoadAmxArtifacts(const std::string& dir) {
+  // Per-Linear naming mirrors tools/build_amx_artifacts.py exactly: the
+  // safetensors weight key minus the ".weight" suffix, plus ".mlmodelc".
+  // Missing artifacts are not an error — the affected Linear silently falls
+  // back to the default INT8/FP32 path at the next forward.
+  const int d = cfg_.hidden_size;
+  const int ffn = cfg_.intermediate_size;
+  std::size_t loaded = 0;
+  auto try_load = [&](const std::string& name, int K, int N)
+      -> std::unique_ptr<AppleAmxContext> {
+    auto p = dir + "/" + name + ".mlmodelc";
+    auto ctx = AppleAmxContext::LoadFromDir(p, K, N);
+    if (ctx) ++loaded;
+    return ctx;
+  };
+  for (std::size_t i = 0; i < layers_.size(); ++i) {
+    auto& lw = layers_[i];
+    const std::string base = "esm.encoder.layer." + std::to_string(i);
+    lw.amx_q = try_load(base + ".attention.self.query", d, d);
+    lw.amx_k = try_load(base + ".attention.self.key", d, d);
+    lw.amx_v = try_load(base + ".attention.self.value", d, d);
+    lw.amx_out = try_load(base + ".attention.output.dense", d, d);
+    lw.amx_fc1 = try_load(base + ".intermediate.dense", d, ffn);
+    lw.amx_fc2 = try_load(base + ".output.dense", ffn, d);
+  }
+  amx_lm_dense_ = try_load("lm_head.dense", d, d);
+  return loaded;
+}
+
 void Model::SaveToGguf(const std::string& path) const {
   const int d = cfg_.hidden_size;
   const int ffn = cfg_.intermediate_size;
@@ -515,12 +544,31 @@ void Embed(const Config& cfg, const float* embed_w,
 // Layout helpers: with the cu_seqlens-packed kernels, Q/K/V projections
 // land directly in [L, H, head_dim] (= [L, H*head_dim] in memory). The
 // old SplitHeads memcpy from [L, H*dh] -> [H, L, dh] is gone.
-// Branch helper: route through LinearInt8 when the model is quantized,
-// else the FP32 Linear facade. Centralized so the routing logic lives
-// in one place instead of being duplicated at every projection site.
+// Resolve the per-Linear AMX context (or nullptr if not loaded / non-Apple).
+// Pointer-to-member lets us reuse one helper for all six per-layer Linears.
+inline AppleAmxContext* AmxOf(
+    const LayerWeights& w,
+    std::unique_ptr<AppleAmxContext> LayerWeights::*field) {
+  return (w.*field).get();
+}
+
+// Branch helper: route through LinearInt8 when the model is quantized, else
+// FP32 Linear — OR, if an Apple-AMX fp16 BNNSGraph context is loaded for this
+// Linear AND ESM_APPLE_AMX=on, short-circuit through it. The AMX artifact has
+// bias baked in, so we don't add it again on that path.
 inline void LinearProj(const Config& cfg, const float* A, const float* W_fp32,
                        const esm::quant::QuantizedTensor& W_int8,
-                       const float* bias, float* C, int M, int N, int K) {
+                       const float* bias, float* C, int M, int N, int K,
+                       AppleAmxContext* amx = nullptr) {
+#ifdef ESM_APPLE_AMX_AVAILABLE
+  if (amx != nullptr && esm::ArmUseAppleAmx()) {
+    Status s = amx->Execute(A, C, M);
+    if (s.ok()) return;
+    // BNNS Execute failed unexpectedly at runtime — fall through defensively.
+  }
+#else
+  (void)amx;
+#endif
   if (cfg.weights_quantized) {
     kernels::LinearInt8(A, W_int8, bias, C, M, N, K);
   } else {
@@ -586,11 +634,11 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   {
     esm::profile::ScopedTimer t("qkv_proj");
     LinearProj(cfg, scratch_ln, w.q_w.data(), w.q_w_int8, w.q_b.data(),
-               q_packed, L, d, d);
+               q_packed, L, d, d, AmxOf(w, &LayerWeights::amx_q));
     LinearProj(cfg, scratch_ln, w.k_w.data(), w.k_w_int8, w.k_b.data(),
-               k_packed, L, d, d);
+               k_packed, L, d, d, AmxOf(w, &LayerWeights::amx_k));
     LinearProj(cfg, scratch_ln, w.v_w.data(), w.v_w_int8, w.v_b.data(),
-               v_packed, L, d, d);
+               v_packed, L, d, d, AmxOf(w, &LayerWeights::amx_v));
   }
 
   // Q-scale BEFORE RoPE — ESM's load-bearing quirk; see CLAUDE.md.
@@ -623,7 +671,8 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   {
     esm::profile::ScopedTimer t("attn_out_proj");
     LinearProj(cfg, scratch_attn_out, w.out_w.data(), w.out_w_int8,
-               w.out_b.data(), scratch_attn_proj, L, d, d);
+               w.out_b.data(), scratch_attn_proj, L, d, d,
+               AmxOf(w, &LayerWeights::amx_out));
   }
 
   // Residual: hidden += attn_proj
@@ -655,7 +704,7 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   {
     esm::profile::ScopedTimer t("fc1");
     LinearProj(cfg, scratch_ln, w.fc1_w.data(), w.fc1_w_int8, w.fc1_b.data(),
-               scratch_inter, L, ffn, d);
+               scratch_inter, L, ffn, d, AmxOf(w, &LayerWeights::amx_fc1));
   }
   {
     esm::profile::ScopedTimer t("gelu");
@@ -670,7 +719,8 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   {
     esm::profile::ScopedTimer t("fc2");
     LinearProj(cfg, scratch_inter_gelu, w.fc2_w.data(), w.fc2_w_int8,
-               w.fc2_b.data(), scratch_ffn_out, L, d, ffn);
+               w.fc2_b.data(), scratch_ffn_out, L, d, ffn,
+               AmxOf(w, &LayerWeights::amx_fc2));
   }
 
   // Residual: hidden += ffn_out
@@ -808,12 +858,21 @@ void Model::ForwardPackedInto(
   float* lm_dense = ws.allocate<float>(Td);
   {
     esm::profile::ScopedTimer t("lm_dense");
-    if (cfg_.lm_head_dense_quantized) {
-      kernels::LinearInt8(final_ln, lm_dense_w_int8_, lm_dense_b_.data(),
-                          lm_dense, T, d, d);
-    } else {
-      kernels::Linear(final_ln, lm_dense_w_.data(), lm_dense_b_.data(),
-                      lm_dense, T, d, d);
+    bool used_amx = false;
+#ifdef ESM_APPLE_AMX_AVAILABLE
+    if (amx_lm_dense_ && esm::ArmUseAppleAmx()) {
+      Status s = amx_lm_dense_->Execute(final_ln, lm_dense, T);
+      used_amx = s.ok();
+    }
+#endif
+    if (!used_amx) {
+      if (cfg_.lm_head_dense_quantized) {
+        kernels::LinearInt8(final_ln, lm_dense_w_int8_, lm_dense_b_.data(),
+                            lm_dense, T, d, d);
+      } else {
+        kernels::Linear(final_ln, lm_dense_w_.data(), lm_dense_b_.data(),
+                        lm_dense, T, d, d);
+      }
     }
   }
   float* lm_gelu = ws.allocate<float>(Td);

@@ -1,0 +1,23 @@
+{
+  "description": "Phase 11 T7: 650M e2e on M3 Pro with ESM_APPLE_AMX=on (fp16 BNNSGraph contexts loaded from weights/esm2_650m.amx-fp16/). Uniform 8x256, esm-cpp-int8 base + 199 AMX contexts loaded via Model::LoadAmxArtifacts.",
+  "hardware": "Apple M3 Pro",
+  "amx_loaded_contexts": 199,
+  "uniform_8x256_p50_ms": {
+    "p10_baseline_sdot": 2257,
+    "p11_amx_fp16_on": 1740,
+    "delta_pct": -22.9,
+    "speedup_vs_hf_eager": 2.23
+  },
+  "profile_per_bucket_ms": {
+    "post_p10_sdot": {"fc1": 497, "fc2": 509, "qkv_proj": 392, "attn_out_proj": 131, "lm_dense": 14, "attention": 521, "GEMM_bucket": 1543},
+    "post_p11_amx":  {"fc1": 338, "fc2": 385, "qkv_proj": 278, "attn_out_proj":  92, "lm_dense":  3, "attention": 558, "GEMM_bucket": 1096},
+    "GEMM_bucket_reduction_pct": -29
+  },
+  "note": "Speedup is real (~2.23x HF vs 1.79x P10) but below the linchpin's 2x-on-fc1 projection. The spike's microbench timing overstated the SDOT-vs-AMX ratio; the real per-call delta in the integrated forward is ~1.5x on the GEMM bucket. The bias is baked into each fp16 mlmodelc, so LinearProj's AMX branch skips the bias add.",
+  "speedup_journey_650m_uniform": {
+    "p9_baseline": "1.30x HF",
+    "p10_t6_pv_attention": "+~7% e2e",
+    "p10_t8_sdot_branch_hoist": "+~17% e2e (1.30x -> 1.79x HF stacked)",
+    "p11_t7_amx_fp16": "+~23% e2e (1.79x -> 2.23x HF)"
+  }
+}

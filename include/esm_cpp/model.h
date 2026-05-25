@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "esm_cpp/apple_amx.h"
 #include "esm_cpp/batch.h"
 #include "esm_cpp/observer.h"
 #include "esm_cpp/quant.h"
@@ -63,6 +64,15 @@ struct LayerWeights {
   // reads these instead of the FP32 vectors above. Biases stay FP32.
   esm::quant::QuantizedTensor q_w_int8, k_w_int8, v_w_int8;
   esm::quant::QuantizedTensor out_w_int8, fc1_w_int8, fc2_w_int8;
+
+  // Phase 11: per-Linear fp16-AMX BNNSGraph contexts loaded by
+  // Model::LoadAmxArtifacts (on Apple builds; always nullptr on Linux ARM).
+  // nullptr = no artifact for this Linear -> fall back to the default
+  // INT8/FP32 path. Bias is baked into the artifact (so the BNNSGraph Execute
+  // returns C = X·W^T + bias directly — the LinearProj branch skips the
+  // bias add when this path is taken).
+  std::unique_ptr<esm::AppleAmxContext> amx_q, amx_k, amx_v;
+  std::unique_ptr<esm::AppleAmxContext> amx_out, amx_fc1, amx_fc2;
 };
 
 // Forward output. `hidden_states` semantics match HF EsmModel:
@@ -88,6 +98,15 @@ class Model {
   // Phase 3 Slice 4: serialize the current model state to GGUF v3.
   // Writes FP32 weights; Slice 5 adds Q8_ESM for quantized state.
   void SaveToGguf(const std::string& path) const;
+
+  // Phase 11: load per-Linear fp16 BNNSGraph artifacts from `dir` (built by
+  // tools/build_amx_artifacts.py). For each Linear in the model, looks for
+  // <dir>/<safetensors-key>.mlmodelc and, if present, compiles + caches the
+  // context. Missing artifacts are silently skipped — the affected Linears
+  // fall back to the default INT8/FP32 path. Apple-only at runtime (no-op
+  // off Apple builds). Returns the count of successfully loaded contexts.
+  // The path is then engaged via the forward dispatch under ESM_APPLE_AMX=on.
+  std::size_t LoadAmxArtifacts(const std::string& dir);
 
   const Config& config() const { return cfg_; }
 
@@ -207,6 +226,9 @@ class Model {
   // QuantizeWeights when cfg_.lm_head_dense_quantized is true (set
   // from the ESM_QUANTIZE_LM_HEAD env var at quantize time).
   esm::quant::QuantizedTensor lm_dense_w_int8_;
+  // Phase 11: optional fp16-AMX BNNSGraph context for lm_head.dense
+  // (always nullptr on Linux ARM builds).
+  std::unique_ptr<esm::AppleAmxContext> amx_lm_dense_;
   // lm_head.decoder.weight is tied to embed_ — we reuse embed_ directly.
 
   // Per-Model scratch arena. Mutable because Forward is logically const
