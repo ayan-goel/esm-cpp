@@ -20,15 +20,61 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <span>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include "esm_cpp/model.h"
 #include "esm_cpp/tokenizer.h"
 
 namespace {
+
+// RAII env-var override (same pattern as test_artifact_cache.cpp).
+class EnvScope {
+ public:
+  EnvScope(const std::string& key, const std::string& value) : key_(key) {
+    if (const char* prev = std::getenv(key.c_str())) {
+      had_prev_ = true;
+      prev_ = prev;
+    }
+    ::setenv(key.c_str(), value.c_str(), 1);
+  }
+  EnvScope(const std::string& key, std::nullptr_t) : key_(key) {
+    if (const char* prev = std::getenv(key.c_str())) {
+      had_prev_ = true;
+      prev_ = prev;
+    }
+    ::unsetenv(key.c_str());
+  }
+  ~EnvScope() {
+    if (had_prev_) ::setenv(key_.c_str(), prev_.c_str(), 1);
+    else            ::unsetenv(key_.c_str());
+  }
+ private:
+  std::string key_;
+  std::string prev_;
+  bool had_prev_ = false;
+};
+
+class TempDir {
+ public:
+  TempDir() {
+    path_ = std::filesystem::temp_directory_path() /
+        ("esm_cpp_auto_load_test_" + std::to_string(::getpid()) + "_" +
+         std::to_string(reinterpret_cast<std::uintptr_t>(this)));
+    std::filesystem::create_directories(path_);
+  }
+  ~TempDir() {
+    std::error_code ec;
+    std::filesystem::remove_all(path_, ec);
+  }
+  const std::filesystem::path& path() const { return path_; }
+ private:
+  std::filesystem::path path_;
+};
 
 // Pearson correlation, computed in double to avoid catastrophic cancellation
 // on logit-magnitude vectors (~1e2 dynamic range).
@@ -152,4 +198,81 @@ TEST(AppleAmx, Fp16ModelParityVsFp32Reference) {
   const int L = static_cast<int>(amx.size() / static_cast<std::size_t>(V));
   const double agree = ArgmaxAgreement(ref, amx, L, V);
   EXPECT_GE(agree, 0.99) << "argmax agreement below 0.99 — AMX path drifted";
+}
+
+// Phase 14 T2: auto-load AMX from the sibling artifact dir at Model::Load*
+// without an explicit LoadAmxArtifacts(...) call. Symlinks the existing
+// AMX fixture into a temp dir as `<weights>.apple/amx-fp16/` so the
+// auto-discovery in TryAutoLoadAppleArtifacts picks it up.
+TEST(AppleAmx, AutoLoadFromSiblingDir) {
+  const char* sft = std::getenv("ESM_AMX_TEST_SAFETENSORS");
+  const char* art = std::getenv("ESM_AMX_TEST_ARTIFACT_DIR");
+  if (!sft || !art) {
+    GTEST_SKIP() << "fixture envs not set (ESM_AMX_TEST_SAFETENSORS, "
+                 << "ESM_AMX_TEST_ARTIFACT_DIR)";
+  }
+  if (!std::filesystem::exists(sft) || !std::filesystem::is_directory(art)) {
+    GTEST_SKIP() << "fixture paths do not resolve: " << sft << " / " << art;
+  }
+
+  namespace fs = std::filesystem;
+  TempDir td;
+  // Symlink targets must be absolute — a symlink to a relative path is
+  // resolved relative to the symlink's location, not $PWD.
+  const fs::path sft_abs = fs::absolute(sft);
+  const fs::path art_abs = fs::absolute(art);
+  const fs::path weights = td.path() / "model.safetensors";
+  std::error_code ec;
+  fs::create_symlink(sft_abs, weights, ec);
+  ASSERT_FALSE(ec) << "symlink weights failed: " << ec.message();
+
+  const fs::path apple_dir = td.path() / "model.apple";
+  fs::create_directories(apple_dir);
+  const fs::path amx_link = apple_dir / "amx-fp16";
+  fs::create_directory_symlink(art_abs, amx_link, ec);
+  ASSERT_FALSE(ec) << "symlink amx fixture failed: " << ec.message();
+
+  // Override the cache dir to nowhere so only the sibling path is found.
+  EnvScope cache_off("ESM_CPP_CACHE_DIR", (td.path() / "nope").string());
+  // Leave ESM_APPLE_AMX unset so the new default-on semantics apply.
+  EnvScope amx_default("ESM_APPLE_AMX", nullptr);
+
+  auto model = esm::Model::LoadFromSafetensors(weights.string());
+  ASSERT_NE(model, nullptr);
+#ifdef ESM_APPLE_AMX_AVAILABLE
+  EXPECT_FALSE(model->amx_artifacts_path().empty())
+      << "auto-discovery did not engage on sibling dir";
+  EXPECT_EQ(model->amx_artifacts_path(), amx_link.string());
+#else
+  EXPECT_TRUE(model->amx_artifacts_path().empty())
+      << "non-Apple build should not auto-load";
+#endif
+}
+
+// Phase 14 T2: ESM_APPLE_AMX=off disables auto-engage even when artifacts
+// were explicitly loaded. We still LOAD them (the loader doesn't check
+// env); the runtime gate is the one that gets disabled.
+TEST(AppleAmx, EnvOffDisablesAutoEngage) {
+  const char* sft = std::getenv("ESM_AMX_TEST_SAFETENSORS");
+  const char* art = std::getenv("ESM_AMX_TEST_ARTIFACT_DIR");
+  if (!sft || !art) GTEST_SKIP() << "fixture envs not set";
+  if (!std::filesystem::exists(sft) || !std::filesystem::is_directory(art)) {
+    GTEST_SKIP() << "fixture paths do not resolve";
+  }
+
+  EnvScope amx_off("ESM_APPLE_AMX", "off");
+  auto model = esm::Model::LoadFromSafetensors(sft);
+  ASSERT_NE(model, nullptr);
+  model->LoadAmxArtifacts(art);  // explicit load still works
+
+  esm::Tokenizer tok;
+  const std::string seq =
+      "MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVSRQVIVQDIAYLRSLGYNIVATPRGYVLAGG";
+  const auto ids = tok.Encode(seq);
+  std::vector<std::int32_t> mask(ids.size(), 1);
+  const auto logits = model->Forward(std::span<const std::int32_t>(ids),
+                                      std::span<const std::int32_t>(mask));
+  // Forward must still produce finite logits via the FP32 fallback path
+  // (AMX gated off by env, even though artifacts are loaded).
+  EXPECT_TRUE(AllFinite(logits));
 }

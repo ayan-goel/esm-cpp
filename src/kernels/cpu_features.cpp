@@ -136,10 +136,16 @@ Isa CurrentIsa() {
 
 bool ArmUseAppleAmx() {
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(_M_ARM64))
+  // Phase 14 default-on flip: AMX engages unless the user explicitly opts
+  // out. The `amx != nullptr` guard at the call site means this is a no-op
+  // when no artifacts have been loaded — so the FP32/INT8 path still runs
+  // for a user who never installed artifacts.
   const char* e = std::getenv("ESM_APPLE_AMX");
-  if (!e || *e == '\0') return false;
-  const std::string_view s(e);
-  return s == "on" || s == "1" || s == "true";
+  if (e && *e != '\0') {
+    const std::string_view s(e);
+    if (s == "off" || s == "0" || s == "false") return false;
+  }
+  return true;
 #else
   return false;
 #endif

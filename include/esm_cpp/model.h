@@ -114,8 +114,19 @@ class Model {
   // context. Missing artifacts are silently skipped — the affected Linears
   // fall back to the default INT8/FP32 path. Apple-only at runtime (no-op
   // off Apple builds). Returns the count of successfully loaded contexts.
-  // The path is then engaged via the forward dispatch under ESM_APPLE_AMX=on.
+  //
+  // As of Phase 14, the forward dispatch engages this path **by default**
+  // when artifacts are present; set `ESM_APPLE_AMX=off` to disable. The
+  // explicit call here remains supported (used by benchmarks/tests that
+  // want a specific artifact dir not at the auto-discovery locations).
   std::size_t LoadAmxArtifacts(const std::string& dir);
+
+  // Phase 14: directory the auto-discovery loaded AMX artifacts from
+  // during the most recent Model::Load*, empty if none. Useful for
+  // diagnostics ("did the auto-engage actually fire?") and the
+  // Python e2e parity test. Independent of whether the forward engages
+  // them (that's the ESM_APPLE_AMX gate).
+  const std::string& amx_artifacts_path() const { return amx_artifacts_path_; }
 
   // Phase 12: load per-Linear-per-bucket ANE artifacts. `dir` is the top-level
   // ANE artifact dir (with M-<m>/ subdirs). For each Linear, walks each
@@ -284,6 +295,16 @@ class Model {
     std::unique_ptr<esm::AppleWholeGraphContext> ctx;
   };
   std::vector<WholeGraphReg> whole_graph_;
+
+  // Phase 14: auto-discovery diagnostics. amx_artifacts_path_ is set to the
+  // directory we auto-loaded AMX artifacts from during the most recent
+  // Model::Load*; empty if none. (T3 will add a similar field for whole-graph.)
+  std::string amx_artifacts_path_;
+
+  // Phase 14: scan `weights_path`'s sibling + cache for AMX + whole-graph
+  // artifacts and load any found. Called from Model::Load{FromSafetensors,
+  // FromGguf} after weights are populated. No-op on non-Apple builds.
+  void TryAutoLoadAppleArtifacts(const std::string& weights_path);
 
   // Per-Model scratch arena. Mutable because Forward is logically const
   // (the model state doesn't change), but the arena bumps and resets.

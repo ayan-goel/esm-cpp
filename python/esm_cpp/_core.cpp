@@ -168,8 +168,15 @@ PYBIND11_MODULE(_core, m) {
            "Phase 11: load per-Linear fp16 BNNSGraph artifacts produced by "
            "tools/build_amx_artifacts.py. Missing artifacts are silently "
            "skipped; per-Linear fallback to the default INT8/FP32 path. "
-           "Apple-only at runtime (returns 0 elsewhere). Engaged in the "
-           "forward via ESM_APPLE_AMX=on. Returns the count of loaded contexts.")
+           "Apple-only at runtime (returns 0 elsewhere). As of Phase 14 "
+           "this engages by default in the forward when artifacts are loaded; "
+           "set ESM_APPLE_AMX=off to disable. Returns the count of loaded contexts.")
+      .def_property_readonly(
+          "amx_artifacts_path",
+          [](const esm::Model& m) { return m.amx_artifacts_path(); },
+          "Phase 14: directory the auto-discovery loaded AMX artifacts from "
+          "during the most recent load_from_safetensors / load_from_gguf, or "
+          "empty if none. Useful for confirming the auto-engage path fired.")
       .def("load_ane_artifacts", &esm::Model::LoadAneArtifacts, py::arg("dir"),
            py::call_guard<py::gil_scoped_release>(),
            "Phase 12: load per-Linear-per-bucket ANE CoreML artifacts built by "

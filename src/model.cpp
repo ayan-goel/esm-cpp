@@ -1,5 +1,7 @@
 #include "esm_cpp/model.h"
 
+#include "esm_cpp/artifact_cache.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -138,6 +140,7 @@ std::unique_ptr<Model> Model::LoadFromSafetensors(const std::string& path) {
   // lm_head.decoder.weight is tied to esm.embeddings.word_embeddings.weight;
   // we reuse out->embed_ at logit time and don't load a separate copy.
 
+  out->TryAutoLoadAppleArtifacts(path);
   return out;
 }
 
@@ -288,6 +291,7 @@ std::unique_ptr<Model> Model::LoadFromGguf(const std::string& path) {
   GgufLoadVector(*file, "lm_head_norm.bias", out->lm_ln_b_);
   GgufLoadVector(*file, "output.bias", out->lm_decoder_bias_);
 
+  out->TryAutoLoadAppleArtifacts(path);
   return out;
 }
 
@@ -374,6 +378,41 @@ std::size_t Model::LoadAmxArtifacts(const std::string& dir) {
   }
   amx_lm_dense_ = try_load("lm_head.dense", d, d);
   return loaded;
+}
+
+void Model::TryAutoLoadAppleArtifacts(const std::string& weights_path) {
+#ifdef ESM_APPLE_AMX_AVAILABLE
+  namespace fs = std::filesystem;
+  // ESM_APPLE_DEBUG_AUTOLOAD=1 dumps the candidate roots + per-root load
+  // result to stderr. Useful when a user's auto-engage isn't firing and
+  // they can't tell whether it's a missing artifact, a bad path, or a
+  // failed compile.
+  const bool debug = std::getenv("ESM_APPLE_DEBUG_AUTOLOAD") != nullptr;
+  auto roots = ArtifactCache::CandidateRoots(weights_path);
+  if (debug) {
+    std::fprintf(stderr, "[autoload] weights=%s  candidates=%zu\n",
+                 weights_path.c_str(), roots.size());
+    for (const auto& r : roots) {
+      std::fprintf(stderr, "[autoload]   candidate: %s\n", r.c_str());
+    }
+  }
+  for (const auto& root : roots) {
+    const fs::path amx_dir = root / "amx-fp16";
+    std::error_code ec;
+    if (!fs::is_directory(amx_dir, ec)) continue;
+    const std::size_t n = LoadAmxArtifacts(amx_dir.string());
+    if (debug) {
+      std::fprintf(stderr, "[autoload]   amx %s -> %zu contexts\n",
+                   amx_dir.c_str(), n);
+    }
+    if (n > 0) {
+      amx_artifacts_path_ = amx_dir.string();
+      break;  // first hit wins
+    }
+  }
+#else
+  (void)weights_path;
+#endif
 }
 
 bool Model::LoadWholeGraphArtifact(const std::string& dir, int B, int L,
