@@ -13,19 +13,29 @@ Target workloads:
 - **Embedding extraction at corpus scale** — per-residue or per-sequence vectors for downstream classifiers, alignment, or retrieval.
 - **On-prem / regulated environments** — runs on CPU without cloud GPU access. Useful for clinical, compliance-restricted, or air-gapped pipelines.
 
-## Status: v0.1.0
+## Status: v0.2
 
 ESM-2 at 8M, 35M, 150M, 650M, 3B. W8A8 INT8 with SmoothQuant ships for 150M and above; smaller models stay FP32. Both safetensors (HF native) and GGUF (esm.cpp native) load paths.
 
-**Headline performance** (Intel Xeon 8481C Sapphire Rapids, AMX-INT8, 22 vCPUs, ESM-2-650M):
+**Headline performance**:
 
-| Workload | esm-cpp-int8 | hf-eager-fp32 | Speedup |
-|---|---:|---:|---:|
-| Variable-length 256-seq (OAS-shape) | **12.4 s** | 115.1 s | **9.31× HF** |
-| Variable-length + opt-in env vars   | 11.5 s | 115.0 s | **10.04× HF** |
-| Uniform 8-seq × 256-tokens          | 0.92 s | 3.42 s | 4.09× HF |
+- **Intel Xeon 8481C Sapphire Rapids** (AMX-INT8, 22 vCPUs, ESM-2-650M):
 
-The variable-length advantage comes from the `cu_seqlens` packed-batch forward: HuggingFace pads every sequence in a batch to `max(len)` and processes the resulting padded tensor uniformly; esm.cpp packs sequences back-to-back along the token axis and isolates per-sequence attention via `cu_seqlens`. On antibody-shaped data (mean ~120 residues, max ~250) that saves ~3× of HF's attention compute and ~2× of its FFN compute on top of the INT8/AMX baseline.
+  | Workload | esm-cpp-int8 | hf-eager-fp32 | Speedup |
+  |---|---:|---:|---:|
+  | Variable-length 256-seq (OAS-shape) | **12.4 s** | 115.1 s | **9.31× HF** |
+  | Variable-length + opt-in env vars   | 11.5 s | 115.0 s | **10.04× HF** |
+  | Uniform 8-seq × 256-tokens          | 0.92 s | 3.42 s | 4.09× HF |
+
+- **Apple M3 Pro** (ANE + GPU via CoreML, ESM-2-650M, **`ESM_APPLE_ANE_GRAPH=on`**):
+
+  | Workload | esm-cpp-whole-graph-fp16 | hf-eager-fp32 | Speedup |
+  |---|---:|---:|---:|
+  | Uniform 8-seq × 256-tokens | **459 ms** | 4617 ms | **10.05× HF** |
+
+The variable-length advantage on x86 comes from the `cu_seqlens` packed-batch forward: HuggingFace pads every sequence in a batch to `max(len)` and processes the resulting padded tensor uniformly; esm.cpp packs sequences back-to-back along the token axis and isolates per-sequence attention via `cu_seqlens`. On antibody-shaped data (mean ~120 residues, max ~250) that saves ~3× of HF's attention compute and ~2× of its FFN compute on top of the INT8/AMX baseline.
+
+The Apple M3 uniform-shape win comes from compiling the entire ESM-2 forward (33 encoder layers + LM head) into ONE CoreML `.mlmodelc` at convert time and routing it through a small Obj-C++ MLModel bridge — keeping one op-fused fp16 graph hot on ANE/GPU instead of the per-Linear pattern that thrashes the ANE compiled-state cache. The path is opt-in (the default is unchanged) and only engages on uniform-length batches with a registered shape; varlen / mixed-length falls through to the Phase-11 AMX-fp16 path. See `docs/benchmarks.md` for the full path table and reproduction.
 
 ### ARM (Apple Silicon / Linux ARM)
 

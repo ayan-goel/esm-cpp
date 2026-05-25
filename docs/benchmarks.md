@@ -6,6 +6,17 @@ variable-length workloads matching OAS antibody heavy-chain statistics
 commit + commands in this file. Raw JSON results live in
 `benchmarks/results/`.
 
+## Headline (v0.2)
+
+**Apple M3 Pro: `esm-cpp` runs ESM-2-650M at 10× HuggingFace eager FP32
+throughput on uniform 8×256 batches via the Phase-13 whole-graph CoreML
+path (`ESM_APPLE_ANE_GRAPH=on`)** — one compiled `.mlmodelc` for the
+entire forward, dispatched to ANE/GPU through one Obj-C++ MLModel bridge.
+650M @ uniform (B=8, L=256): **459 ms vs 4617 ms = 10.05× HF**. Quality
+vs FP32: corr 0.999998, argmax 1.000, PPPL drift < 0.001 on the
+25-protein holdout. See `## ARM (Apple Silicon / Linux ARM) — v0.2`
+below for the full path table and reproduction.
+
 ## Headline (v0.1.0)
 
 **`esm-cpp-int8` runs ESM-2-650M at 9.3-10× HuggingFace eager FP32
