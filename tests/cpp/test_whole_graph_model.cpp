@@ -144,11 +144,11 @@ TEST(AppleWholeGraph, Fp16ModelParityVsFp32Reference) {
   ASSERT_NE(model, nullptr);
   esm::Tokenizer tok;
 
-  // Fixed 64-residue sequence + cls + eos -> L=66 to match the artifact's
-  // (B=1, L=66) shape. If the user passes a different artifact, the
-  // LoadWholeGraphArtifact registration just won't match the runtime shape
-  // and the forward will fall through to the default path (and the test
-  // will fail with a clear "registration not engaged" assertion below).
+  // Fixed 65-residue sequence + cls + eos -> L=67 to match the artifact's
+  // (B=1, L=67) shape. The bridge LoadFromDir checks the compiled input
+  // shape against the requested (B, L) and refuses to load on mismatch
+  // (Phase 14 fix — previously silent-fallback would mask a fixture/test
+  // mismatch as a trivial corr=1.0 pass via the standard-path fallback).
   const std::string seq =
       "MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVSRQVIVQDIAYLRSLGYNIVATPRGYVLAGG";
   const auto ids = tok.Encode(seq);
@@ -205,7 +205,7 @@ TEST(AppleWholeGraph, Fp16ModelParityVsFp32Reference) {
 }
 
 // Phase 14 T3: whole-graph artifact auto-discovery + env opt-out flip.
-// Stages a B-1_L-66 artifact at <td>/model.apple/whole-graph/B-1_L-66/,
+// Stages a B-1_L-67 artifact at <td>/model.apple/whole-graph/B-1_L-67/,
 // loads the model with no explicit register call + no env vars, and asserts
 // the shape is registered AND a forward_scheduled engages the fast path.
 TEST(AppleWholeGraph, AutoLoadFromSiblingDir) {
@@ -236,7 +236,7 @@ TEST(AppleWholeGraph, AutoLoadFromSiblingDir) {
   const fs::path apple_dir = td.path() / "model.apple";
   const fs::path wg_root = apple_dir / "whole-graph";
   fs::create_directories(wg_root);
-  const fs::path bundle_link = wg_root / "B-1_L-66" / "whole_graph.mlmodelc";
+  const fs::path bundle_link = wg_root / "B-1_L-67" / "whole_graph.mlmodelc";
   fs::create_directories(bundle_link.parent_path());
   fs::create_directory_symlink(art_abs, bundle_link, ec);
   ASSERT_FALSE(ec) << "symlink whole_graph fixture failed: " << ec.message();
@@ -252,11 +252,11 @@ TEST(AppleWholeGraph, AutoLoadFromSiblingDir) {
   auto shapes = model->whole_graph_shapes();
   ASSERT_EQ(shapes.size(), 1u) << "auto-discovery should have registered 1 shape";
   EXPECT_EQ(shapes[0].first, 1);
-  EXPECT_EQ(shapes[0].second, 66);
+  EXPECT_EQ(shapes[0].second, 67);
   EXPECT_FALSE(model->whole_graph_path().empty());
 
   // Forward path: scheduled with a single sequence should auto-engage the
-  // whole-graph (uniform L=66 + matching registration + no env opt-out).
+  // whole-graph (uniform L=67 + matching registration + no env opt-out).
   esm::Tokenizer tok;
   const std::string seq =
       "MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVSRQVIVQDIAYLRSLGYNIVATPRGYVLAGG";
@@ -285,7 +285,7 @@ TEST(AppleWholeGraph, EnvOffDisablesAutoEngage) {
   ASSERT_NE(model, nullptr);
 #ifdef ESM_APPLE_ANE_AVAILABLE
   const bool registered = model->LoadWholeGraphArtifact(
-      art, /*B=*/1, /*L=*/66, esm::WholeGraphComputeUnits::kCpuAndNeuralEngine);
+      art, /*B=*/1, /*L=*/67, esm::WholeGraphComputeUnits::kCpuAndNeuralEngine);
   ASSERT_TRUE(registered);
   ASSERT_EQ(model->whole_graph_shapes().size(), 1u);
 #endif

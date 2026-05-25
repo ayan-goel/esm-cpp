@@ -59,6 +59,30 @@ std::unique_ptr<AppleWholeGraphContext> AppleWholeGraphContext::LoadFromDir(
         [MLModel modelWithContentsOfURL:url configuration:cfg error:&err];
     if (model == nil || err != nil) return nullptr;
 
+    // Verify the artifact's compiled input shape matches the (B, L) the
+    // caller is requesting. CoreML's predict will silently truncate or
+    // produce nonsense on a shape mismatch — without this check, a stale
+    // artifact at the wrong (B, L) causes the bridge to look like it's
+    // running while actually returning junk that happens to be near-zero,
+    // and the corr-vs-FP32 gate then doesn't catch it.
+    MLModelDescription* desc = model.modelDescription;
+    MLFeatureDescription* ids_desc = desc.inputDescriptionsByName[@"input_ids"];
+    if (ids_desc != nil) {
+      MLMultiArrayConstraint* c = ids_desc.multiArrayConstraint;
+      if (c != nil && c.shape != nil && c.shape.count == 2) {
+        const int expected_B = [c.shape[0] intValue];
+        const int expected_L = [c.shape[1] intValue];
+        if (expected_B != B || expected_L != L) {
+          std::fprintf(stderr,
+                       "[apple_whole_graph] shape mismatch: artifact %s "
+                       "compiled at (B=%d, L=%d), caller requested (B=%d, L=%d). "
+                       "Refusing to load.\n",
+                       dir.c_str(), expected_B, expected_L, B, L);
+          return nullptr;
+        }
+      }
+    }
+
     NSArray* in_shape = @[ @(B), @(L) ];
     NSArray* out_shape = @[ @(B), @(L), @(V) ];
 
