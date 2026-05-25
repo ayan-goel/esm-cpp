@@ -1,0 +1,20 @@
+{
+  "description": "Phase 11 Task 1: locked the post-P10 starting line for the fp16-AMX integration target on Apple M3 Pro. The headline is to beat this number with ESM_APPLE_AMX=on after T7.",
+  "hardware": "Apple M3 Pro (6P+6E, 12 logical, 18 GB RAM, macOS 26.3.1)",
+  "model": "facebook/esm2_t33_650M_UR50D",
+  "shape": "uniform batch=8 len=256",
+  "esm-cpp-int8_sdot_post_p10": {
+    "p50_ms": 2257,
+    "mean_ms": 2288,
+    "throughput_seqs_per_s": 3.50,
+    "speedup_vs_hf_p9": 1.72
+  },
+  "varlen_baseline": "P9 measured esm-cpp-int8 varlen=37828ms p50 vs HF=150071ms (3.97x); P10 T6/T8 kernels improve it but the slow HF baseline was not re-run — that's T7's job post-AMX.",
+  "150m_cached": "/Users/ayangoel/.cache/huggingface/hub/models--facebook--esm2_t30_150M_UR50D/snapshots/a695f6045e2e32885fa60af20c13cb35398ce30c/model.safetensors",
+  "convert_time_env": {
+    "python": "3.12.11",
+    "coremltools": "9.0",
+    "path": "/tmp/ct312/bin/python (a throwaway venv from P10; will be promoted to .venv-ct or documented in tools/build_amx_artifacts.py for Phase 11 production use)",
+    "why_separate": "coremltools 9.0 ships pure-Python wheels for Python 3.14 (missing libcoremlpython + libmilstoragepython native libs needed for MIL blob serialization). Native libs are present in the 3.12 wheel. Convert-time only; the 3.14 runtime needs zero coremltools."
+  }
+}
