@@ -7,7 +7,13 @@
 
 #include "esm_cpp/thread_pool.h"
 
-#ifdef ESM_APPLE_AMX_AVAILABLE
+// On Apple we can route plain FP32 GEMM through Accelerate's cblas (which
+// uses the AMX coprocessor under the hood). This is independent of the
+// BNNSGraph path in apple_amx.cpp — even SDKs without <Accelerate/BNNSGraph.h>
+// (older Xcode on the macos-14 GHA runner) still have cblas. Gate on
+// __APPLE__ rather than ESM_APPLE_AMX_AVAILABLE so the cblas path
+// survives the BNNSGraph SDK check in CMakeLists.txt.
+#ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
 
 #include "esm_cpp/cpu_features.h"
@@ -129,9 +135,11 @@ void ComputeRowsNeon(const float* A, const float* W, const float* bias,
 void LinearNeon(const float* A, const float* W, const float* bias, float* C,
                 int M, int N, int K) {
   if (M <= 0 || N <= 0 || K <= 0) return;
-#ifdef ESM_APPLE_AMX_AVAILABLE
-  // Opt-in Apple AMX (Accelerate) FP32 GEMM — ~3.75-6.2x the hand-written
-  // NEON FMLA on M-series. Apple-only, off by default (ESM_APPLE_AMX=on).
+#ifdef __APPLE__
+  // Apple-only Accelerate cblas FP32 GEMM — ~3.75-6.2x the hand-written
+  // NEON FMLA on M-series. Opt-in via ESM_APPLE_AMX flag — same env knob
+  // used by the BNNSGraph fp16 path; semantically "use the Accelerate
+  // implementation when on Apple."
   if (esm::ArmUseAppleAmx()) {
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0f, A, K, W,
                 K, 0.0f, C, N);

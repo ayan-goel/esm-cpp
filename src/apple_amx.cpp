@@ -2,6 +2,10 @@
 
 #ifdef ESM_APPLE_AMX_AVAILABLE
 
+// <Accelerate/Accelerate.h> umbrellas vecLib which in turn umbrellas BNNS
+// (including the modern bnns_graph_* API). CMake guarantees this file's
+// presence in the SDK via the EXISTS check that gates ESM_APPLE_AMX_AVAILABLE,
+// so we can include the umbrella without worrying about a partial SDK.
 #include <Accelerate/Accelerate.h>
 
 #include <array>

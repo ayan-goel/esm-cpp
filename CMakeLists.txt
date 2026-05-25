@@ -99,15 +99,22 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
   target_compile_definitions(esm_cpp_kernels_neon PRIVATE ESM_KERNEL_NEON)
   target_link_libraries(esm_cpp_kernels_neon PRIVATE esm_warnings)
   target_compile_features(esm_cpp_kernels_neon PUBLIC cxx_std_20)
+  # The NEON SDOT kernel uses `vdotq_s32` which requires the `+dotprod` target
+  # feature. Apple's arm64 clang sets it by default; Linux ARM clang's baseline
+  # is ARMv8.0-A and rejects the intrinsic without an explicit -march. ARMv8.2-A
+  # + dotprod is the minimum that lets `vdotq_s32` inline (matches the i8mm TU's
+  # base and AWS Graviton2+/Apple M1+ baselines).
+  target_compile_options(esm_cpp_kernels_neon PRIVATE -march=armv8.2-a+dotprod)
   # The default NEON FP32 path is the hand-written FMLA microkernel, so the
   # engine runs on Linux ARM/Graviton where Accelerate does not exist. On
-  # Apple (where Accelerate is a system framework) we link it and compile the
-  # AMX path in; it is selected only at runtime via ESM_APPLE_AMX=on, so the
-  # default behaviour stays the portable hand-written kernel.
+  # Apple we link Accelerate so LinearNeon can opt into cblas at runtime
+  # under ESM_APPLE_AMX=on. The cblas path is gated by __APPLE__ in
+  # gemm_fp32.cpp (always available on Apple, unlike ESM_APPLE_AMX_AVAILABLE
+  # which now also requires <Accelerate/BNNSGraph.h>).
   if(APPLE)
     target_link_libraries(esm_cpp_kernels_neon PUBLIC "-framework Accelerate")
     target_compile_definitions(esm_cpp_kernels_neon PRIVATE
-      ESM_APPLE_AMX_AVAILABLE ACCELERATE_NEW_LAPACK)
+      ACCELERATE_NEW_LAPACK)
   endif()
   list(APPEND ESM_KERNEL_OBJECT_LIBS esm_cpp_kernels_neon)
 
@@ -142,10 +149,21 @@ add_library(esm_cpp_core STATIC
   src/threading/thread_pool.cpp
   src/model.cpp
   src/apple_amx.cpp
-  src/apple_ane.mm
-  src/apple_whole_graph.mm
+  src/apple_ane_stub.cpp
+  src/apple_whole_graph_stub.cpp
   src/artifact_cache.cpp
 )
+# Apple-only Objective-C++ TUs. We add them via target_sources gated on
+# APPLE so the .mm extension never reaches g++ on Linux (where it would
+# try cc1objplus, which isn't installed) or the linker (where there's no
+# __gnu_objc_personality_v0 to resolve against). The C++ public surface
+# is in include/esm_cpp/apple_*.h; on non-Apple the bridge classes are
+# never instantiated.
+if(APPLE)
+  target_sources(esm_cpp_core PRIVATE
+    src/apple_ane.mm
+    src/apple_whole_graph.mm)
+endif()
 
 # Phase 14: stamp the artifact trace SHA into a generated header. The
 # algorithm matches tools/_artifact_manifest.py's compute_trace_sha
@@ -183,9 +201,47 @@ target_compile_features(esm_cpp_core PUBLIC cxx_std_20)
 # define + framework link mean tests and the Python extension also see them.
 # Linux ARM / Graviton builds skip this block entirely — apple_amx.cpp's body
 # is fully #ifdef ESM_APPLE_AMX_AVAILABLE so the .o becomes empty.
+#
+# We probe the SDK for <Accelerate/BNNSGraph.h> at configure time. It first
+# shipped publicly with the macOS 14 SDK but the umbrella header for
+# Accelerate didn't always include it; older Xcode (15.0 on some GHA
+# macos-14 images) lacks the BNNSGraph types entirely. When the header
+# isn't present we omit ESM_APPLE_AMX_AVAILABLE so apple_amx.cpp's body
+# stays empty — the engine still builds, the AMX-fp16 path is just
+# unavailable on that host. ANE/whole-graph (CoreML) is independent and
+# stays enabled.
 if(APPLE)
+  # check_include_file_cxx synthesizes a compile that doesn't get
+  # -framework Accelerate (CMake can't add framework flags to the probe
+  # without manual setup), so framework-resident headers never resolve.
+  # Probe the SDK directly: query the active SDK path with xcrun, then
+  # check if Accelerate.framework/Headers/BNNSGraph.h exists. This is
+  # the same path the compiler actually sees through framework search.
+  execute_process(
+    COMMAND xcrun --sdk macosx --show-sdk-path
+    OUTPUT_VARIABLE _esm_sdk_path
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _esm_sdk_path_rc)
+  set(ESM_HAVE_BNNSGRAPH_H FALSE)
+  if(_esm_sdk_path_rc EQUAL 0)
+    # BNNS lives inside Accelerate's vecLib sub-framework; the header is at
+    # <vecLib/BNNS/bnns_graph.h> via the umbrella include. Probe the actual
+    # SDK file. Older Xcode SDKs (e.g. macos-14 GHA images with Xcode 15.0)
+    # may ship without it even though the API is documented as macOS 13.3+.
+    set(_esm_bnnsgraph_h
+        "${_esm_sdk_path}/System/Library/Frameworks/Accelerate.framework/Frameworks/vecLib.framework/Headers/BNNS/bnns_graph.h")
+    if(EXISTS "${_esm_bnnsgraph_h}")
+      set(ESM_HAVE_BNNSGRAPH_H TRUE)
+    endif()
+  endif()
+  if(ESM_HAVE_BNNSGRAPH_H)
+    message(STATUS "Found Accelerate/BNNSGraph.h — AMX-fp16 path enabled")
+    target_compile_definitions(esm_cpp_core PUBLIC ESM_APPLE_AMX_AVAILABLE)
+  else()
+    message(STATUS "Accelerate/BNNSGraph.h not found in SDK — AMX-fp16 path "
+                    "disabled. (Bump Xcode / macOS SDK to enable it.)")
+  endif()
   target_compile_definitions(esm_cpp_core PUBLIC
-    ESM_APPLE_AMX_AVAILABLE
     ESM_APPLE_ANE_AVAILABLE
     ACCELERATE_NEW_LAPACK)
   target_link_libraries(esm_cpp_core PUBLIC
