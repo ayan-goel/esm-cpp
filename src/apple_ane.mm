@@ -2,72 +2,41 @@
 
 #ifdef ESM_APPLE_ANE_AVAILABLE
 
-#import <Foundation/Foundation.h>
+#import <Accelerate/Accelerate.h>
 #import <CoreML/CoreML.h>
+#import <Foundation/Foundation.h>
 
+#include <arm_neon.h>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 // Per-Linear, per-bucket Neural Engine runtime via CoreML's MLModel API.
-// BNNSGraph (the Phase-11 AMX path) is CPU/AMX-only — there is no compute-unit
-// selector in its API — so ANE has to go through MLModel. The graph itself
-// is the same single-op `linear` MLModel that build_amx_artifacts.py emits with
-// --compute-units CPU_AND_NE and a fixed M. Per-call overhead is dominated by
-// the input/output MLMultiArray construction; we zero-copy the input via
-// `initWithDataPointer:` and only copy the output back into the caller's
-// buffer.
+// Phase 12 lesson (post-T7 perf debug): a naive bridge that creates fresh
+// MLMultiArrays per call is ~20x slower than coremltools.predict on the same
+// artifact, because (a) MLModel allocates a new output MLMultiArray of the
+// declared output type/shape on every prediction (40 MB for fc1 at M=8192),
+// (b) `initWithDataPointer:deallocator:` doesn't actually give a zero-copy
+// path on ANE — ANE has to bounce the buffer through its own allocator
+// regardless, and the dataPointer:deallocator: route trips an internal slow
+// path on large buffers. The fix is the same one CoreML's own clients use:
+// pre-allocate the input and output MLMultiArrays at LoadFromDir time (in
+// CoreML-managed memory, so ANE can map them efficiently) and pass the output
+// via MLPredictionOptions.outputBackings so the runtime never re-allocates.
+// Per-Execute is then just: memcpy fp32 input -> in_arr_, predict, vectorized
+// fp16 -> fp32 copy from out_arr_ -> caller's `out`.
 
 namespace esm {
 
 namespace {
 
-// Wrap the caller's contiguous fp32 buffer in an MLMultiArray view (no copy).
-// `dataPtr` lifetime must outlive the MLMultiArray's use inside predict.
-MLMultiArray* WrapFp32Input(const float* dataPtr, int M, int K) {
-  NSArray<NSNumber*>* shape =
-      @[ @(M), @(K) ];
-  // Row-major: stride[0] = K, stride[1] = 1.
-  NSArray<NSNumber*>* strides = @[ @(K), @(1) ];
-  NSError* err = nil;
-  // initWithDataPointer doesn't take ownership; pass a no-op deallocator.
-  MLMultiArray* a =
-      [[MLMultiArray alloc] initWithDataPointer:(void*)dataPtr
-                                          shape:shape
-                                       dataType:MLMultiArrayDataTypeFloat32
-                                        strides:strides
-                                    deallocator:^(void* /*ptr*/) {}
-                                          error:&err];
-  if (err) return nil;
-  return a;
-}
-
-// Copy MLMultiArray (any supported numeric type) into a contiguous fp32 buffer
-// of size M*N. ANE may return fp16; CoreML up-casts at access time but we go
-// through the explicit getBytesWithHandler: path for safety.
-bool CopyOutFp32(MLMultiArray* a, float* out, int M, int N) {
-  if (a == nil) return false;
-  if (a.count != (NSInteger)((long)M * N)) return false;
-  // Walk the most common dtypes; fall back through KVC float access if needed.
-  const NSInteger total = a.count;
-  switch (a.dataType) {
-    case MLMultiArrayDataTypeFloat32: {
-      const float* p = (const float*)a.dataPointer;
-      std::memcpy(out, p, total * sizeof(float));
-      return true;
-    }
-    case MLMultiArrayDataTypeFloat16: {
-      // ARM ABI defines __fp16 as IEEE half; safe cast.
-      const __fp16* p = (const __fp16*)a.dataPointer;
-      for (NSInteger i = 0; i < total; ++i) out[i] = (float)p[i];
-      return true;
-    }
-    case MLMultiArrayDataTypeDouble: {
-      const double* p = (const double*)a.dataPointer;
-      for (NSInteger i = 0; i < total; ++i) out[i] = (float)p[i];
-      return true;
-    }
-    default:
-      return false;
-  }
+// Vectorized fp16 -> fp32 conversion via Accelerate's vImage. Beats the scalar
+// `for (i) out[i]=(float)p[i]` loop ~30x for 10 MB outputs.
+void Fp16ToFp32(const __fp16* src, float* dst, std::size_t n) {
+  vImage_Buffer in_buf  = {(void*)src, 1, n, n * sizeof(__fp16)};
+  vImage_Buffer out_buf = {dst,       1, n, n * sizeof(float)};
+  vImageConvert_Planar16FtoPlanarF(&in_buf, &out_buf, 0);
 }
 
 }  // namespace
@@ -86,9 +55,38 @@ std::unique_ptr<AppleAneContext> AppleAneContext::LoadFromDir(
         [MLModel modelWithContentsOfURL:url configuration:cfg error:&err];
     if (model == nil || err != nil) return nullptr;
 
+    // Pre-allocate input MLMultiArray fp32 [M, K]. MLMultiArray allocates an
+    // ANE-mappable buffer when we don't pass a dataPointer.
+    NSArray* in_shape  = @[ @(M), @(K) ];
+    NSArray* out_shape = @[ @(M), @(N) ];
+    MLMultiArray* in_arr =
+        [[MLMultiArray alloc] initWithShape:in_shape
+                                   dataType:MLMultiArrayDataTypeFloat32
+                                      error:&err];
+    if (in_arr == nil || err != nil) return nullptr;
+    // Output is fp16 (ANE's native type); we'll vectorize the fp16->fp32 copy
+    // in Execute. Forcing the output to fp32 here would round-trip through an
+    // MLModel-allocated fp32 buffer on every call (the slow path we're fixing).
+    MLMultiArray* out_arr =
+        [[MLMultiArray alloc] initWithShape:out_shape
+                                   dataType:MLMultiArrayDataTypeFloat16
+                                      error:&err];
+    if (out_arr == nil || err != nil) return nullptr;
+
+    MLDictionaryFeatureProvider* provider =
+        [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{ @"x": in_arr }
+                                                          error:&err];
+    if (provider == nil || err != nil) return nullptr;
+
+    MLPredictionOptions* opts = [[MLPredictionOptions alloc] init];
+    opts.outputBackings = @{ @"out": out_arr };
+
     auto out = std::unique_ptr<AppleAneContext>(new AppleAneContext());
-    // Bridge-retain across the ARC/non-ARC boundary; ~AppleAneContext releases.
-    out->model_ = (__bridge_retained void*)model;
+    out->model_    = (__bridge_retained void*)model;
+    out->in_arr_   = (__bridge_retained void*)in_arr;
+    out->out_arr_  = (__bridge_retained void*)out_arr;
+    out->provider_ = (__bridge_retained void*)provider;
+    out->options_  = (__bridge_retained void*)opts;
     out->m_ = M;
     out->k_ = K;
     out->n_ = N;
@@ -97,47 +95,60 @@ std::unique_ptr<AppleAneContext> AppleAneContext::LoadFromDir(
 }
 
 AppleAneContext::~AppleAneContext() {
-  if (model_ != nullptr) {
-    // Transfer ownership back to ARC so the MLModel deallocs.
-    MLModel* m = (__bridge_transfer MLModel*)model_;
-    (void)m;
-    model_ = nullptr;
-  }
+  if (options_  != nullptr) { (void)(__bridge_transfer MLPredictionOptions*)options_;  options_  = nullptr; }
+  if (provider_ != nullptr) { (void)(__bridge_transfer MLDictionaryFeatureProvider*)provider_; provider_ = nullptr; }
+  if (out_arr_  != nullptr) { (void)(__bridge_transfer MLMultiArray*)out_arr_;  out_arr_  = nullptr; }
+  if (in_arr_   != nullptr) { (void)(__bridge_transfer MLMultiArray*)in_arr_;   in_arr_   = nullptr; }
+  if (model_    != nullptr) { (void)(__bridge_transfer MLModel*)model_;         model_    = nullptr; }
 }
 
 Status AppleAneContext::Execute(const float* in, float* out) {
   if (in == nullptr || out == nullptr) {
     return {StatusCode::kInvalidArgument, "apple_ane: null in/out"};
   }
-  if (model_ == nullptr) {
-    return {StatusCode::kInternal, "apple_ane: no model"};
+  if (model_ == nullptr || in_arr_ == nullptr || out_arr_ == nullptr ||
+      provider_ == nullptr || options_ == nullptr) {
+    return {StatusCode::kInternal, "apple_ane: context not initialized"};
   }
 
+  static const bool debug = std::getenv("ESM_APPLE_ANE_DEBUG") != nullptr;
+  auto t0 = std::chrono::steady_clock::now();
+  auto stamp = [&t0, this](const char* label) {
+    auto t = std::chrono::steady_clock::now();
+    double us = std::chrono::duration_cast<std::chrono::microseconds>(t - t0)
+                    .count();
+    std::fprintf(stderr, "[ane M=%d K=%d N=%d] %-10s %.2f ms\n", m_, k_, n_,
+                 label, us / 1e3);
+    t0 = t;
+  };
+
   @autoreleasepool {
-    MLModel* model = (__bridge MLModel*)model_;
-    MLMultiArray* xArr = WrapFp32Input(in, m_, k_);
-    if (xArr == nil) {
-      return {StatusCode::kInternal, "apple_ane: WrapFp32Input failed"};
-    }
+    MLModel* model      = (__bridge MLModel*)model_;
+    MLMultiArray* xArr  = (__bridge MLMultiArray*)in_arr_;
+    MLMultiArray* yArr  = (__bridge MLMultiArray*)out_arr_;
+    id<MLFeatureProvider> provider = (__bridge id<MLFeatureProvider>)provider_;
+    MLPredictionOptions* opts      = (__bridge MLPredictionOptions*)options_;
+
+    // Copy caller's fp32 input into the pre-allocated MLMultiArray (which is
+    // in CoreML/ANE-friendly memory). For M=8192 K=5120 this is ~160 MB and
+    // takes a few ms, but it's the entry the runtime can map zero-copy to ANE.
+    std::memcpy(xArr.dataPointer, in,
+                static_cast<std::size_t>(m_) * k_ * sizeof(float));
+    if (debug) stamp("copy_in");
+
     NSError* err = nil;
-    NSDictionary<NSString*, MLMultiArray*>* inputs = @{ @"x": xArr };
-    MLDictionaryFeatureProvider* provider =
-        [[MLDictionaryFeatureProvider alloc] initWithDictionary:inputs
-                                                          error:&err];
-    if (provider == nil || err != nil) {
-      return {StatusCode::kInternal,
-              "apple_ane: MLDictionaryFeatureProvider init failed"};
-    }
     id<MLFeatureProvider> result =
-        [model predictionFromFeatures:provider error:&err];
+        [model predictionFromFeatures:provider options:opts error:&err];
+    if (debug) stamp("predict");
     if (result == nil || err != nil) {
       return {StatusCode::kInternal, "apple_ane: predictionFromFeatures failed"};
     }
-    MLFeatureValue* outVal = [result featureValueForName:@"out"];
-    MLMultiArray* outArr = outVal != nil ? outVal.multiArrayValue : nil;
-    if (!CopyOutFp32(outArr, out, m_, n_)) {
-      return {StatusCode::kInternal, "apple_ane: output extract failed"};
-    }
+    // With outputBackings set, the result's "out" feature aliases yArr.
+    // Vectorized fp16 -> fp32 into the caller's `out` (Accelerate ~30x faster
+    // than a scalar __fp16-cast loop for tens of MB).
+    Fp16ToFp32((const __fp16*)yArr.dataPointer, out,
+               static_cast<std::size_t>(m_) * n_);
+    if (debug) stamp("copy_out");
     return Status::Ok();
   }
 }

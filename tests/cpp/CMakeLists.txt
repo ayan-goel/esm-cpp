@@ -16,6 +16,7 @@ add_executable(esm_cpp_tests
   test_scheduler.cpp
   test_gguf.cpp
   test_apple_amx_model.cpp
+  test_apple_ane_model.cpp
 )
 target_link_libraries(esm_cpp_tests PRIVATE
   esm_cpp_core

@@ -45,9 +45,17 @@ class AppleAneContext {
   AppleAneContext() = default;
 
 #ifdef ESM_APPLE_ANE_AVAILABLE
-  // Opaque pointer to the ARC-retained MLModel* (cast in the .mm file).
-  // Stored as void* to keep CoreML headers out of this public header.
+  // Opaque pointers to ARC-retained CoreML objects (cast in the .mm file).
+  // model_ + reusable input/output MLMultiArrays + MLPredictionOptions
+  // (outputBackings = pre-allocated output buffer) + MLDictionaryFeatureProvider
+  // pre-built around the input array. Pre-allocating these once per context
+  // avoids per-call MLMultiArray allocation of large buffers (40MB at M=8192,
+  // fc1) which was the main source of integrated-forward slowdown.
   void* model_ = nullptr;
+  void* in_arr_ = nullptr;
+  void* out_arr_ = nullptr;
+  void* provider_ = nullptr;
+  void* options_ = nullptr;
 #endif
   int m_ = 0;
   int k_ = 0;
