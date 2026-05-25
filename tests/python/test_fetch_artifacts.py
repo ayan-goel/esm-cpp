@@ -57,7 +57,7 @@ def _make_fake_release(release_root: Path, model_short: str = "esm2_t6_8M",
         "models": {
             model_short: {
                 "hf_id": hf_id,
-                "cache_key": hf_id.split("/", 1)[-1],
+                "cache_key": hf_id.replace("/", "--"),
                 "whole_graph": {
                     "B-1_L-67": {
                         "file": tarball.name,
@@ -106,14 +106,14 @@ def test_fetch_local_repo_round_trip(tmp_path: Path) -> None:
     assert p.returncode == 0, f"stderr:\n{p.stderr}\nstdout:\n{p.stdout}"
 
     # The expected extracted layout: <cache>/<key>/whole-graph/B-1_L-67/...
-    extracted = cache_root / "esm2_t6_8M_UR50D" / "whole-graph" / \
+    extracted = cache_root / "facebook--esm2_t6_8M_UR50D" / "whole-graph" / \
         "B-1_L-67" / "whole_graph.mlmodelc" / "marker.txt"
     assert extracted.is_file(), \
         f"missing extracted file at {extracted}\nstdout:\n{p.stdout}"
     assert extracted.read_text() == "fake-mlmodelc-content\n"
 
     # Tarball should be deleted by default (no --keep-tarballs).
-    leftover = list((cache_root / "esm2_t6_8M_UR50D").glob("*.tar.gz"))
+    leftover = list((cache_root / "facebook--esm2_t6_8M_UR50D").glob("*.tar.gz"))
     assert not leftover, f"unexpected leftover tarball(s): {leftover}"
 
 

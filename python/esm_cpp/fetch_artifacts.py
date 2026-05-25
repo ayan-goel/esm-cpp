@@ -56,8 +56,21 @@ _HF_ID_FOR_SHORTHAND: dict[str, str] = {
 # updates this to the real "owner/name".
 _DEFAULT_REPO = "esmcpp/esm-cpp"
 
+def _cache_key_for_hf(hf_id: str) -> str:
+    """Mirror ArtifactCache::CacheKeyFor in src/artifact_cache.cpp.
+
+    The C++ side extracts `<org>--<name>` from the HF cache path pattern
+    `models--<org>--<name>/snapshots/.../model.safetensors`, so the
+    download target has to use the SAME format or the auto-load won't
+    find the artifacts.
+    """
+    if "/" not in hf_id:
+        return hf_id  # already plain; HF id shouldn't be missing the org
+    return hf_id.replace("/", "--")
+
+
 CACHE_KEY_FROM_HF: dict[str, str] = {
-    hf_id: hf_id.split("/", 1)[-1]
+    hf_id: _cache_key_for_hf(hf_id)
     for hf_id in _HF_ID_FOR_SHORTHAND.values()
 }
 
@@ -216,10 +229,7 @@ def _resolve_model(arg: str) -> tuple[str, str]:
             raise SystemExit(
                 f"unknown --model {arg!r}; pass either a shorthand "
                 f"({sorted(_HF_ID_FOR_SHORTHAND.keys())}) or the full HF id.")
-    if "/" not in hf_id:
-        cache_key = hf_id
-    else:
-        cache_key = hf_id.split("/", 1)[-1]
+    cache_key = _cache_key_for_hf(hf_id)
     return arg, cache_key
 
 
