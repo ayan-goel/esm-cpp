@@ -143,6 +143,7 @@ add_library(esm_cpp_core STATIC
   src/model.cpp
   src/apple_amx.cpp
   src/apple_ane.mm
+  src/apple_whole_graph.mm
 )
 target_include_directories(esm_cpp_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
@@ -166,6 +167,8 @@ if(APPLE)
   # mode in clang on Apple. The whole esm_cpp_core lib stays plain C++ on Linux
   # (the .mm becomes an unused TU that the gate fully #ifs out).
   set_source_files_properties(src/apple_ane.mm PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc")
+  set_source_files_properties(src/apple_whole_graph.mm PROPERTIES
     COMPILE_FLAGS "-fobjc-arc")
 endif()
 
@@ -207,4 +210,12 @@ if(ESM_BUILD_BENCH)
   set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(benchmark)
   add_subdirectory(bench)
+endif()
+
+# Phase 13: standalone whole-graph C++ bench harness (Apple-only). Built when
+# ESM_BUILD_TOOLS is set or ESM_BUILD_BENCH is set, so it follows the same
+# convention as the rest of the spike + bench tools.
+if(APPLE AND (ESM_BUILD_BENCH OR ESM_BUILD_TOOLS))
+  add_executable(bench_whole_graph_cpp tools/bench_whole_graph_cpp.cpp)
+  target_link_libraries(bench_whole_graph_cpp PRIVATE esm_cpp_core esm_warnings)
 endif()
