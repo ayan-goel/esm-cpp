@@ -9,13 +9,27 @@ commit + commands in this file. Raw JSON results live in
 ## Headline (v0.2)
 
 **Apple M3 Pro: `esm-cpp` runs ESM-2-650M at 10× HuggingFace eager FP32
-throughput on uniform 8×256 batches via the Phase-13 whole-graph CoreML
-path (`ESM_APPLE_ANE_GRAPH=on`)** — one compiled `.mlmodelc` for the
-entire forward, dispatched to ANE/GPU through one Obj-C++ MLModel bridge.
-650M @ uniform (B=8, L=256): **459 ms vs 4617 ms = 10.05× HF**. Quality
-vs FP32: corr 0.999998, argmax 1.000, PPPL drift < 0.001 on the
-25-protein holdout. See `## ARM (Apple Silicon / Linux ARM) — v0.2`
-below for the full path table and reproduction.
+throughput on uniform 8×256 batches via a whole-graph CoreML path** —
+one compiled `.mlmodelc` for the entire forward, dispatched to ANE/GPU
+through one Obj-C++ MLModel bridge. 650M @ uniform (B=8, L=256):
+**459 ms vs 4617 ms = 10.05× HF**. Quality vs FP32: corr 0.999998,
+argmax 1.000, PPPL drift < 0.001 on the 25-protein holdout.
+
+**Zero-config reproduction** (Phase 14):
+
+```bash
+pip install esm-cpp
+esm-cpp-fetch-artifacts --model esm2_t33_650M  # ~5 GB, one-time download
+python -c "
+import esm_cpp
+m = esm_cpp.Model.load_from_safetensors('/path/to/esm2_t33_650M_UR50D/model.safetensors')
+# Auto-engages; no env vars, no register calls.
+print(m.whole_graph_shapes)  # -> [(1, 256), (8, 256), (1, 512), (1, 1024)]
+"
+```
+
+See `## ARM (Apple Silicon / Linux ARM) — v0.2` below for the full path
+table.
 
 ## Headline (v0.1.0)
 
@@ -67,8 +81,8 @@ HF eager FP32 on the 256-sequence OAS-distribution dataset
 
 | Variant | esm-cpp | hf-eager-fp32 | Speedup |
 |---|---:|---:|---:|
-| 650M / uniform 8×256 (Phase-13, `ESM_APPLE_ANE_GRAPH=on`) | **459 ms** | 4617 ms | **10.05× HF** |
-| 650M / uniform 8×256 (Phase-11, `ESM_APPLE_AMX=on`) | 1.74 s | 3.88 s | 2.23× HF |
+| 650M / uniform 8×256 (Phase-14 auto-load whole-graph) | **459 ms** | 4617 ms | **10.05× HF** |
+| 650M / uniform 8×256 (Phase-14 auto-load AMX-fp16; varlen fallback) | 1.74 s | 3.88 s | 2.23× HF |
 | 650M / uniform 8×256 (Phase-10, SDOT default) | 2.17 s | 3.88 s | 1.79× HF |
 | 650M / uniform 8×256 (Phase-9) | 2.92 s | 3.80 s | 1.45× HF |
 | 650M / varlen (Phase-9, SDOT) | 37.8 s | 150.1 s | **3.97× HF** |
@@ -81,7 +95,7 @@ HF eager FP32 on the 256-sequence OAS-distribution dataset
 
 | Shape | Recommended path | Headline |
 |---|---|---|
-| Uniform (B, L) with a built artifact | Phase-13 whole-graph CoreML (`ESM_APPLE_ANE_GRAPH=on`) | 10.05× HF at 650M @ 8×256 |
+| Uniform (B, L) with a fetched artifact | Phase-13 whole-graph CoreML (auto-engages after `esm-cpp-fetch-artifacts`) | 10.05× HF at 650M @ 8×256 |
 | Varlen / cu_seqlens packed | Phase-11 AMX-fp16 (`ESM_APPLE_AMX=on`) | 4.53× HF at 650M / OAS |
 | Default (no env, no artifacts) | NEON SDOT (Phase-10) | 1.79× HF at 650M @ 8×256 |
 
@@ -145,36 +159,36 @@ ISA is auto-detected). Notes:
   only AMX win. There is no `cblas` half-precision GEMM, so the BNNSGraph
   compiled-graph pipeline is the only path that delivers it.
 
-- **Phase 13 whole-graph CoreML (`ESM_APPLE_ANE_GRAPH=on`)** — ONE
-  `.mlmodelc` for the entire ESM-2 forward (33 encoder layers + LM head),
-  built at convert time from a clean traced PyTorch wrapper
+- **Phase 13 whole-graph CoreML (auto-engages when artifacts present)** —
+  ONE `.mlmodelc` for the entire ESM-2 forward (33 encoder layers + LM
+  head), built at convert time from a clean traced PyTorch wrapper
   (`tools/esm_traceable.py`) loaded with HF weights. The runtime is a small
   Objective-C++ MLModel bridge (`src/apple_whole_graph.mm`) — one MLModel
   kept hot per (B, L) shape registration, op-fused across the full graph,
   zero per-Linear context switching. **650M @ uniform 8×256: 459 ms p50 =
   10.05× HF eager FP32**, 3.78× over Phase-11 AMX. Quality vs HF FP32:
   corr 0.999998, argmax 1.000, PPPL drift < 0.001 on the 25-protein
-  holdout subset. Reproduction:
+  holdout subset. Reproduction (Phase 14 zero-config):
 
   ```
-  # 1. Build artifact at convert time (Python 3.12 + coremltools 9):
-  /path/to/py3.12/python tools/build_whole_graph_artifacts.py \
-      --model facebook/esm2_t33_650M_UR50D \
-      --shapes 8x256 \
-      --out weights/esm2_650m.whole-graph \
-      --precision fp16 --compute-units CPU_AND_NE
-  # 2. Use at runtime (3.14 runtime needs zero coremltools):
-  m = esm_cpp.Model.load_from_safetensors(...)
-  m.load_whole_graph_artifact(
-      "weights/esm2_650m.whole-graph/B-8_L-256/whole_graph.mlmodelc",
-      batch=8, seq_len=256, compute_units="cpu_and_ne")
-  # ESM_APPLE_ANE_GRAPH=on engages the path under matching (B, L);
-  # mixed-length batches and unregistered shapes fall through to Phase-11 AMX.
+  pip install esm-cpp
+  esm-cpp-fetch-artifacts --model esm2_t33_650M  # pulls ~5 GB
+  python -c "
+  import esm_cpp
+  m = esm_cpp.Model.load_from_safetensors('<path>/model.safetensors')
+  out = m.forward_scheduled([ids_a, ids_b, ...])  # auto-engages
+  "
   ```
+
+  No env vars required. Set `ESM_APPLE_ANE_GRAPH=off` to disable.
+  Mixed-length / varlen batches fall through to the Phase-11 AMX path
+  automatically (also auto-loaded from the same fetch). Power users who
+  want a custom artifact location call `model.load_whole_graph_artifact(...)`
+  explicitly.
 
   This is the **uniform-shape headline on M3**. Varlen / cu_seqlens stays
   on the Phase-11 AMX path until a whole-graph varlen formulation lands
-  (carry-forward; see `notes/phase13.md`).
+  (carry-forward; see `notes/phase13.md`, `notes/phase14.md`).
 - **Phase 12 ANE-fp16 (`ESM_APPLE_ANE=on`) — wired but experimental, default OFF.**
   Per-Linear `.mlmodelc` artifacts targeted at the Neural Engine
   (`tools/build_amx_artifacts.py --compute-units CPU_AND_NE --buckets …`). Per-shape
