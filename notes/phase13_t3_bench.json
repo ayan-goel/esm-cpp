@@ -1,0 +1,30 @@
+{
+  "phase": 13,
+  "task": "T3",
+  "model": "facebook/esm2_t33_650M_UR50D",
+  "shape": {"batch": 8, "seq_len": 256},
+  "hardware": "M3 Pro (M3 12-core, macOS)",
+  "results_ms_p50": {
+    "hf_eager_fp32": 4617,
+    "phase11_amx_fp16_per_linear": null,
+    "coremltools_predict_cpu_and_ne": 705.79,
+    "coremltools_predict_all": 628.19,
+    "cpp_bridge_cpu_and_ne": 620.41,
+    "cpp_bridge_all": 674.54
+  },
+  "speedups_vs_hf_eager": {
+    "phase11_amx_baseline_per_claudemd": 2.32,
+    "coremltools_predict_cpu_and_ne": 6.54,
+    "coremltools_predict_all": 7.35,
+    "cpp_bridge_cpu_and_ne": 7.44,
+    "cpp_bridge_all": 6.85
+  },
+  "quality_vs_hf_fp32": {
+    "corr": 0.999998,
+    "argmax_agreement": 1.0,
+    "fp16_compute_precision": true
+  },
+  "artifact_size_mb": 1303,
+  "T3_target": ">= 4x HF (<= 970 ms); minimum >= 1.5x Phase-11 AMX",
+  "T3_outcome": "PASS — 7.45x HF / 2.69x over Phase-11 AMX baseline; far above both target and minimum"
+}

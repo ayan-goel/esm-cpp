@@ -9,6 +9,7 @@
 
 #include "esm_cpp/apple_amx.h"
 #include "esm_cpp/apple_ane.h"
+#include "esm_cpp/apple_whole_graph.h"
 #include "esm_cpp/batch.h"
 #include "esm_cpp/observer.h"
 #include "esm_cpp/quant.h"
@@ -122,6 +123,32 @@ class Model {
   // ane_* vectors (sorted ascending by M). Apple-only; returns the count of
   // loaded contexts (0 elsewhere). Path engaged via ESM_APPLE_ANE=on.
   std::size_t LoadAneArtifacts(const std::string& dir);
+
+  // Phase 13: load a whole-graph CoreML artifact (one MLModel for the entire
+  // ESM forward) for the fixed shape (B, L). `dir` is a path to a
+  // `.mlmodelc` bundle built by tools/build_whole_graph_artifacts.py.
+  // Returns true on success; false on Apple-non-availability or invalid
+  // artifact. The engine routes through the artifact in
+  // ForwardWholeGraph when (a) `ESM_APPLE_ANE_GRAPH=on`, (b) the runtime
+  // shape matches a loaded (B, L) registration, and (c) attention_mask
+  // matches the int32 1/0 contract. Multiple artifacts may be registered;
+  // shape lookup is O(N) over registrations (we expect N ≤ ~8).
+  // Apple-only — returns false on Linux ARM / non-Apple builds.
+  bool LoadWholeGraphArtifact(const std::string& dir, int B, int L,
+                              WholeGraphComputeUnits cu =
+                                  WholeGraphComputeUnits::kCpuAndNeuralEngine);
+
+  // Phase 13: whole-graph forward. Runs the registered (B, L) CoreML graph
+  // exactly once. Inputs are row-major int32 tensors of length B*L. Returns
+  // a flat [B*L*vocab_size] fp32 logits buffer. Returns an empty vector +
+  // sets `*ok=false` on missing (B, L) artifact, non-Apple build, or runtime
+  // error; callers should fall back to ForwardBatch / ForwardScheduled.
+  // The intent is that the public Python/C++ dispatch in ForwardScheduled
+  // calls ForwardWholeGraph when the env gate + shape match are both true.
+  std::vector<float> ForwardWholeGraph(
+      std::span<const std::int32_t> input_ids,
+      std::span<const std::int32_t> attention_mask, int B, int L,
+      bool* ok = nullptr) const;
 
   const Config& config() const { return cfg_; }
 
@@ -247,6 +274,16 @@ class Model {
   // Phase 12: per-bucket ANE contexts for lm_head.dense (empty on Linux ARM).
   std::vector<std::unique_ptr<esm::AppleAneContext>> ane_lm_dense_;
   // lm_head.decoder.weight is tied to embed_ — we reuse embed_ directly.
+
+  // Phase 13: registered whole-graph CoreML contexts, keyed by (B, L). Stays
+  // empty on Linux ARM / non-Apple. Lookup is linear scan — N is small
+  // (typically 1-8 shape registrations).
+  struct WholeGraphReg {
+    int B;
+    int L;
+    std::unique_ptr<esm::AppleWholeGraphContext> ctx;
+  };
+  std::vector<WholeGraphReg> whole_graph_;
 
   // Per-Model scratch arena. Mutable because Forward is logically const
   // (the model state doesn't change), but the arena bumps and resets.

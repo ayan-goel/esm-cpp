@@ -376,6 +376,47 @@ std::size_t Model::LoadAmxArtifacts(const std::string& dir) {
   return loaded;
 }
 
+bool Model::LoadWholeGraphArtifact(const std::string& dir, int B, int L,
+                                   WholeGraphComputeUnits cu) {
+  // Replace any existing registration at the same (B, L) — convenient when
+  // a benchmark wants to A/B compute-units without restarting.
+  for (auto& reg : whole_graph_) {
+    if (reg.B == B && reg.L == L) {
+      auto ctx = AppleWholeGraphContext::LoadFromDir(dir, B, L, cfg_.vocab_size, cu);
+      if (!ctx) return false;
+      reg.ctx = std::move(ctx);
+      return true;
+    }
+  }
+  auto ctx = AppleWholeGraphContext::LoadFromDir(dir, B, L, cfg_.vocab_size, cu);
+  if (!ctx) return false;
+  whole_graph_.push_back(WholeGraphReg{B, L, std::move(ctx)});
+  return true;
+}
+
+std::vector<float> Model::ForwardWholeGraph(
+    std::span<const std::int32_t> input_ids,
+    std::span<const std::int32_t> attention_mask, int B, int L,
+    bool* ok) const {
+  auto report = [ok](bool good) { if (ok) *ok = good; };
+  const std::size_t n = static_cast<std::size_t>(B) * L;
+  if (input_ids.size() != n || attention_mask.size() != n) {
+    report(false);
+    return {};
+  }
+  const AppleWholeGraphContext* ctx = nullptr;
+  for (const auto& reg : whole_graph_) {
+    if (reg.B == B && reg.L == L) { ctx = reg.ctx.get(); break; }
+  }
+  if (ctx == nullptr) { report(false); return {}; }
+  std::vector<float> logits(n * static_cast<std::size_t>(cfg_.vocab_size));
+  auto* mut = const_cast<AppleWholeGraphContext*>(ctx);
+  auto status = mut->Execute(input_ids.data(), attention_mask.data(), logits.data());
+  if (!status.ok()) { report(false); return {}; }
+  report(true);
+  return logits;
+}
+
 void Model::SaveToGguf(const std::string& path) const {
   const int d = cfg_.hidden_size;
   const int ffn = cfg_.intermediate_size;
@@ -1121,6 +1162,59 @@ std::vector<std::vector<float>> Model::ForwardScheduled(
   if (!attention_masks.empty() && attention_masks.size() != N) {
     throw std::runtime_error("attention_masks/input_ids batch size mismatch");
   }
+
+  // Phase 13: whole-graph CoreML opt-in path. Activates only when every input
+  // sequence has the same length L AND we have a registered (N, L) artifact
+  // AND ESM_APPLE_ANE_GRAPH=on. Defaults preserve every other forward path.
+  // Varlen / mixed-length batches fall through to the standard scheduler.
+  if (!whole_graph_.empty() && std::getenv("ESM_APPLE_ANE_GRAPH") != nullptr) {
+    bool uniform = true;
+    const int L = static_cast<int>(input_ids[0].size());
+    for (const auto& ids : input_ids) {
+      if (static_cast<int>(ids.size()) != L) { uniform = false; break; }
+    }
+    if (uniform) {
+      const int B = static_cast<int>(N);
+      // Look up a matching shape registration first; only pack if found.
+      bool have_shape = false;
+      for (const auto& reg : whole_graph_) {
+        if (reg.B == B && reg.L == L) { have_shape = true; break; }
+      }
+      if (have_shape) {
+        std::vector<std::int32_t> ids_packed(static_cast<std::size_t>(B) * L);
+        std::vector<std::int32_t> mask_packed(static_cast<std::size_t>(B) * L);
+        for (int b = 0; b < B; ++b) {
+          const auto& ids_b = input_ids[static_cast<std::size_t>(b)];
+          const std::size_t off = static_cast<std::size_t>(b) * L;
+          std::memcpy(ids_packed.data() + off, ids_b.data(),
+                      static_cast<std::size_t>(L) * sizeof(std::int32_t));
+          if (!attention_masks.empty() &&
+              !attention_masks[static_cast<std::size_t>(b)].empty()) {
+            const auto& m = attention_masks[static_cast<std::size_t>(b)];
+            std::memcpy(mask_packed.data() + off, m.data(),
+                        static_cast<std::size_t>(L) * sizeof(std::int32_t));
+          } else {
+            for (int t = 0; t < L; ++t) mask_packed[off + t] = 1;
+          }
+        }
+        bool ok = false;
+        auto logits_flat = ForwardWholeGraph(
+            ids_packed, mask_packed, B, L, &ok);
+        if (ok) {
+          std::vector<std::vector<float>> outputs(N);
+          const std::size_t per_seq = static_cast<std::size_t>(L) * cfg_.vocab_size;
+          for (int b = 0; b < B; ++b) {
+            outputs[static_cast<std::size_t>(b)].assign(
+                logits_flat.begin() + static_cast<std::ptrdiff_t>(b * per_seq),
+                logits_flat.begin() + static_cast<std::ptrdiff_t>((b + 1) * per_seq));
+          }
+          return outputs;
+        }
+        // Fall through on Execute failure (logged inside the bridge).
+      }
+    }
+  }
+
   std::vector<int> lengths;
   lengths.reserve(N);
   for (const auto& ids : input_ids) {

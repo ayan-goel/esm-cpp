@@ -179,6 +179,32 @@ PYBIND11_MODULE(_core, m) {
            "pads runtime M to the nearest bucket (or chunks at the max bucket "
            "when M exceeds it). ANE wins on shapes that fit; missing buckets "
            "/ over-large M / non-Apple all fall back to AMX (if loaded) or SDOT.")
+      .def("load_whole_graph_artifact",
+           [](esm::Model& self, const std::string& dir, int B, int L,
+              const std::string& compute_units) {
+             auto cu = esm::WholeGraphComputeUnits::kCpuAndNeuralEngine;
+             if (compute_units == "cpu_only") {
+               cu = esm::WholeGraphComputeUnits::kCpuOnly;
+             } else if (compute_units == "cpu_and_ne") {
+               cu = esm::WholeGraphComputeUnits::kCpuAndNeuralEngine;
+             } else if (compute_units == "all") {
+               cu = esm::WholeGraphComputeUnits::kAll;
+             } else {
+               throw std::invalid_argument(
+                   "compute_units must be one of {cpu_only, cpu_and_ne, all}");
+             }
+             return self.LoadWholeGraphArtifact(dir, B, L, cu);
+           },
+           py::arg("dir"), py::arg("batch"), py::arg("seq_len"),
+           py::arg("compute_units") = std::string("cpu_and_ne"),
+           py::call_guard<py::gil_scoped_release>(),
+           "Phase 13: register a whole-graph CoreML artifact (one MLModel for "
+           "the entire ESM forward) for fixed shape (batch, seq_len). `dir` "
+           "is a `.mlmodelc` bundle produced by "
+           "`tools/build_whole_graph_artifacts.py`. Apple-only; returns False "
+           "elsewhere. Engaged via ESM_APPLE_ANE_GRAPH=on in ForwardScheduled "
+           "when all sequences share a length L AND there's a registered "
+           "(B, L). Falls through to the default scheduled path otherwise.")
       .def_property_readonly("config", &esm::Model::config)
       .def("set_first_block_fc1_fp16", &esm::Model::SetFirstBlockFc1Fp16,
            py::arg("enabled"),
