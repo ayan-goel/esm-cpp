@@ -144,6 +144,7 @@ add_library(esm_cpp_core STATIC
   src/apple_amx.cpp
   src/apple_ane.mm
   src/apple_whole_graph.mm
+  src/artifact_cache.cpp
 )
 target_include_directories(esm_cpp_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
