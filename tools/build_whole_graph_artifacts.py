@@ -41,6 +41,7 @@ import coremltools as ct
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from esm_traceable import EsmCfg, EsmMaskedLMTraceable, load_from_hf
+from _artifact_manifest import write_manifest as _write_manifest
 
 
 def parse_shapes(s: str) -> list[tuple[int, int]]:
@@ -67,7 +68,8 @@ def corr(a: np.ndarray, b: np.ndarray) -> float:
 
 def build_one(hf, tok, cfg: EsmCfg, batch: int, seq_len: int,
               out_dir: Path, precision: str, compute_units: str,
-              corr_threshold: float, force: bool, seed: int) -> bool:
+              corr_threshold: float, force: bool, seed: int,
+              model_id: str = "") -> bool:
     tag = f"B-{batch}_L-{seq_len}"
     target_dir = out_dir / tag
     bundle = target_dir / "whole_graph.mlmodelc"
@@ -164,6 +166,14 @@ def build_one(hf, tok, cfg: EsmCfg, batch: int, seq_len: int,
     # Keep the .mlpackage alongside the .mlmodelc so coremltools can re-open
     # the model for predict/quality runs (the .mlmodelc has no Manifest.json
     # and can't be re-loaded from Python).
+    _write_manifest(
+        target_dir,
+        kind="whole-graph",
+        model_id=model_id,
+        precision=precision,
+        compute_units=compute_units,
+        shape=(batch, seq_len),
+    )
     print(f"  [ok] {tag}")
     return True
 
@@ -194,7 +204,8 @@ def main() -> int:
     for batch, seq_len in shapes:
         ok = build_one(
             hf, tok, cfg, batch, seq_len, args.out, args.precision,
-            args.compute_units, args.corr_threshold, args.force, args.seed)
+            args.compute_units, args.corr_threshold, args.force, args.seed,
+            model_id=args.model)
         if ok:
             n_ok += 1
     print(f"[done] built {n_ok}/{len(shapes)} shapes -> {args.out}")

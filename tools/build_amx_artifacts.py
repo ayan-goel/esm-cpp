@@ -241,6 +241,24 @@ def main() -> int:
     print(f"\nDone: built {built} new, skipped {skipped} existing, "
           f"max rel err {worst_err:.4f}, {elapsed:.1f}s, "
           f"total size {total_bytes / 1e6:.0f} MB", flush=True)
+
+    # Phase 14: stamp a manifest so the C++ auto-load can detect stale
+    # artifacts (trace_sha mismatch). One manifest per artifact root —
+    # for the bucket variant we write one manifest per M-<m>/ subdir.
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from _artifact_manifest import write_manifest as _write_manifest
+        for sub, _fixed_m, _m_probe in groups:
+            sub_out = args.out / sub if sub else args.out
+            _write_manifest(
+                sub_out,
+                kind="amx-fp16",
+                model_id=str(args.safetensors),  # path-as-id; the publish tool overrides
+                precision=args.precision,
+                compute_units=args.compute_units,
+            )
+    except Exception as e:
+        print(f"warning: manifest write failed: {e}", flush=True)
     return 0
 
 

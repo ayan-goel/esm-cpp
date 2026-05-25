@@ -146,6 +146,34 @@ add_library(esm_cpp_core STATIC
   src/apple_whole_graph.mm
   src/artifact_cache.cpp
 )
+
+# Phase 14: stamp the artifact trace SHA into a generated header. The
+# algorithm matches tools/_artifact_manifest.py's compute_trace_sha
+# exactly: for each present input file, compute hex SHA256 of the bytes;
+# join "<rel>=<hex>" parts with '|'; SHA256 the joined string.
+set(_artifact_trace_inputs
+  tools/esm_traceable.py
+  tools/build_whole_graph_artifacts.py
+  tools/build_amx_artifacts.py)
+set(_artifact_trace_parts "")
+foreach(_f ${_artifact_trace_inputs})
+  set(_path "${CMAKE_CURRENT_SOURCE_DIR}/${_f}")
+  if(EXISTS "${_path}")
+    file(SHA256 "${_path}" _file_sha)
+    if(_artifact_trace_parts STREQUAL "")
+      set(_artifact_trace_parts "${_f}=${_file_sha}")
+    else()
+      set(_artifact_trace_parts "${_artifact_trace_parts}|${_f}=${_file_sha}")
+    endif()
+  endif()
+endforeach()
+string(SHA256 ESM_ARTIFACT_TRACE_SHA "${_artifact_trace_parts}")
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmake/artifact_trace_sha.h.in
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/esm_cpp/artifact_trace_sha.h
+  @ONLY)
+target_include_directories(esm_cpp_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>)
 target_include_directories(esm_cpp_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_link_libraries(esm_cpp_core PRIVATE esm_warnings nlohmann_json::nlohmann_json)

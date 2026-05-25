@@ -241,6 +241,16 @@ TEST(AppleWholeGraph, AutoLoadFromSiblingDir) {
   fs::create_directory_symlink(art_abs, bundle_link, ec);
   ASSERT_FALSE(ec) << "symlink whole_graph fixture failed: " << ec.message();
 
+  // Also link the manifest if the fixture has one (Phase 14 freshness
+  // check). The manifest sits next to the .mlmodelc bundle, not inside it.
+  const fs::path real_manifest = art_abs.parent_path() / "esm_cpp_artifact.json";
+  if (fs::is_regular_file(real_manifest, ec)) {
+    fs::create_symlink(real_manifest,
+                        bundle_link.parent_path() / "esm_cpp_artifact.json",
+                        ec);
+    // ignore ec — the freshness check is informational, not fatal
+  }
+
   // Force the cache dir to a nonexistent path so only the sibling is found.
   EnvScope cache_off("ESM_CPP_CACHE_DIR", (td.path() / "nope").string());
   EnvScope wg_default("ESM_APPLE_ANE_GRAPH", nullptr);

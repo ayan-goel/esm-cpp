@@ -1,12 +1,14 @@
 #include "esm_cpp/model.h"
 
 #include "esm_cpp/artifact_cache.h"
+#include "esm_cpp/artifact_trace_sha.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -380,6 +382,49 @@ std::size_t Model::LoadAmxArtifacts(const std::string& dir) {
   return loaded;
 }
 
+namespace {
+// Cheap JSON field reader for the artifact manifest. We only need a single
+// string field (`trace_sha`), so pulling in nlohmann_json here is overkill.
+// Returns empty string on any parse failure — caller treats that as "no
+// manifest, no warning."
+std::string ReadManifestTraceSha(const std::filesystem::path& manifest_path) {
+  std::ifstream f(manifest_path);
+  if (!f.is_open()) return "";
+  std::string content((std::istreambuf_iterator<char>(f)),
+                       std::istreambuf_iterator<char>());
+  // Look for "trace_sha": "<value>" — simple substring scan; manifest is
+  // always written by our own helper so the format is stable.
+  const std::string key = "\"trace_sha\"";
+  auto kp = content.find(key);
+  if (kp == std::string::npos) return "";
+  auto colon = content.find(':', kp + key.size());
+  if (colon == std::string::npos) return "";
+  auto q1 = content.find('"', colon + 1);
+  if (q1 == std::string::npos) return "";
+  auto q2 = content.find('"', q1 + 1);
+  if (q2 == std::string::npos) return "";
+  return content.substr(q1 + 1, q2 - q1 - 1);
+}
+
+// Warn-once helper — same artifact path shouldn't double-log if the user
+// somehow auto-loads twice.
+void CheckManifestFreshness(const std::filesystem::path& manifest_path,
+                            const char* kind_label) {
+  const std::string artifact_sha = ReadManifestTraceSha(manifest_path);
+  if (artifact_sha.empty()) return;  // no manifest or unparseable -> silent
+  if (artifact_sha == kArtifactTraceSha) return;
+  std::fprintf(stderr,
+               "[esm_cpp] warning: %s artifact at %s was built against a "
+               "different trace_sha (%s vs %s for this build). The artifact "
+               "is still being used — refresh via "
+               "`esm-cpp-fetch-artifacts --model <id>` if you see quality "
+               "regressions.\n",
+               kind_label, manifest_path.parent_path().c_str(),
+               artifact_sha.substr(0, 12).c_str(),
+               std::string(kArtifactTraceSha).substr(0, 12).c_str());
+}
+}  // namespace
+
 void Model::TryAutoLoadAppleArtifacts(const std::string& weights_path) {
 #ifdef ESM_APPLE_AMX_AVAILABLE
   namespace fs = std::filesystem;
@@ -406,7 +451,10 @@ void Model::TryAutoLoadAppleArtifacts(const std::string& weights_path) {
           std::fprintf(stderr, "[autoload]   amx %s -> %zu contexts\n",
                        amx_dir.c_str(), n);
         }
-        if (n > 0) amx_artifacts_path_ = amx_dir.string();
+        if (n > 0) {
+          amx_artifacts_path_ = amx_dir.string();
+          CheckManifestFreshness(amx_dir / "esm_cpp_artifact.json", "amx-fp16");
+        }
       }
     }
 
@@ -444,7 +492,11 @@ void Model::TryAutoLoadAppleArtifacts(const std::string& weights_path) {
             std::fprintf(stderr, "[autoload]   wg %s (B=%d L=%d) -> %d\n",
                          bundle.c_str(), B, L, ok ? 1 : 0);
           }
-          if (ok) ++registered;
+          if (ok) {
+            ++registered;
+            CheckManifestFreshness(entry.path() / "esm_cpp_artifact.json",
+                                    "whole-graph");
+          }
         }
         if (registered > 0) {
           whole_graph_path_ = wg_root.string();
