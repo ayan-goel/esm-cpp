@@ -1,0 +1,84 @@
+{
+  "model": "esm2_t30_150M",
+  "hf_id": "facebook/esm2_t30_150M_UR50D",
+  "num_quality": 8,
+  "num_pppl": 3,
+  "logit_quality": {
+    "rows": [
+      {
+        "idx": 0,
+        "L": 67,
+        "corr": 0.9999996739474373,
+        "argmax_agree": 1.0,
+        "finite": true
+      },
+      {
+        "idx": 1,
+        "L": 78,
+        "corr": 0.9999979017366125,
+        "argmax_agree": 1.0,
+        "finite": true
+      },
+      {
+        "idx": 2,
+        "L": 131,
+        "corr": 0.9999958141795768,
+        "argmax_agree": 1.0,
+        "finite": true
+      },
+      {
+        "idx": 3,
+        "L": 241,
+        "corr": 0.999999596221529,
+        "argmax_agree": 1.0,
+        "finite": true
+      },
+      {
+        "idx": 4,
+        "L": 144,
+        "corr": 0.9999956425211809,
+        "argmax_agree": 1.0,
+        "finite": true
+      },
+      {
+        "idx": 5,
+        "L": 149,
+        "corr": 0.999997568186,
+        "argmax_agree": 1.0,
+        "finite": true
+      },
+      {
+        "idx": 6,
+        "L": 106,
+        "corr": 0.9999975824908681,
+        "argmax_agree": 1.0,
+        "finite": true
+      },
+      {
+        "idx": 7,
+        "L": 126,
+        "corr": 0.9999992210969292,
+        "argmax_agree": 1.0,
+        "finite": true
+      }
+    ],
+    "min_corr": 0.9999956425211809,
+    "median_corr": 0.9999977421137403,
+    "min_argmax_agree": 1.0,
+    "median_argmax_agree": 1.0,
+    "any_nan": false
+  },
+  "pppl_drift": {
+    "fp32_pppl": 4.686606998925309,
+    "whole_graph_pppl": 4.686212871280496,
+    "drift": 0.00039412764481294715,
+    "fp32_elapsed_s": 57.224610125180334,
+    "wg_elapsed_s": 2.5064392504282296,
+    "num_sequences": 3
+  },
+  "gates": {
+    "logit_corr_min_pass": true,
+    "argmax_min_pass": true,
+    "pppl_drift_pass": true
+  }
+}

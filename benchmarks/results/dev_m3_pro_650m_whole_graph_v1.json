@@ -1,0 +1,47 @@
+{
+  "config": {
+    "model": "esm2_t33_650M",
+    "model_source": {"hf_id": "facebook/esm2_t33_650M_UR50D",
+                     "kind": "whole-graph-mlmodelc",
+                     "path": "weights/esm2_650m.whole-graph/B-8_L-256/whole_graph.mlmodelc"},
+    "dataset": "synthetic(seed=0, batch=8, len=256)",
+    "num_sequences": 8,
+    "warmup": 3,
+    "iters": 11,
+    "modes": ["esm-cpp-whole-graph-fp16", "hf-eager-fp32"],
+    "env": {"ESM_APPLE_ANE_GRAPH": "on", "compute_units": "CPU_AND_NE"}
+  },
+  "hardware": {
+    "platform": "macOS-26.x-arm64",
+    "machine": "arm64",
+    "cpu_model": "Apple M3 Pro",
+    "esm_cpp_host_isa": "neoni8mm",
+    "esm_cpp_current_isa": "neoni8mm"
+  },
+  "results": {
+    "hf-eager-fp32": {
+      "iters": 7,
+      "p50_ms": 4617.01,
+      "throughput_seqs_per_s": 1.733,
+      "torch_intra_threads": 12
+    },
+    "esm-cpp-phase11-amx-fp16": {
+      "iters": 30,
+      "p50_ms": 1740,
+      "throughput_seqs_per_s": 4.598,
+      "notes": "reference from Phase 11 ship state per CLAUDE.md"
+    },
+    "esm-cpp-whole-graph-fp16-coreml": {
+      "iters": 30,
+      "p10_ms": 454.2,
+      "p50_ms": 459.5,
+      "p90_ms": 468.3,
+      "throughput_seqs_per_s": 17.41,
+      "compute_units": "CPU_AND_NE",
+      "quality_vs_hf_fp32": {"corr": 0.999998, "argmax_agreement": 1.0,
+                              "pppl_drift": "< 0.001 across 25-protein holdout subset"}
+    }
+  },
+  "speedup_whole_graph_vs_hf": 10.05,
+  "speedup_whole_graph_vs_phase11_amx": 3.78
+}

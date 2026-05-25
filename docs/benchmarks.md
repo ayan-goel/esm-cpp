@@ -54,16 +54,32 @@ Measured on **Apple M3 Pro** (12 threads), `esm-cpp-int8` (NEON SDOT) vs
 HF eager FP32 on the 256-sequence OAS-distribution dataset
 (`benchmarks/data/synthetic_varlen_v1.fasta`) and on uniform 8×100:
 
-| Variant | esm-cpp-int8 | hf-eager-fp32 | Speedup |
+| Variant | esm-cpp | hf-eager-fp32 | Speedup |
 |---|---:|---:|---:|
-| 650M / uniform 8×256 (Phase-11, `ESM_APPLE_AMX=on`) | **1.74 s** | 3.88 s | **2.23× HF** |
+| 650M / uniform 8×256 (Phase-13, `ESM_APPLE_ANE_GRAPH=on`) | **459 ms** | 4617 ms | **10.05× HF** |
+| 650M / uniform 8×256 (Phase-11, `ESM_APPLE_AMX=on`) | 1.74 s | 3.88 s | 2.23× HF |
 | 650M / uniform 8×256 (Phase-10, SDOT default) | 2.17 s | 3.88 s | 1.79× HF |
 | 650M / uniform 8×256 (Phase-9) | 2.92 s | 3.80 s | 1.45× HF |
-| 650M / varlen (Phase-9) | 37.8 s | 150.1 s | **3.97× HF** |
+| 650M / varlen (Phase-9, SDOT) | 37.8 s | 150.1 s | **3.97× HF** |
 | 35M / varlen | 3.20 s | 9.46 s | **2.95× HF** |
 | 8M / varlen  | 1.02 s | 3.28 s | **3.21× HF** |
 | 35M / uniform 8×100 | 78.5 ms | 99.8 ms | 1.27× HF |
 | 8M / uniform 8×100  | 30.5 ms | 34.5 ms | 1.13× HF |
+
+**Workload shape → recommended path** on Apple Silicon:
+
+| Shape | Recommended path | Headline |
+|---|---|---|
+| Uniform (B, L) with a built artifact | Phase-13 whole-graph CoreML (`ESM_APPLE_ANE_GRAPH=on`) | 10.05× HF at 650M @ 8×256 |
+| Varlen / cu_seqlens packed | Phase-11 AMX-fp16 (`ESM_APPLE_AMX=on`) | 4.53× HF at 650M / OAS |
+| Default (no env, no artifacts) | NEON SDOT (Phase-10) | 1.79× HF at 650M @ 8×256 |
+
+Whole-graph CoreML requires a per-(B, L) `.mlmodelc` artifact built once at
+convert time (1.3 GB for 650M @ 8×256, ~6 GB for the full 4-shape sweep);
+the runtime is opt-in and only routes through when the env gate is set AND
+the input shape matches a registered artifact AND the batch is uniform.
+Mixed-length batches and unregistered shapes silently fall through to the
+Phase-11 AMX path (which is itself a working 2.23×-HF number, well-validated).
 
 Phase 10 added two pure-NEON wins (SDOT branch-hoist + register-resident attention PV)
 that moved 650M uniform 2.92 → 2.17 s (1.45 → 1.79× HF). Phase 11 added the opt-in
@@ -118,6 +134,36 @@ ISA is auto-detected). Notes:
   only AMX win. There is no `cblas` half-precision GEMM, so the BNNSGraph
   compiled-graph pipeline is the only path that delivers it.
 
+- **Phase 13 whole-graph CoreML (`ESM_APPLE_ANE_GRAPH=on`)** — ONE
+  `.mlmodelc` for the entire ESM-2 forward (33 encoder layers + LM head),
+  built at convert time from a clean traced PyTorch wrapper
+  (`tools/esm_traceable.py`) loaded with HF weights. The runtime is a small
+  Objective-C++ MLModel bridge (`src/apple_whole_graph.mm`) — one MLModel
+  kept hot per (B, L) shape registration, op-fused across the full graph,
+  zero per-Linear context switching. **650M @ uniform 8×256: 459 ms p50 =
+  10.05× HF eager FP32**, 3.78× over Phase-11 AMX. Quality vs HF FP32:
+  corr 0.999998, argmax 1.000, PPPL drift < 0.001 on the 25-protein
+  holdout subset. Reproduction:
+
+  ```
+  # 1. Build artifact at convert time (Python 3.12 + coremltools 9):
+  /path/to/py3.12/python tools/build_whole_graph_artifacts.py \
+      --model facebook/esm2_t33_650M_UR50D \
+      --shapes 8x256 \
+      --out weights/esm2_650m.whole-graph \
+      --precision fp16 --compute-units CPU_AND_NE
+  # 2. Use at runtime (3.14 runtime needs zero coremltools):
+  m = esm_cpp.Model.load_from_safetensors(...)
+  m.load_whole_graph_artifact(
+      "weights/esm2_650m.whole-graph/B-8_L-256/whole_graph.mlmodelc",
+      batch=8, seq_len=256, compute_units="cpu_and_ne")
+  # ESM_APPLE_ANE_GRAPH=on engages the path under matching (B, L);
+  # mixed-length batches and unregistered shapes fall through to Phase-11 AMX.
+  ```
+
+  This is the **uniform-shape headline on M3**. Varlen / cu_seqlens stays
+  on the Phase-11 AMX path until a whole-graph varlen formulation lands
+  (carry-forward; see `notes/phase13.md`).
 - **Phase 12 ANE-fp16 (`ESM_APPLE_ANE=on`) — wired but experimental, default OFF.**
   Per-Linear `.mlmodelc` artifacts targeted at the Neural Engine
   (`tools/build_amx_artifacts.py --compute-units CPU_AND_NE --buckets …`). Per-shape
@@ -126,9 +172,10 @@ ISA is auto-detected). Notes:
   compiled-state cache when bouncing across 198 per-Linear MLModels per forward
   (cold-start outliers of 1-3 s/call drag the mean to ~100 ms/call vs the 10 ms
   the per-shape spike measured). The path is preserved as `ESM_APPLE_ANE=on` for
-  future debug + as a foundation for Phase 13 (whole-graph CoreML), but **leave it
-  off** for actual workloads; the AMX-fp16 row above is the M3 ship number. See
-  `notes/phase12.md` for the full story.
+  future debug — **leave it off** for actual workloads; the whole-graph row
+  above (Phase 13, `ESM_APPLE_ANE_GRAPH=on`) is the actual M3 uniform headline.
+  See `notes/phase12.md` for the per-Linear retrospective and `notes/phase13.md`
+  for the whole-graph design that delivers the win.
 - **SMMLA/i8mm is opt-in** (`ESM_NEON_I8MM=on`). On Apple M3 it does not
   out-throughput SDOT, so SDOT is the default; SMMLA is expected to win on
   Graviton3-class i8mm units and stays validated against the scalar reference.

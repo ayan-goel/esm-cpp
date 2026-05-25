@@ -31,19 +31,22 @@ The variable-length advantage comes from the `cu_seqlens` packed-batch forward: 
 
 esm.cpp also runs on AArch64 with a hand-written NEON kernel stack — FMLA FP32, SDOT INT8 (the VNNI analog), and an opt-in SMMLA/i8mm path (the AMX analog) — runtime-dispatched the same way as x86. No Apple Accelerate dependency in the default build, so it runs on Linux ARM / AWS Graviton too.
 
-**Apple M3 Pro, ESM-2, esm-cpp-int8 (NEON SDOT) vs HF eager FP32:**
+**Apple M3 Pro, ESM-2, esm-cpp vs HF eager FP32:**
 
-| Workload | esm-cpp-int8 | hf-eager-fp32 | Speedup |
+| Workload | esm-cpp | hf-eager-fp32 | Speedup |
 |---|---:|---:|---:|
-| Variable-length 256-seq (OAS-shape), 650M | **37.8 s** | 150.1 s | **3.97× HF** |
+| Uniform 8-seq × 256-tokens, 650M, **`ESM_APPLE_ANE_GRAPH=on`** | **459 ms** | 4617 ms | **10.05× HF** |
+| Uniform 8-seq × 256-tokens, 650M, **`ESM_APPLE_AMX=on`** | 1.74 s | 3.88 s | 2.23× HF |
+| Uniform 8-seq × 256-tokens, 650M (SDOT default) | 2.17 s | 3.88 s | 1.79× HF |
+| Variable-length 256-seq (OAS-shape), 650M (SDOT, Phase-9) | **37.8 s** | 150.1 s | **3.97× HF** |
 | Variable-length 256-seq (OAS-shape), 35M | **3.20 s** | 9.46 s | **2.95× HF** |
 | Variable-length 256-seq (OAS-shape), 8M | **1.02 s** | 3.28 s | **3.21× HF** |
-| Uniform 8-seq × 256-tokens, 650M, **`ESM_APPLE_AMX=on`** | **1.74 s** | 3.88 s | **2.23× HF** |
-| Uniform 8-seq × 256-tokens, 650M (SDOT default) | 2.17 s | 3.88 s | 1.79× HF |
 | Uniform 8-seq × 100-tokens, 35M | 78.5 ms | 99.8 ms | 1.27× HF |
 | Uniform 8-seq × 100-tokens, 8M | 30.5 ms | 34.5 ms | 1.13× HF |
 
-The Phase-11 headline is the opt-in **`ESM_APPLE_AMX=on`** path: per-Linear fp16 BNNSGraph artifacts built at convert time (`tools/build_amx_artifacts.py`) and loaded at `Model.load_amx_artifacts(...)`. Routes the dense GEMMs through Apple's AMX coprocessor in fp16; the 650M GEMM bucket drops ~29% and e2e goes 1.79× → **2.23× HF**, with quality vs FP32 slightly *better* than INT8 SDOT (corr 0.99997 vs 0.99956 on 650M). The SDOT default also improved this cycle (Phase-10 SDOT branch-hoist + register-resident attention PV: 1.45× → 1.79× HF). The SMMLA/i8mm tier is opt-in (`ESM_NEON_I8MM=on`): on Apple M3 it does not out-throughput SDOT, but is expected to win on Graviton3-class cores. The whole AMX backend is compiled out on Linux ARM / Graviton — hand-written NEON / SDOT stays the default and the only Linux-ARM path.
+The Phase-13 **uniform-shape headline** is the opt-in **`ESM_APPLE_ANE_GRAPH=on`** path: ONE compiled `.mlmodelc` for the entire ESM-2 forward (33 encoder layers + LM head), built at convert time via `tools/build_whole_graph_artifacts.py` and registered at runtime via `Model.load_whole_graph_artifact(...)`. The runtime is a small Objective-C++ MLModel bridge — one MLModel kept hot per (B, L) shape, op-fused across the whole graph, dispatched to the Neural Engine + GPU via CoreML. 650M @ uniform 8×256 hits 459 ms p50 (**10.05× HF**), with quality vs FP32 strictly better than INT8 SDOT (corr 0.999998 vs 0.99956 on 650M; PPPL drift < 0.001 across the 25-protein holdout subset).
+
+The whole-graph path engages only when (a) the env gate is set, (b) all sequences in a batch share length L, and (c) a matching (B, L) artifact is registered. **Mixed-length / varlen batches fall through to the Phase-11 AMX-fp16 path** (`ESM_APPLE_AMX=on`, per-Linear fp16 BNNSGraph artifacts via `tools/build_amx_artifacts.py` and `Model.load_amx_artifacts(...)`) which delivers 2.23× HF at 650M uniform and 4.53× HF at 650M varlen. Without any opt-in env, the **NEON SDOT default** (Phase-10: branch-hoist + register-resident attention PV) gives 1.79× HF at 650M uniform / 3.97× HF at 650M varlen — and is the only Apple-runtime-free path, also the only Linux ARM / AWS Graviton path. The SMMLA/i8mm tier is opt-in (`ESM_NEON_I8MM=on`): on Apple M3 it does not out-throughput SDOT, but is expected to win on Graviton3-class cores. The whole AMX + ANE backends are compiled out on Linux ARM / Graviton — hand-written NEON / SDOT stays the default and the only Linux-ARM path.
 
 ## Install
 
