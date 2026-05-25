@@ -141,11 +141,22 @@ add_library(esm_cpp_core STATIC
   src/sched/scheduler.cpp
   src/threading/thread_pool.cpp
   src/model.cpp
+  src/apple_amx.cpp
 )
 target_include_directories(esm_cpp_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_link_libraries(esm_cpp_core PRIVATE esm_warnings nlohmann_json::nlohmann_json)
 target_compile_features(esm_cpp_core PUBLIC cxx_std_20)
+
+# Apple-AMX fp16 backend (opt-in via ESM_APPLE_AMX=on at runtime). The PUBLIC
+# define + framework link mean tests and the Python extension also see them.
+# Linux ARM / Graviton builds skip this block entirely — apple_amx.cpp's body
+# is fully #ifdef ESM_APPLE_AMX_AVAILABLE so the .o becomes empty.
+if(APPLE)
+  target_compile_definitions(esm_cpp_core PUBLIC
+    ESM_APPLE_AMX_AVAILABLE ACCELERATE_NEW_LAPACK)
+  target_link_libraries(esm_cpp_core PUBLIC "-framework Accelerate")
+endif()
 
 # Link the per-ISA kernel TUs into the static lib. The Ref TU is always
 # present; SIMD TUs contribute symbols only once Slice 3 fills the
