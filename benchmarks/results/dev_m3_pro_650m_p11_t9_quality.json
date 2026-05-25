@@ -1,0 +1,21 @@
+{
+  "model": "esm2_t33_650M",
+  "isa": "neoni8mm",
+  "num_seqs": 5,
+  "int8_vs_fp32": {
+    "min_logit_correlation": 0.9995629698293347,
+    "argmax_agreement": 1.0,
+    "any_nan": false
+  },
+  "amx_loaded": 199,
+  "amx_fp16_vs_fp32": {
+    "min_logit_correlation": 0.9999696078505789,
+    "argmax_agreement": 1.0,
+    "any_nan": false
+  },
+  "amx_fp16_vs_int8": {
+    "min_logit_correlation": 0.9994424820416548,
+    "argmax_agreement": 1.0,
+    "any_nan": false
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "model": "esm2_t30_150M",
+  "isa": "neoni8mm",
+  "num_seqs": 5,
+  "int8_vs_fp32": {
+    "min_logit_correlation": 0.9999274443036379,
+    "argmax_agreement": 1.0,
+    "any_nan": false
+  },
+  "amx_loaded": 181,
+  "amx_fp16_vs_fp32": {
+    "min_logit_correlation": 0.9999939240885832,
+    "argmax_agreement": 1.0,
+    "any_nan": false
+  },
+  "amx_fp16_vs_int8": {
+    "min_logit_correlation": 0.9999019862540318,
+    "argmax_agreement": 1.0,
+    "any_nan": false
+  }
+}
