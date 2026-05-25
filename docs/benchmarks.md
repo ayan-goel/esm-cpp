@@ -117,6 +117,18 @@ ISA is auto-detected). Notes:
   shape M=2048; BNNS dequantizes int8 → fp16 and runs a float kernel. fp16 is the
   only AMX win. There is no `cblas` half-precision GEMM, so the BNNSGraph
   compiled-graph pipeline is the only path that delivers it.
+
+- **Phase 12 ANE-fp16 (`ESM_APPLE_ANE=on`) — wired but experimental, default OFF.**
+  Per-Linear `.mlmodelc` artifacts targeted at the Neural Engine
+  (`tools/build_amx_artifacts.py --compute-units CPU_AND_NE --buckets …`). Per-shape
+  characterization (Phase 12 T1) measured 2-4× ANE-vs-AMX in isolation, but the
+  *integrated* forward is slower than AMX-fp16 because ANE thrashes its
+  compiled-state cache when bouncing across 198 per-Linear MLModels per forward
+  (cold-start outliers of 1-3 s/call drag the mean to ~100 ms/call vs the 10 ms
+  the per-shape spike measured). The path is preserved as `ESM_APPLE_ANE=on` for
+  future debug + as a foundation for Phase 13 (whole-graph CoreML), but **leave it
+  off** for actual workloads; the AMX-fp16 row above is the M3 ship number. See
+  `notes/phase12.md` for the full story.
 - **SMMLA/i8mm is opt-in** (`ESM_NEON_I8MM=on`). On Apple M3 it does not
   out-throughput SDOT, so SDOT is the default; SMMLA is expected to win on
   Graviton3-class i8mm units and stays validated against the scalar reference.
