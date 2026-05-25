@@ -170,6 +170,15 @@ PYBIND11_MODULE(_core, m) {
            "skipped; per-Linear fallback to the default INT8/FP32 path. "
            "Apple-only at runtime (returns 0 elsewhere). Engaged in the "
            "forward via ESM_APPLE_AMX=on. Returns the count of loaded contexts.")
+      .def("load_ane_artifacts", &esm::Model::LoadAneArtifacts, py::arg("dir"),
+           py::call_guard<py::gil_scoped_release>(),
+           "Phase 12: load per-Linear-per-bucket ANE CoreML artifacts built by "
+           "`build_amx_artifacts.py --compute-units CPU_AND_NE --buckets …`. "
+           "`dir` contains M-<m>/<linear>.mlmodelc subdirs. Apple-only; "
+           "returns 0 elsewhere. Engaged via ESM_APPLE_ANE=on; the dispatcher "
+           "pads runtime M to the nearest bucket (or chunks at the max bucket "
+           "when M exceeds it). ANE wins on shapes that fit; missing buckets "
+           "/ over-large M / non-Apple all fall back to AMX (if loaded) or SDOT.")
       .def_property_readonly("config", &esm::Model::config)
       .def("set_first_block_fc1_fp16", &esm::Model::SetFirstBlockFc1Fp16,
            py::arg("enabled"),

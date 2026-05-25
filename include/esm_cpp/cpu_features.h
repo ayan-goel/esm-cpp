@@ -43,6 +43,15 @@ std::optional<Isa> StringToIsa(std::string_view s);
 // Re-read on each call; returns false on non-Apple builds.
 bool ArmUseAppleAmx();
 
+// Whether to route the dense GEMMs through CoreML's Apple Neural Engine (ANE)
+// path. Apple-only, opt-in via ESM_APPLE_ANE=on. ANE delivers 2-4x over our
+// fp16-AMX path on the M values our forward uses (Phase 12 T1 characterization),
+// but requires static-shape mlmodelc artifacts built at convert time. Re-read
+// on each call; returns false on non-Apple builds. Independent of ArmUseAppleAmx
+// — if both are on AND the relevant context is loaded, ANE wins; if ANE has no
+// matching bucket for the runtime M, AMX (or SDOT default) takes over.
+bool ArmUseAppleAne();
+
 // Whether the ARM i8mm (SMMLA) INT8 kernel should engage. SMMLA is opt-in:
 // it does not beat the SDOT kernel on Apple M3 (measured), so an auto-detected
 // NeonI8mm host uses SDOT by default. SMMLA engages only on an explicit request

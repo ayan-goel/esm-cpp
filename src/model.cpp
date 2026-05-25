@@ -4,8 +4,10 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 #if (defined(__x86_64__) || defined(_M_X64)) && defined(__F16C__)
 #include <immintrin.h>
@@ -294,6 +296,57 @@ std::unique_ptr<Model> Model::Load(const std::string& path) {
   return LoadFromSafetensors(path);
 }
 
+namespace {
+
+// Walk a directory of M-<m>/ subdirs, sorted ascending by M.
+std::vector<std::pair<int, std::string>> ListAneBuckets(const std::string& dir) {
+  namespace fs = std::filesystem;
+  std::vector<std::pair<int, std::string>> out;
+  std::error_code ec;
+  if (!fs::is_directory(dir, ec)) return out;
+  for (const auto& entry : fs::directory_iterator(dir, ec)) {
+    if (!entry.is_directory()) continue;
+    const std::string n = entry.path().filename().string();
+    if (n.size() < 3 || n.substr(0, 2) != "M-") continue;
+    int m = 0;
+    try { m = std::stoi(n.substr(2)); } catch (...) { continue; }
+    if (m > 0) out.emplace_back(m, entry.path().string());
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+}  // namespace
+
+std::size_t Model::LoadAneArtifacts(const std::string& dir) {
+  const int d = cfg_.hidden_size;
+  const int ffn = cfg_.intermediate_size;
+  std::size_t loaded = 0;
+  auto buckets = ListAneBuckets(dir);
+  auto try_load_into = [&](std::vector<std::unique_ptr<AppleAneContext>>& vec,
+                           const std::string& name, int K, int N) {
+    vec.clear();
+    for (const auto& [m, sub] : buckets) {
+      auto p = sub + "/" + name + ".mlmodelc";
+      auto ctx = AppleAneContext::LoadFromDir(p, m, K, N);
+      if (ctx) { vec.push_back(std::move(ctx)); ++loaded; }
+    }
+    // Vec is already sorted by M (buckets sorted; we append in order).
+  };
+  for (std::size_t i = 0; i < layers_.size(); ++i) {
+    auto& lw = layers_[i];
+    const std::string base = "esm.encoder.layer." + std::to_string(i);
+    try_load_into(lw.ane_q,   base + ".attention.self.query",   d, d);
+    try_load_into(lw.ane_k,   base + ".attention.self.key",     d, d);
+    try_load_into(lw.ane_v,   base + ".attention.self.value",   d, d);
+    try_load_into(lw.ane_out, base + ".attention.output.dense", d, d);
+    try_load_into(lw.ane_fc1, base + ".intermediate.dense",     d, ffn);
+    try_load_into(lw.ane_fc2, base + ".output.dense",           ffn, d);
+  }
+  try_load_into(ane_lm_dense_, "lm_head.dense", d, d);
+  return loaded;
+}
+
 std::size_t Model::LoadAmxArtifacts(const std::string& dir) {
   // Per-Linear naming mirrors tools/build_amx_artifacts.py exactly: the
   // safetensors weight key minus the ".weight" suffix, plus ".mlmodelc".
@@ -552,19 +605,111 @@ inline AppleAmxContext* AmxOf(
   return (w.*field).get();
 }
 
+// Phase 12: ANE dispatch with pad-to-bucket + chunking when M > max_bucket.
+// `vec` is per-Linear contexts sorted ascending by bucket M. Returns Ok on
+// success; the LinearProj caller falls back on failure. Bias is baked into the
+// artifact, so the caller does NOT add bias separately on success.
+//
+// Strategy:
+//   1. If M <= max bucket: pick the smallest bucket >= M; if M == bucket_m,
+//      Execute directly (zero-copy); else pad input to bucket_m in scratch_in
+//      and copy the first M rows of scratch_out back into `out`.
+//   2. If M > max bucket: chunk by max_bucket. Full chunks Execute directly
+//      against (in + offset*K, out + offset*N); the partial tail goes through
+//      scratch_in/out the same way as case 1.
+inline Status DispatchAne(
+    const std::vector<std::unique_ptr<AppleAneContext>>& vec,
+    const float* in, float* out, int M, int K, int N) {
+  if (vec.empty()) return {StatusCode::kNotFound, "ane: no contexts"};
+  // Find smallest bucket >= M.
+  AppleAneContext* fit = nullptr;
+  for (const auto& c : vec) {
+    if (c->bucket_m() >= M) { fit = c.get(); break; }
+  }
+  if (fit && fit->k() == K && fit->n() == N) {
+    if (M == fit->bucket_m()) {
+      return fit->Execute(in, out);  // zero-copy fast path
+    }
+    static thread_local std::vector<float> s_in, s_out;
+    const std::size_t in_bytes  = static_cast<std::size_t>(fit->bucket_m()) * K;
+    const std::size_t out_bytes = static_cast<std::size_t>(fit->bucket_m()) * N;
+    if (s_in.size() < in_bytes) s_in.assign(in_bytes, 0.0f);
+    if (s_out.size() < out_bytes) s_out.assign(out_bytes, 0.0f);
+    std::memcpy(s_in.data(), in,
+                static_cast<std::size_t>(M) * K * sizeof(float));
+    std::memset(s_in.data() + static_cast<std::size_t>(M) * K, 0,
+                (static_cast<std::size_t>(fit->bucket_m()) - M) * K *
+                    sizeof(float));
+    Status s = fit->Execute(s_in.data(), s_out.data());
+    if (!s.ok()) return s;
+    std::memcpy(out, s_out.data(),
+                static_cast<std::size_t>(M) * N * sizeof(float));
+    return Status::Ok();
+  }
+  // M > max bucket → chunk.
+  AppleAneContext* max_ctx = vec.back().get();
+  if (max_ctx->k() != K || max_ctx->n() != N) {
+    return {StatusCode::kInternal, "ane: K/N mismatch on max bucket"};
+  }
+  const int M_b = max_ctx->bucket_m();
+  int offset = 0;
+  static thread_local std::vector<float> s_in, s_out;
+  while (offset < M) {
+    int chunk_M = std::min(M - offset, M_b);
+    if (chunk_M == M_b) {
+      Status s = max_ctx->Execute(in + static_cast<std::size_t>(offset) * K,
+                                  out + static_cast<std::size_t>(offset) * N);
+      if (!s.ok()) return s;
+    } else {
+      const std::size_t in_bytes  = static_cast<std::size_t>(M_b) * K;
+      const std::size_t out_bytes = static_cast<std::size_t>(M_b) * N;
+      if (s_in.size() < in_bytes) s_in.assign(in_bytes, 0.0f);
+      if (s_out.size() < out_bytes) s_out.assign(out_bytes, 0.0f);
+      std::memcpy(s_in.data(),
+                  in + static_cast<std::size_t>(offset) * K,
+                  static_cast<std::size_t>(chunk_M) * K * sizeof(float));
+      std::memset(s_in.data() + static_cast<std::size_t>(chunk_M) * K, 0,
+                  static_cast<std::size_t>(M_b - chunk_M) * K * sizeof(float));
+      Status s = max_ctx->Execute(s_in.data(), s_out.data());
+      if (!s.ok()) return s;
+      std::memcpy(out + static_cast<std::size_t>(offset) * N, s_out.data(),
+                  static_cast<std::size_t>(chunk_M) * N * sizeof(float));
+    }
+    offset += chunk_M;
+  }
+  return Status::Ok();
+}
+
+// Resolve the per-Linear ANE bucket vector (or empty if not loaded).
+inline const std::vector<std::unique_ptr<AppleAneContext>>& AneOf(
+    const LayerWeights& w,
+    std::vector<std::unique_ptr<AppleAneContext>> LayerWeights::*field) {
+  return w.*field;
+}
+
 // Branch helper: route through LinearInt8 when the model is quantized, else
 // FP32 Linear — OR, if an Apple-AMX fp16 BNNSGraph context is loaded for this
 // Linear AND ESM_APPLE_AMX=on, short-circuit through it. The AMX artifact has
 // bias baked in, so we don't add it again on that path.
-inline void LinearProj(const Config& cfg, const float* A, const float* W_fp32,
-                       const esm::quant::QuantizedTensor& W_int8,
-                       const float* bias, float* C, int M, int N, int K,
-                       AppleAmxContext* amx = nullptr) {
+inline void LinearProj(
+    const Config& cfg, const float* A, const float* W_fp32,
+    const esm::quant::QuantizedTensor& W_int8, const float* bias, float* C,
+    int M, int N, int K, AppleAmxContext* amx = nullptr,
+    const std::vector<std::unique_ptr<AppleAneContext>>* ane = nullptr) {
+#ifdef ESM_APPLE_ANE_AVAILABLE
+  if (ane != nullptr && !ane->empty() && esm::ArmUseAppleAne()) {
+    Status s = DispatchAne(*ane, A, C, M, K, N);
+    if (s.ok()) return;
+    // ANE dispatch failed (no matching bucket / runtime error) -> fall through
+    // through AMX -> default. Each layer can mix.
+  }
+#else
+  (void)ane;
+#endif
 #ifdef ESM_APPLE_AMX_AVAILABLE
   if (amx != nullptr && esm::ArmUseAppleAmx()) {
     Status s = amx->Execute(A, C, M);
     if (s.ok()) return;
-    // BNNS Execute failed unexpectedly at runtime — fall through defensively.
   }
 #else
   (void)amx;
@@ -634,11 +779,14 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   {
     esm::profile::ScopedTimer t("qkv_proj");
     LinearProj(cfg, scratch_ln, w.q_w.data(), w.q_w_int8, w.q_b.data(),
-               q_packed, L, d, d, AmxOf(w, &LayerWeights::amx_q));
+               q_packed, L, d, d, AmxOf(w, &LayerWeights::amx_q),
+               &AneOf(w, &LayerWeights::ane_q));
     LinearProj(cfg, scratch_ln, w.k_w.data(), w.k_w_int8, w.k_b.data(),
-               k_packed, L, d, d, AmxOf(w, &LayerWeights::amx_k));
+               k_packed, L, d, d, AmxOf(w, &LayerWeights::amx_k),
+               &AneOf(w, &LayerWeights::ane_k));
     LinearProj(cfg, scratch_ln, w.v_w.data(), w.v_w_int8, w.v_b.data(),
-               v_packed, L, d, d, AmxOf(w, &LayerWeights::amx_v));
+               v_packed, L, d, d, AmxOf(w, &LayerWeights::amx_v),
+               &AneOf(w, &LayerWeights::ane_v));
   }
 
   // Q-scale BEFORE RoPE — ESM's load-bearing quirk; see CLAUDE.md.
@@ -672,7 +820,8 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
     esm::profile::ScopedTimer t("attn_out_proj");
     LinearProj(cfg, scratch_attn_out, w.out_w.data(), w.out_w_int8,
                w.out_b.data(), scratch_attn_proj, L, d, d,
-               AmxOf(w, &LayerWeights::amx_out));
+               AmxOf(w, &LayerWeights::amx_out),
+               &AneOf(w, &LayerWeights::ane_out));
   }
 
   // Residual: hidden += attn_proj
@@ -704,7 +853,8 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
   {
     esm::profile::ScopedTimer t("fc1");
     LinearProj(cfg, scratch_ln, w.fc1_w.data(), w.fc1_w_int8, w.fc1_b.data(),
-               scratch_inter, L, ffn, d, AmxOf(w, &LayerWeights::amx_fc1));
+               scratch_inter, L, ffn, d, AmxOf(w, &LayerWeights::amx_fc1),
+               &AneOf(w, &LayerWeights::ane_fc1));
   }
   {
     esm::profile::ScopedTimer t("gelu");
@@ -720,7 +870,8 @@ void TransformerBlock(const Config& cfg, const LayerWeights& w, float* hidden,
     esm::profile::ScopedTimer t("fc2");
     LinearProj(cfg, scratch_inter_gelu, w.fc2_w.data(), w.fc2_w_int8,
                w.fc2_b.data(), scratch_ffn_out, L, d, ffn,
-               AmxOf(w, &LayerWeights::amx_fc2));
+               AmxOf(w, &LayerWeights::amx_fc2),
+               &AneOf(w, &LayerWeights::ane_fc2));
   }
 
   // Residual: hidden += ffn_out
@@ -858,14 +1009,20 @@ void Model::ForwardPackedInto(
   float* lm_dense = ws.allocate<float>(Td);
   {
     esm::profile::ScopedTimer t("lm_dense");
-    bool used_amx = false;
-#ifdef ESM_APPLE_AMX_AVAILABLE
-    if (amx_lm_dense_ && esm::ArmUseAppleAmx()) {
-      Status s = amx_lm_dense_->Execute(final_ln, lm_dense, T);
-      used_amx = s.ok();
+    bool used_fast = false;
+#ifdef ESM_APPLE_ANE_AVAILABLE
+    if (!ane_lm_dense_.empty() && esm::ArmUseAppleAne()) {
+      Status s = DispatchAne(ane_lm_dense_, final_ln, lm_dense, T, d, d);
+      used_fast = s.ok();
     }
 #endif
-    if (!used_amx) {
+#ifdef ESM_APPLE_AMX_AVAILABLE
+    if (!used_fast && amx_lm_dense_ && esm::ArmUseAppleAmx()) {
+      Status s = amx_lm_dense_->Execute(final_ln, lm_dense, T);
+      used_fast = s.ok();
+    }
+#endif
+    if (!used_fast) {
       if (cfg_.lm_head_dense_quantized) {
         kernels::LinearInt8(final_ln, lm_dense_w_int8_, lm_dense_b_.data(),
                             lm_dense, T, d, d);

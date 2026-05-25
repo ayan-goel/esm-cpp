@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "esm_cpp/apple_amx.h"
+#include "esm_cpp/apple_ane.h"
 #include "esm_cpp/batch.h"
 #include "esm_cpp/observer.h"
 #include "esm_cpp/quant.h"
@@ -73,6 +74,13 @@ struct LayerWeights {
   // bias add when this path is taken).
   std::unique_ptr<esm::AppleAmxContext> amx_q, amx_k, amx_v;
   std::unique_ptr<esm::AppleAmxContext> amx_out, amx_fc1, amx_fc2;
+
+  // Phase 12: per-Linear ANE CoreML contexts, one per static-M bucket. Sorted
+  // ascending by bucket M. The dispatcher in LinearProj picks the smallest
+  // bucket >= runtime M (padding the activation), or chunks at the max bucket
+  // when M exceeds it. Bias baked, same as AMX. Always empty on non-Apple.
+  std::vector<std::unique_ptr<esm::AppleAneContext>> ane_q, ane_k, ane_v;
+  std::vector<std::unique_ptr<esm::AppleAneContext>> ane_out, ane_fc1, ane_fc2;
 };
 
 // Forward output. `hidden_states` semantics match HF EsmModel:
@@ -107,6 +115,13 @@ class Model {
   // off Apple builds). Returns the count of successfully loaded contexts.
   // The path is then engaged via the forward dispatch under ESM_APPLE_AMX=on.
   std::size_t LoadAmxArtifacts(const std::string& dir);
+
+  // Phase 12: load per-Linear-per-bucket ANE artifacts. `dir` is the top-level
+  // ANE artifact dir (with M-<m>/ subdirs). For each Linear, walks each
+  // bucket subdir and loads any present .mlmodelc into the LayerWeights
+  // ane_* vectors (sorted ascending by M). Apple-only; returns the count of
+  // loaded contexts (0 elsewhere). Path engaged via ESM_APPLE_ANE=on.
+  std::size_t LoadAneArtifacts(const std::string& dir);
 
   const Config& config() const { return cfg_; }
 
@@ -229,6 +244,8 @@ class Model {
   // Phase 11: optional fp16-AMX BNNSGraph context for lm_head.dense
   // (always nullptr on Linux ARM builds).
   std::unique_ptr<esm::AppleAmxContext> amx_lm_dense_;
+  // Phase 12: per-bucket ANE contexts for lm_head.dense (empty on Linux ARM).
+  std::vector<std::unique_ptr<esm::AppleAneContext>> ane_lm_dense_;
   // lm_head.decoder.weight is tied to embed_ — we reuse embed_ directly.
 
   // Per-Model scratch arena. Mutable because Forward is logically const

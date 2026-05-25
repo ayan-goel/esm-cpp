@@ -145,6 +145,17 @@ bool ArmUseAppleAmx() {
 #endif
 }
 
+bool ArmUseAppleAne() {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(_M_ARM64))
+  const char* e = std::getenv("ESM_APPLE_ANE");
+  if (!e || *e == '\0') return false;
+  const std::string_view s(e);
+  return s == "on" || s == "1" || s == "true";
+#else
+  return false;
+#endif
+}
+
 bool ArmUseSmmla() {
   if (const char* f = std::getenv("ESM_FORCE_ISA");
       f && std::string_view(f) == "neoni8mm") {
