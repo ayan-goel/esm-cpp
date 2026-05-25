@@ -16,6 +16,7 @@ compile_commands.json
 .cache/
 tests/golden/**/*.npz
 !tests/golden/**/manifest.json
+weights/
 
 # Internal planning and notes — top-level README and docs/ are public.
 *.md

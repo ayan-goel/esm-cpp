@@ -56,7 +56,8 @@ HF eager FP32 on the 256-sequence OAS-distribution dataset
 
 | Variant | esm-cpp-int8 | hf-eager-fp32 | Speedup |
 |---|---:|---:|---:|
-| 650M / uniform 8×256 (post-Phase-10) | **2.17 s** | 3.88 s | **1.79× HF** |
+| 650M / uniform 8×256 (Phase-11, `ESM_APPLE_AMX=on`) | **1.74 s** | 3.88 s | **2.23× HF** |
+| 650M / uniform 8×256 (Phase-10, SDOT default) | 2.17 s | 3.88 s | 1.79× HF |
 | 650M / uniform 8×256 (Phase-9) | 2.92 s | 3.80 s | 1.45× HF |
 | 650M / varlen (Phase-9) | 37.8 s | 150.1 s | **3.97× HF** |
 | 35M / varlen | 3.20 s | 9.46 s | **2.95× HF** |
@@ -64,9 +65,14 @@ HF eager FP32 on the 256-sequence OAS-distribution dataset
 | 35M / uniform 8×100 | 78.5 ms | 99.8 ms | 1.27× HF |
 | 8M / uniform 8×100  | 30.5 ms | 34.5 ms | 1.13× HF |
 
-Phase 10 re-benched 650M uniform after two pure-NEON kernel wins (below): **2.92 →
-2.17 s, 1.45× → 1.79× HF**. The varlen kernels (shared) improve identically but the
-~150 s HF varlen baseline was not re-run, so that row stays the Phase-9 measurement.
+Phase 10 added two pure-NEON wins (SDOT branch-hoist + register-resident attention PV)
+that moved 650M uniform 2.92 → 2.17 s (1.45 → 1.79× HF). Phase 11 added the opt-in
+fp16-AMX BNNSGraph path (per-Linear `.mlmodelc` artifacts compiled at convert time +
+loaded at `Model::load`), routing the dense GEMMs through Apple's AMX coprocessor in
+fp16. With `ESM_APPLE_AMX=on` 650M uniform drops to **1.74 s** (1.79 → **2.23× HF**),
+and quality vs FP32 is *better* than the SDOT-INT8 path (corr 0.99997 / argmax 1.0).
+The varlen kernels (shared) improve identically each phase but the ~150 s HF varlen
+baseline was not re-run, so that row stays the Phase-9 measurement.
 
 Raw JSON: `benchmarks/results/dev_m3_pro_*_neon_*.json`. Reproduce with the
 same `esm-cpp-bench` commands below (any ESM-2 safetensors checkpoint;
@@ -83,21 +89,34 @@ ISA is auto-detected). Notes:
     `out_row`) cut the attention section **~28%** (~3× fewer PV memory ops).
 
   Stacked: 650M uniform 8×256 **2826 → 2170 ms p50, 1.79× HF** (was 1.45×).
-- **Apple-AMX INT8 is a dead end; fp16 is the AMX lever (Phase 10 spike).** Via
-  CoreML/BNNS (the only non-deprecated AMX route) int8 W8A8 (14.0 ms) is *slower*
-  than fp16 (11.3 ms) at the fc1 650M shape M=2048 — BNNS dequantizes int8 to fp16
-  and runs a float kernel, so int8 adds only overhead (the deprecated `BNNSMatMul`
-  int8 also returns `rc=-1`). **fp16 on AMX is ~2× our SDOT**; the C++
-  `BNNSGraphCompileFromFile`+`Execute` path is proven at **10.4 ms** (bit-matches the
-  CoreML reference). It is reachable only via a compiled-graph (mlmodelc) pipeline —
-  no `cblas` half-precision GEMM exists — so a per-Linear fp16 mlmodelc + BNNSGraph
-  runtime under `ESM_APPLE_AMX`, with an fp16 PPPL/ProteinGym gate, is the scoped
-  fast-follow (foundation: `tools/spike_fp16_mlmodelc_gen.py`,
-  `tools/spike_bnns_graph_execute.cpp`).
-- **`ESM_APPLE_AMX=on`** (Apple-only, opt-in) routes FP32 GEMM through Accelerate's
-  AMX-backed cblas (~3.75–6.2× the NEON FMLA; 8M FP32 forward 94 → 66 ms; at 650M
-  e2e ≈ on par with INT8 SDOT). Hand-written NEON stays the default and the only
-  Linux-ARM path.
+- **`ESM_APPLE_AMX=on` (Phase 11, opt-in)** routes the dense GEMMs (qkv / out_proj /
+  fc1 / fc2 / lm_dense) through fp16 BNNSGraph contexts compiled from per-Linear
+  `.mlmodelc` artifacts. Per-bucket at 650M uniform (post-T8 SDOT baseline → AMX-fp16):
+  fc1 497 → 338 ms, fc2 509 → 385 ms, qkv 392 → 278 ms, out_proj 131 → 92 ms,
+  lm_dense 14 → 3 ms (GEMM bucket 1543 → 1096 ms, **−29 %**), e2e 2257 → 1740 ms
+  (**−23 %**). Quality is *better* than SDOT-INT8 vs FP32 (corr 0.99997 vs 0.99956 on
+  650M; corr 0.999994 on 150M). Reproduction:
+
+  ```
+  # 1. Build artifacts at convert time (Python 3.12 + coremltools 9):
+  /path/to/py3.12/python tools/build_amx_artifacts.py \
+      --safetensors ~/.cache/huggingface/.../model.safetensors \
+      --precision fp16 \
+      --out weights/esm2_650m.amx-fp16
+  # 2. Use at runtime (3.14 runtime needs zero coremltools):
+  m = esm_cpp.Model.load_from_safetensors(...)
+  m.load_amx_artifacts("weights/esm2_650m.amx-fp16")
+  # ESM_APPLE_AMX=on engages the path; off (default) falls back to SDOT.
+  ```
+
+  Hand-written NEON / SDOT stays the default and the only Linux-ARM path; the
+  BNNSGraph runtime is compiled out on non-Apple builds (no Accelerate dep on Linux).
+
+- **Phase 10 spike (kept for context).** Int8 on AMX gives **no** speedup — via
+  CoreML/BNNS, int8 W8A8 (14.0 ms) is *slower* than fp16 (11.3 ms) at the fc1 650M
+  shape M=2048; BNNS dequantizes int8 → fp16 and runs a float kernel. fp16 is the
+  only AMX win. There is no `cblas` half-precision GEMM, so the BNNSGraph
+  compiled-graph pipeline is the only path that delivers it.
 - **SMMLA/i8mm is opt-in** (`ESM_NEON_I8MM=on`). On Apple M3 it does not
   out-throughput SDOT, so SDOT is the default; SMMLA is expected to win on
   Graviton3-class i8mm units and stays validated against the scalar reference.

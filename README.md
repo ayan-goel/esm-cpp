@@ -38,11 +38,12 @@ esm.cpp also runs on AArch64 with a hand-written NEON kernel stack — FMLA FP32
 | Variable-length 256-seq (OAS-shape), 650M | **37.8 s** | 150.1 s | **3.97× HF** |
 | Variable-length 256-seq (OAS-shape), 35M | **3.20 s** | 9.46 s | **2.95× HF** |
 | Variable-length 256-seq (OAS-shape), 8M | **1.02 s** | 3.28 s | **3.21× HF** |
-| Uniform 8-seq × 256-tokens, 650M | 2.17 s | 3.88 s | **1.79× HF** |
+| Uniform 8-seq × 256-tokens, 650M, **`ESM_APPLE_AMX=on`** | **1.74 s** | 3.88 s | **2.23× HF** |
+| Uniform 8-seq × 256-tokens, 650M (SDOT default) | 2.17 s | 3.88 s | 1.79× HF |
 | Uniform 8-seq × 100-tokens, 35M | 78.5 ms | 99.8 ms | 1.27× HF |
 | Uniform 8-seq × 100-tokens, 8M | 30.5 ms | 34.5 ms | 1.13× HF |
 
-The 650M uniform number reflects two Phase-10 pure-NEON kernel wins (a SDOT inner-loop branch-hoist, ~15–24% per GEMM; register-resident attention PV, ~28% off attention) — 1.45× → 1.79× HF. The SMMLA/i8mm tier is opt-in (`ESM_NEON_I8MM=on`): on Apple M3 it does not out-throughput SDOT, but it is expected to win on Graviton3-class cores with stronger i8mm units. On Apple, `ESM_APPLE_AMX=on` routes FP32 GEMM through Accelerate's AMX-backed BLAS (a measured fp16-via-BNNSGraph path is ~2× SDOT and is a scoped follow-up; int8-on-AMX gives no speedup — BNNS dequantizes to fp16). INT8 quality on ARM matches FP32 — 0.9996 logit correlation, 1.0 masked-marginal argmax agreement.
+The Phase-11 headline is the opt-in **`ESM_APPLE_AMX=on`** path: per-Linear fp16 BNNSGraph artifacts built at convert time (`tools/build_amx_artifacts.py`) and loaded at `Model.load_amx_artifacts(...)`. Routes the dense GEMMs through Apple's AMX coprocessor in fp16; the 650M GEMM bucket drops ~29% and e2e goes 1.79× → **2.23× HF**, with quality vs FP32 slightly *better* than INT8 SDOT (corr 0.99997 vs 0.99956 on 650M). The SDOT default also improved this cycle (Phase-10 SDOT branch-hoist + register-resident attention PV: 1.45× → 1.79× HF). The SMMLA/i8mm tier is opt-in (`ESM_NEON_I8MM=on`): on Apple M3 it does not out-throughput SDOT, but is expected to win on Graviton3-class cores. The whole AMX backend is compiled out on Linux ARM / Graviton — hand-written NEON / SDOT stays the default and the only Linux-ARM path.
 
 ## Install
 

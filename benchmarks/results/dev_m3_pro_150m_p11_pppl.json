@@ -1,0 +1,25 @@
+{
+  "model": "esm2_t30_150M",
+  "isa": "neoni8mm",
+  "num_sequences": 5,
+  "fp32_pppl": 6.765667680521054,
+  "int8_pppl": 6.853976567858352,
+  "drift": 0.08830888733729747,
+  "gate_threshold": 0.1,
+  "gate_pass": true,
+  "env_amx_attention": false,
+  "env_quantize_lm_head": false,
+  "results": {
+    "fp32": {
+      "pppl": 6.765667680521054,
+      "elapsed_s": 71.01265425002202,
+      "drift_vs_fp32": 0.0
+    },
+    "int8": {
+      "pppl": 6.853976567858352,
+      "elapsed_s": 30.32590604107827,
+      "drift_vs_fp32": 0.08830888733729747,
+      "gate_pass": true
+    }
+  }
+}
