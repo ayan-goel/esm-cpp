@@ -142,6 +142,7 @@ add_library(esm_cpp_core STATIC
   src/threading/thread_pool.cpp
   src/model.cpp
   src/apple_amx.cpp
+  src/apple_ane.mm
 )
 target_include_directories(esm_cpp_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
@@ -154,8 +155,18 @@ target_compile_features(esm_cpp_core PUBLIC cxx_std_20)
 # is fully #ifdef ESM_APPLE_AMX_AVAILABLE so the .o becomes empty.
 if(APPLE)
   target_compile_definitions(esm_cpp_core PUBLIC
-    ESM_APPLE_AMX_AVAILABLE ACCELERATE_NEW_LAPACK)
-  target_link_libraries(esm_cpp_core PUBLIC "-framework Accelerate")
+    ESM_APPLE_AMX_AVAILABLE
+    ESM_APPLE_ANE_AVAILABLE
+    ACCELERATE_NEW_LAPACK)
+  target_link_libraries(esm_cpp_core PUBLIC
+    "-framework Accelerate"
+    "-framework Foundation"
+    "-framework CoreML")
+  # apple_ane.mm is Objective-C++; the source file extension drives ARC + ObjC++
+  # mode in clang on Apple. The whole esm_cpp_core lib stays plain C++ on Linux
+  # (the .mm becomes an unused TU that the gate fully #ifs out).
+  set_source_files_properties(src/apple_ane.mm PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc")
 endif()
 
 # Link the per-ISA kernel TUs into the static lib. The Ref TU is always

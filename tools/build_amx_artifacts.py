@@ -90,28 +90,40 @@ def _discover_linears(state: dict) -> list[tuple[str, np.ndarray, np.ndarray]]:
 
 
 def _build_one(name: str, W: np.ndarray, bias: np.ndarray | None,
-               precision: ct.precision) -> ct.models.MLModel:
-    """One Linear → single-op mlprogram, M as a Symbol (dynamic), weight+bias baked.
+               precision: ct.precision, units: ct.ComputeUnit,
+               fixed_m: int | None) -> ct.models.MLModel:
+    """One Linear → single-op mlprogram, weight+bias baked as constants.
 
-    The Symbol leaves M unbounded in the MIL program; the C++ runtime selects the
-    actual M per forward via BNNSGraphContextSetDynamicShapes. The `inputs=` arg
-    to `ct.convert` carries the bounds (RangeDim) into the compiled package.
+    If `fixed_m` is None: M is a Symbol+RangeDim (the Phase-11 AMX/BNNSGraph path
+    — varlen-friendly, runs on CPU only). If `fixed_m` is an int: M is that fixed
+    integer — required for ANE dispatch (ANE rejects dynamic shapes; verified in
+    P12 T1 characterization). `units` selects the target compute unit.
     """
     N, K = int(W.shape[0]), int(W.shape[1])
     b = bias if bias is not None else np.zeros(N, dtype=np.float32)
-    m_sym = Symbol("M")
+    if fixed_m is None:
+        m_sym = Symbol("M")
 
-    @mb.program(input_specs=[mb.TensorSpec(shape=(m_sym, K), dtype=types.fp32)])
-    def prog(x):  # pragma: no cover (passed as a builder)
+        @mb.program(input_specs=[mb.TensorSpec(shape=(m_sym, K), dtype=types.fp32)])
+        def prog(x):  # pragma: no cover
+            return mb.linear(x=x, weight=W, bias=b, name="out")
+
+        return ct.convert(
+            prog, convert_to="mlprogram",
+            compute_units=units, compute_precision=precision,
+            inputs=[ct.TensorType(name="x",
+                                  shape=ct.Shape(shape=(ct.RangeDim(1, 65536), K)),
+                                  dtype=np.float32)],
+            minimum_deployment_target=ct.target.macOS15,
+        )
+
+    @mb.program(input_specs=[mb.TensorSpec(shape=(fixed_m, K), dtype=types.fp32)])
+    def prog_fixed(x):  # pragma: no cover
         return mb.linear(x=x, weight=W, bias=b, name="out")
 
     return ct.convert(
-        prog, convert_to="mlprogram",
-        compute_units=ct.ComputeUnit.CPU_ONLY,
-        compute_precision=precision,
-        inputs=[ct.TensorType(name="x",
-                              shape=ct.Shape(shape=(ct.RangeDim(1, 65536), K)),
-                              dtype=np.float32)],
+        prog_fixed, convert_to="mlprogram",
+        compute_units=units, compute_precision=precision,
         minimum_deployment_target=ct.target.macOS15,
     )
 
@@ -125,13 +137,9 @@ def _save_compiled(model: ct.models.MLModel, dst: Path) -> None:
 
 
 def _spot_check(model: ct.models.MLModel, W: np.ndarray,
-                bias: np.ndarray | None, M_probe: int = 8) -> float:
-    """Predict on a random input; compare to a numpy reference.
-
-    Returns `max|Y - ref| / max(|ref|, 1e-3)`: a single max-magnitude-normalized
-    error that doesn't explode on near-zero entries (which is what a per-element
-    relative metric does — see the dev log on this). fp16 typically lands ~5e-4.
-    """
+                bias: np.ndarray | None, M_probe: int) -> float:
+    """Predict on a random input of shape [M_probe, K]; compare to a numpy
+    reference. Returns max-magnitude-normalized error (fp16 typically ~5e-3)."""
     rng = np.random.default_rng(0)
     K = int(W.shape[1])
     X = (rng.standard_normal((M_probe, K)).astype(np.float32) * 0.5)
@@ -143,64 +151,96 @@ def _spot_check(model: ct.models.MLModel, W: np.ndarray,
     return float(np.max(np.abs(Y - ref)) / scale)
 
 
+_UNITS = {
+    "CPU_ONLY":    ct.ComputeUnit.CPU_ONLY,
+    "CPU_AND_NE":  ct.ComputeUnit.CPU_AND_NE,
+    "ALL":         ct.ComputeUnit.ALL,
+}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--safetensors", required=True, type=Path)
-    ap.add_argument("--precision", choices=("fp16", "fp32"), default="fp16",
-                    help="fp16 hits the AMX-fp16 path (~2x SDOT in the P10 spike). "
-                         "fp32 is the safety baseline (≈ cblas_sgemm).")
+    ap.add_argument("--precision", choices=("fp16", "fp32"), default="fp16")
+    ap.add_argument("--compute-units", choices=tuple(_UNITS), default="CPU_ONLY",
+                    help="CPU_ONLY = AMX/BNNSGraph (Phase 11, RangeDim M). "
+                         "CPU_AND_NE = ANE-targeted (Phase 12); requires --buckets.")
+    ap.add_argument("--buckets", default="",
+                    help="Comma-separated fixed M values (e.g. '2048,8192,16384'). "
+                         "Required for ANE/static-shape artifacts. Empty -> RangeDim.")
     ap.add_argument("--out", required=True, type=Path,
-                    help="Output dir: <linear_name>.mlmodelc/ inside.")
-    ap.add_argument("--limit", type=int, default=0,
-                    help="Only build the first N Linears (debug / smoke).")
-    ap.add_argument("--rel-err-threshold", type=float, default=3e-2,
-                    help="Spot-check max-magnitude-normalized err vs numpy "
-                         "ref. fp16 accumulation noise grows with K — for K=5120 "
-                         "the typical worst-case is ~1.5%. 3% gives margin without "
-                         "masking a real correctness bug (which would be O(1.0)).")
+                    help="Output dir. Static-shape mode lays out per-bucket "
+                         "subdirs <out>/M-<m>/<linear>.mlmodelc; RangeDim mode "
+                         "puts artifacts directly under <out>.")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--rel-err-threshold", type=float, default=3e-2)
     args = ap.parse_args()
 
     if not args.safetensors.exists():
         sys.exit(f"missing: {args.safetensors}")
+    units = _UNITS[args.compute_units]
+    buckets: list[int] = []
+    if args.buckets:
+        buckets = sorted({int(x) for x in args.buckets.split(",") if x})
+        for m in buckets:
+            if m <= 0 or m > 1_000_000:
+                sys.exit(f"bad bucket {m}")
+    if units == ct.ComputeUnit.CPU_AND_NE and not buckets:
+        sys.exit("CPU_AND_NE requires --buckets (ANE rejects dynamic shapes)")
+    if units == ct.ComputeUnit.CPU_ONLY and buckets:
+        print("note: --buckets with CPU_ONLY → static-shape AMX artifacts "
+              "(BNNSGraph still loads them; LinearProj must use the static path)")
     args.out.mkdir(parents=True, exist_ok=True)
 
     state = load_file(str(args.safetensors))
     linears = _discover_linears(state)
     if args.limit > 0:
         linears = linears[: args.limit]
-    print(f"discovered {len(linears)} Linears -> {args.out}", flush=True)
+    prec = (ct.precision.FLOAT16 if args.precision == "fp16"
+            else ct.precision.FLOAT32)
+    mode = f"buckets={buckets}" if buckets else "RangeDim(M)"
+    print(f"discovered {len(linears)} Linears -> {args.out}  "
+          f"units={args.compute_units}  mode={mode}", flush=True)
     if not linears:
         sys.exit("no Linears matched the discovery patterns")
 
-    prec = (ct.precision.FLOAT16 if args.precision == "fp16"
-            else ct.precision.FLOAT32)
+    # Plan: (subdir, fixed_m, m_probe) per artifact group.
+    if buckets:
+        groups = [(f"M-{m}", m, m) for m in buckets]
+    else:
+        groups = [("", None, 8)]  # RangeDim — probe with a small M
+
     skipped = built = 0
     worst_err = 0.0
     t0 = time.perf_counter()
-    for i, (name, W, bias) in enumerate(linears, 1):
-        dst = args.out / f"{name}.mlmodelc"
-        if dst.exists() and (dst / "model.mil").exists():
-            skipped += 1
-            continue
-        N, K = int(W.shape[0]), int(W.shape[1])
-        t = time.perf_counter()
-        model = _build_one(name, W, bias, prec)
-        _save_compiled(model, dst)
-        err = _spot_check(model, W, bias)
-        worst_err = max(worst_err, err)
-        if err > args.rel_err_threshold:
-            sys.exit(f"FAIL: {name} max rel err {err:.4f} > threshold "
-                     f"{args.rel_err_threshold} (precision={args.precision})")
-        built += 1
-        print(f"  [{i:3d}/{len(linears)}] {name}  [N={N},K={K}]  "
-              f"err={err:.4f}  ({time.perf_counter() - t:.1f}s)", flush=True)
+    total_n = len(linears) * len(groups)
+    for sub, fixed_m, m_probe in groups:
+        sub_out = args.out / sub if sub else args.out
+        sub_out.mkdir(parents=True, exist_ok=True)
+        for i, (name, W, bias) in enumerate(linears, 1):
+            dst = sub_out / f"{name}.mlmodelc"
+            if dst.exists() and (dst / "model.mil").exists():
+                skipped += 1
+                continue
+            N, K = int(W.shape[0]), int(W.shape[1])
+            t = time.perf_counter()
+            model = _build_one(name, W, bias, prec, units, fixed_m)
+            _save_compiled(model, dst)
+            err = _spot_check(model, W, bias, m_probe)
+            worst_err = max(worst_err, err)
+            if err > args.rel_err_threshold:
+                sys.exit(f"FAIL: {name} (M={fixed_m or 'dyn'}) max rel err "
+                         f"{err:.4f} > {args.rel_err_threshold}")
+            built += 1
+            tag = f"M={fixed_m}" if fixed_m else "M=dyn"
+            print(f"  [{built+skipped:4d}/{total_n}] {name} ({tag}) "
+                  f"[N={N},K={K}]  err={err:.4f}  "
+                  f"({time.perf_counter()-t:.1f}s)", flush=True)
     elapsed = time.perf_counter() - t0
-    total_mb = sum(
-        sum(p.stat().st_size for p in (args.out / f"{n}.mlmodelc").rglob("*")
-            if p.is_file()) for n, *_ in linears) / 1e6
+    total_bytes = sum(p.stat().st_size for p in args.out.rglob("*") if p.is_file())
     print(f"\nDone: built {built} new, skipped {skipped} existing, "
-          f"max rel err {worst_err:.4f}, {elapsed:.1f}s, total size {total_mb:.0f} MB",
-          flush=True)
+          f"max rel err {worst_err:.4f}, {elapsed:.1f}s, "
+          f"total size {total_bytes / 1e6:.0f} MB", flush=True)
     return 0
 
 
