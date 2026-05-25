@@ -128,6 +128,16 @@ class Model {
   // them (that's the ESM_APPLE_AMX gate).
   const std::string& amx_artifacts_path() const { return amx_artifacts_path_; }
 
+  // Phase 14: parent directory the auto-discovery scanned for whole-graph
+  // shapes during the most recent Model::Load* (empty if none).
+  const std::string& whole_graph_path() const { return whole_graph_path_; }
+
+  // Phase 14: list of (B, L) pairs currently registered for the whole-graph
+  // path — populated by auto-load or explicit LoadWholeGraphArtifact calls.
+  // Order is registration order. Useful for end-to-end tests and for users
+  // who want to know which shapes will hit the fast path.
+  std::vector<std::pair<int, int>> whole_graph_shapes() const;
+
   // Phase 12: load per-Linear-per-bucket ANE artifacts. `dir` is the top-level
   // ANE artifact dir (with M-<m>/ subdirs). For each Linear, walks each
   // bucket subdir and loads any present .mlmodelc into the LayerWeights
@@ -296,10 +306,9 @@ class Model {
   };
   std::vector<WholeGraphReg> whole_graph_;
 
-  // Phase 14: auto-discovery diagnostics. amx_artifacts_path_ is set to the
-  // directory we auto-loaded AMX artifacts from during the most recent
-  // Model::Load*; empty if none. (T3 will add a similar field for whole-graph.)
+  // Phase 14: auto-discovery diagnostics.
   std::string amx_artifacts_path_;
+  std::string whole_graph_path_;
 
   // Phase 14: scan `weights_path`'s sibling + cache for AMX + whole-graph
   // artifacts and load any found. Called from Model::Load{FromSafetensors,

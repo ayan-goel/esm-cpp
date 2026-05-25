@@ -397,18 +397,62 @@ void Model::TryAutoLoadAppleArtifacts(const std::string& weights_path) {
     }
   }
   for (const auto& root : roots) {
-    const fs::path amx_dir = root / "amx-fp16";
-    std::error_code ec;
-    if (!fs::is_directory(amx_dir, ec)) continue;
-    const std::size_t n = LoadAmxArtifacts(amx_dir.string());
-    if (debug) {
-      std::fprintf(stderr, "[autoload]   amx %s -> %zu contexts\n",
-                   amx_dir.c_str(), n);
+    if (amx_artifacts_path_.empty()) {
+      const fs::path amx_dir = root / "amx-fp16";
+      std::error_code ec;
+      if (fs::is_directory(amx_dir, ec)) {
+        const std::size_t n = LoadAmxArtifacts(amx_dir.string());
+        if (debug) {
+          std::fprintf(stderr, "[autoload]   amx %s -> %zu contexts\n",
+                       amx_dir.c_str(), n);
+        }
+        if (n > 0) amx_artifacts_path_ = amx_dir.string();
+      }
     }
-    if (n > 0) {
-      amx_artifacts_path_ = amx_dir.string();
-      break;  // first hit wins
+
+    // Whole-graph: scan B-<B>_L-<L>/whole_graph.mlmodelc subdirs and register
+    // each via the public LoadWholeGraphArtifact. Multiple shapes per root
+    // are loaded together (each forward picks by (B, L)). First root that
+    // yields any registration wins; we don't merge across roots.
+    if (whole_graph_.empty()) {
+      const fs::path wg_root = root / "whole-graph";
+      std::error_code ec;
+      if (fs::is_directory(wg_root, ec)) {
+        std::size_t registered = 0;
+        for (const auto& entry : fs::directory_iterator(wg_root, ec)) {
+          if (!entry.is_directory()) continue;
+          const std::string n = entry.path().filename().string();
+          // Pattern: B-<B>_L-<L>
+          if (n.size() < 6 || n.substr(0, 2) != "B-") continue;
+          const auto underscore = n.find("_L-");
+          if (underscore == std::string::npos) continue;
+          int B = 0, L = 0;
+          try {
+            B = std::stoi(n.substr(2, underscore - 2));
+            L = std::stoi(n.substr(underscore + 3));
+          } catch (...) { continue; }
+          if (B <= 0 || L <= 0) continue;
+          const fs::path bundle = entry.path() / "whole_graph.mlmodelc";
+          if (!fs::is_directory(bundle, ec)) continue;
+          // Auto-load uses CPU_AND_NE as the default compute_units. Power
+          // users who want CPU_ONLY / ALL go through the explicit
+          // LoadWholeGraphArtifact API.
+          const bool ok = LoadWholeGraphArtifact(
+              bundle.string(), B, L,
+              WholeGraphComputeUnits::kCpuAndNeuralEngine);
+          if (debug) {
+            std::fprintf(stderr, "[autoload]   wg %s (B=%d L=%d) -> %d\n",
+                         bundle.c_str(), B, L, ok ? 1 : 0);
+          }
+          if (ok) ++registered;
+        }
+        if (registered > 0) {
+          whole_graph_path_ = wg_root.string();
+        }
+      }
     }
+
+    if (!amx_artifacts_path_.empty() && !whole_graph_.empty()) break;
   }
 #else
   (void)weights_path;
@@ -431,6 +475,13 @@ bool Model::LoadWholeGraphArtifact(const std::string& dir, int B, int L,
   if (!ctx) return false;
   whole_graph_.push_back(WholeGraphReg{B, L, std::move(ctx)});
   return true;
+}
+
+std::vector<std::pair<int, int>> Model::whole_graph_shapes() const {
+  std::vector<std::pair<int, int>> out;
+  out.reserve(whole_graph_.size());
+  for (const auto& reg : whole_graph_) out.emplace_back(reg.B, reg.L);
+  return out;
 }
 
 std::vector<float> Model::ForwardWholeGraph(
@@ -1202,11 +1253,21 @@ std::vector<std::vector<float>> Model::ForwardScheduled(
     throw std::runtime_error("attention_masks/input_ids batch size mismatch");
   }
 
-  // Phase 13: whole-graph CoreML opt-in path. Activates only when every input
-  // sequence has the same length L AND we have a registered (N, L) artifact
-  // AND ESM_APPLE_ANE_GRAPH=on. Defaults preserve every other forward path.
-  // Varlen / mixed-length batches fall through to the standard scheduler.
-  if (!whole_graph_.empty() && std::getenv("ESM_APPLE_ANE_GRAPH") != nullptr) {
+  // Phase 13: whole-graph CoreML fast path. Activates when every input
+  // sequence has the same length L AND we have a registered (N, L)
+  // artifact AND the engine isn't told to opt out.
+  // Phase 14: env semantics flipped to default-on — set
+  // ESM_APPLE_ANE_GRAPH=off / 0 / false to disable. The whole_graph_
+  // emptiness check above means a user with no artifacts gets exactly
+  // the previous scheduled path; the flip only matters once an artifact
+  // is registered (via auto-load or explicit LoadWholeGraphArtifact).
+  auto wg_opted_out = []() {
+    const char* e = std::getenv("ESM_APPLE_ANE_GRAPH");
+    if (!e || *e == '\0') return false;
+    const std::string_view s(e);
+    return s == "off" || s == "0" || s == "false";
+  };
+  if (!whole_graph_.empty() && !wg_opted_out()) {
     bool uniform = true;
     const int L = static_cast<int>(input_ids[0].size());
     for (const auto& ids : input_ids) {

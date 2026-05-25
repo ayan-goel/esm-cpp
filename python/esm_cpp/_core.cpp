@@ -177,6 +177,24 @@ PYBIND11_MODULE(_core, m) {
           "Phase 14: directory the auto-discovery loaded AMX artifacts from "
           "during the most recent load_from_safetensors / load_from_gguf, or "
           "empty if none. Useful for confirming the auto-engage path fired.")
+      .def_property_readonly(
+          "whole_graph_path",
+          [](const esm::Model& m) { return m.whole_graph_path(); },
+          "Phase 14: parent directory the auto-discovery scanned for "
+          "whole-graph shapes during the most recent load_*, empty if none.")
+      .def_property_readonly(
+          "whole_graph_shapes",
+          [](const esm::Model& m) {
+            py::list out;
+            for (const auto& [B, L] : m.whole_graph_shapes()) {
+              out.append(py::make_tuple(B, L));
+            }
+            return out;
+          },
+          "Phase 14: list of (batch, seq_len) pairs registered for the "
+          "whole-graph CoreML fast path, populated by auto-load and explicit "
+          "load_whole_graph_artifact calls. Engaged in forward_scheduled when "
+          "all sequences share a length L matching a registered (B, L).")
       .def("load_ane_artifacts", &esm::Model::LoadAneArtifacts, py::arg("dir"),
            py::call_guard<py::gil_scoped_release>(),
            "Phase 12: load per-Linear-per-bucket ANE CoreML artifacts built by "

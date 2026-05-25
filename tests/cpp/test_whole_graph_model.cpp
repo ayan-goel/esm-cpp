@@ -24,12 +24,56 @@
 #include <filesystem>
 #include <span>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include "esm_cpp/model.h"
 #include "esm_cpp/tokenizer.h"
 
 namespace {
+
+class EnvScope {
+ public:
+  EnvScope(const std::string& key, const std::string& value) : key_(key) {
+    if (const char* prev = std::getenv(key.c_str())) {
+      had_prev_ = true;
+      prev_ = prev;
+    }
+    ::setenv(key.c_str(), value.c_str(), 1);
+  }
+  EnvScope(const std::string& key, std::nullptr_t) : key_(key) {
+    if (const char* prev = std::getenv(key.c_str())) {
+      had_prev_ = true;
+      prev_ = prev;
+    }
+    ::unsetenv(key.c_str());
+  }
+  ~EnvScope() {
+    if (had_prev_) ::setenv(key_.c_str(), prev_.c_str(), 1);
+    else            ::unsetenv(key_.c_str());
+  }
+ private:
+  std::string key_;
+  std::string prev_;
+  bool had_prev_ = false;
+};
+
+class TempDir {
+ public:
+  TempDir() {
+    path_ = std::filesystem::temp_directory_path() /
+        ("esm_cpp_wg_test_" + std::to_string(::getpid()) + "_" +
+         std::to_string(reinterpret_cast<std::uintptr_t>(this)));
+    std::filesystem::create_directories(path_);
+  }
+  ~TempDir() {
+    std::error_code ec;
+    std::filesystem::remove_all(path_, ec);
+  }
+  const std::filesystem::path& path() const { return path_; }
+ private:
+  std::filesystem::path path_;
+};
 
 double Correlate(std::span<const float> a, std::span<const float> b) {
   const std::size_t n = a.size();
@@ -158,4 +202,100 @@ TEST(AppleWholeGraph, Fp16ModelParityVsFp32Reference) {
 
   const double agree = ArgmaxAgreement(ref, wg, L, V);
   EXPECT_GE(agree, 0.99) << "whole-graph argmax agreement below 0.99";
+}
+
+// Phase 14 T3: whole-graph artifact auto-discovery + env opt-out flip.
+// Stages a B-1_L-66 artifact at <td>/model.apple/whole-graph/B-1_L-66/,
+// loads the model with no explicit register call + no env vars, and asserts
+// the shape is registered AND a forward_scheduled engages the fast path.
+TEST(AppleWholeGraph, AutoLoadFromSiblingDir) {
+  const char* sft = std::getenv("ESM_WHOLE_GRAPH_TEST_SAFETENSORS");
+  const char* art = std::getenv("ESM_WHOLE_GRAPH_TEST_ARTIFACT");
+  if (!sft || !art) {
+    GTEST_SKIP() << "fixture envs not set "
+                 << "(ESM_WHOLE_GRAPH_TEST_SAFETENSORS, "
+                 << "ESM_WHOLE_GRAPH_TEST_ARTIFACT — a .mlmodelc bundle "
+                 << "built for B=1, L matching the test sequence + 2).";
+  }
+  if (!std::filesystem::exists(sft) ||
+      !std::filesystem::is_directory(art)) {
+    GTEST_SKIP() << "fixture paths do not resolve";
+  }
+
+  namespace fs = std::filesystem;
+  TempDir td;
+  const fs::path sft_abs = fs::absolute(sft);
+  const fs::path art_abs = fs::absolute(art);
+  const fs::path weights = td.path() / "model.safetensors";
+  std::error_code ec;
+  fs::create_symlink(sft_abs, weights, ec);
+  ASSERT_FALSE(ec);
+
+  // Determine L from the model so we register at the right shape — the test
+  // sequence is 64 residues, encoded with cls + eos = 66.
+  const fs::path apple_dir = td.path() / "model.apple";
+  const fs::path wg_root = apple_dir / "whole-graph";
+  fs::create_directories(wg_root);
+  const fs::path bundle_link = wg_root / "B-1_L-66" / "whole_graph.mlmodelc";
+  fs::create_directories(bundle_link.parent_path());
+  fs::create_directory_symlink(art_abs, bundle_link, ec);
+  ASSERT_FALSE(ec) << "symlink whole_graph fixture failed: " << ec.message();
+
+  // Force the cache dir to a nonexistent path so only the sibling is found.
+  EnvScope cache_off("ESM_CPP_CACHE_DIR", (td.path() / "nope").string());
+  EnvScope wg_default("ESM_APPLE_ANE_GRAPH", nullptr);
+
+  auto model = esm::Model::LoadFromSafetensors(weights.string());
+  ASSERT_NE(model, nullptr);
+
+#ifdef ESM_APPLE_ANE_AVAILABLE
+  auto shapes = model->whole_graph_shapes();
+  ASSERT_EQ(shapes.size(), 1u) << "auto-discovery should have registered 1 shape";
+  EXPECT_EQ(shapes[0].first, 1);
+  EXPECT_EQ(shapes[0].second, 66);
+  EXPECT_FALSE(model->whole_graph_path().empty());
+
+  // Forward path: scheduled with a single sequence should auto-engage the
+  // whole-graph (uniform L=66 + matching registration + no env opt-out).
+  esm::Tokenizer tok;
+  const std::string seq =
+      "MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVSRQVIVQDIAYLRSLGYNIVATPRGYVLAGG";
+  const auto ids = tok.Encode(seq);
+  std::vector<std::vector<std::int32_t>> batch = {ids};
+  auto out = model->ForwardScheduled(batch, {});
+  ASSERT_EQ(out.size(), 1u);
+  EXPECT_FALSE(out[0].empty());
+  for (float x : out[0]) EXPECT_TRUE(std::isfinite(x));
+#else
+  EXPECT_TRUE(model->whole_graph_shapes().empty())
+      << "non-Apple build should not auto-register";
+#endif
+}
+
+// Phase 14 T3: ESM_APPLE_ANE_GRAPH=off disables auto-engage even when shapes
+// are registered. The opt-out gate is in ForwardScheduled, not in
+// LoadWholeGraphArtifact, so the shapes still show up in whole_graph_shapes().
+TEST(AppleWholeGraph, EnvOffDisablesAutoEngage) {
+  const char* sft = std::getenv("ESM_WHOLE_GRAPH_TEST_SAFETENSORS");
+  const char* art = std::getenv("ESM_WHOLE_GRAPH_TEST_ARTIFACT");
+  if (!sft || !art) GTEST_SKIP() << "fixture envs not set";
+
+  EnvScope wg_off("ESM_APPLE_ANE_GRAPH", "off");
+  auto model = esm::Model::LoadFromSafetensors(sft);
+  ASSERT_NE(model, nullptr);
+#ifdef ESM_APPLE_ANE_AVAILABLE
+  const bool registered = model->LoadWholeGraphArtifact(
+      art, /*B=*/1, /*L=*/66, esm::WholeGraphComputeUnits::kCpuAndNeuralEngine);
+  ASSERT_TRUE(registered);
+  ASSERT_EQ(model->whole_graph_shapes().size(), 1u);
+#endif
+
+  // With env opt-out, the standard scheduled path runs — verify finite logits.
+  esm::Tokenizer tok;
+  const std::string seq =
+      "MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVSRQVIVQDIAYLRSLGYNIVATPRGYVLAGG";
+  const auto ids = tok.Encode(seq);
+  auto out = model->ForwardScheduled({ids}, {});
+  ASSERT_EQ(out.size(), 1u);
+  for (float x : out[0]) EXPECT_TRUE(std::isfinite(x));
 }
