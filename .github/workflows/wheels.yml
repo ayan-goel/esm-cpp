@@ -1,0 +1,130 @@
+name: Wheels
+
+# Two trigger paths:
+#   1. workflow_dispatch with `target: build_only` — verifies the matrix builds
+#      green without publishing. Use this whenever cibuildwheel config changes.
+#   2. Tag push v*  — builds + uploads. `v*-rc*` tags go to TestPyPI (for smoke
+#      testing the actual published artifact); plain `v*` tags go to PyPI.
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to publish (build_only | testpypi | pypi)"
+        required: true
+        default: "build_only"
+        type: choice
+        options:
+          - build_only
+          - testpypi
+          - pypi
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build_wheels:
+    name: Wheels ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04          → manylinux_2_28 x86_64
+        # ubuntu-24.04-arm      → manylinux_2_28 aarch64 (native ARM runner, no QEMU)
+        # macos-14              → macOS 14 Apple Silicon (arm64)
+        os: [ubuntu-22.04, ubuntu-24.04-arm, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21
+        env:
+          # cibuildwheel reads [tool.cibuildwheel] from pyproject.toml for
+          # the build/skip/test config. Anything platform-conditional lives
+          # there too. Keep this step env minimal.
+          CIBW_BUILD_VERBOSITY: "1"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+          if-no-files-found: error
+
+  build_sdist:
+    name: sdist
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build sdist
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --sdist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: ./dist/*.tar.gz
+          if-no-files-found: error
+
+  publish_testpypi:
+    name: Publish → TestPyPI
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi') ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && contains(github.ref, '-rc'))
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/esm-cpp
+    permissions:
+      id-token: write   # OIDC trusted publishing — no API token needed.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish_pypi:
+    name: Publish → PyPI
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi') ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-rc'))
+    environment:
+      name: pypi
+      url: https://pypi.org/p/esm-cpp
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
