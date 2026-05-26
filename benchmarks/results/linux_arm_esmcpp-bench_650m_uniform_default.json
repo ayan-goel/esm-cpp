@@ -1,0 +1,48 @@
+{
+  "config": {
+    "model": "esm2_t33_650M",
+    "model_source": {
+      "kind": "safetensors",
+      "path": "/home/ayangoel/.cache/huggingface/hub/models--facebook--esm2_t33_650M_UR50D/snapshots/08e4846e537177426273712802403f7ba8261b6c/model.safetensors",
+      "hf_id": "facebook/esm2_t33_650M_UR50D"
+    },
+    "dataset": "synthetic(seed=0, batch=8, len=256)",
+    "num_sequences": 8,
+    "warmup": 3,
+    "iters": 10,
+    "modes": [
+      "esm-cpp-int8",
+      "hf-eager-fp32"
+    ]
+  },
+  "hardware": {
+    "platform": "Linux-6.1.0-47-cloud-arm64-aarch64-with-glibc2.36",
+    "machine": "aarch64",
+    "python": "3.11.2",
+    "esm_cpp_host_isa": "neoni8mm",
+    "esm_cpp_current_isa": "neoni8mm",
+    "esm_cpp_num_threads": 8,
+    "cpu_threads": 8,
+    "ram_gb": 31.3
+  },
+  "results": {
+    "esm-cpp-int8": {
+      "iters": 10,
+      "p50_ms": 2024.2177284999343,
+      "p99_ms": 2137.7530775600053,
+      "mean_ms": 2037.1401250999725,
+      "throughput_seqs_per_s": 3.92707399036058,
+      "isa": "neoni8mm"
+    },
+    "hf-eager-fp32": {
+      "iters": 10,
+      "p50_ms": 4691.3358114999255,
+      "p99_ms": 4705.144730990075,
+      "mean_ms": 4692.808338499958,
+      "throughput_seqs_per_s": 1.7047361458101176,
+      "torch_intra_threads": 8
+    }
+  },
+  "speedup_fp32_vs_hf": null,
+  "speedup_int8_vs_hf": 2.303625695983804
+}

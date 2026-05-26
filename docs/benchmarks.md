@@ -75,6 +75,45 @@ NEON SDOT (INT8, the VNNI analog), and an opt-in NEON SMMLA/i8mm path
 detection. The default build links no Apple Accelerate, so the same
 binary runs on Linux ARM / AWS Graviton.
 
+### Linux ARM (Graviton / Axion class)
+
+Measured on **GCP C4A (Google Axion, Neoverse V2 core, 8 vCPUs)**, Debian
+12 + Python 3.11. Same SDOT default + same kernel stack as Apple Silicon
+— the Apple-only AMX/CoreML paths are `#ifdef`'d out, so this is the
+no-special-install behavior on any Linux ARM host (AWS Graviton3/4, GCP
+C4A, Ampere Altra-class). Raw JSONs:
+`benchmarks/results/linux_arm_esmcpp-bench_*`.
+
+| Variant | esm-cpp | hf-eager-fp32 | Speedup |
+|---|---:|---:|---:|
+| **650M / varlen 256-seq (OAS-shape), SDOT default** | **29.3 s** | 147.8 s | **5.04× HF** |
+| 650M / uniform 8×256, SDOT default | 2.02 s | 4.69 s | 2.30× HF |
+| 650M / uniform 8×256, SMMLA opt-in (`ESM_NEON_I8MM=on`) | 1.96 s | 4.73 s | 2.42× HF |
+
+Two findings worth highlighting:
+
+- **Linux ARM is the second-best default-path host after x86 AMX-Xeon.**
+  C4A's 5.04× HF on varlen beats M3 Pro's 3.97× on the same shape with
+  the same NEON SDOT default kernel. Neoverse V2's wider SIMD pipeline +
+  better memory bandwidth than M3 carry the gap, and on uniform 8×256
+  C4A is also faster than M3 (2.02 s vs 2.17 s).
+- **SMMLA opt-in is noise-level on Neoverse V2** — 1.96 s vs 2.02 s on
+  the uniform 8×256 shape, +3.5%. The Phase-12 carry-forward that hoped
+  SMMLA branch-hoist might lift Linux ARM to 5-7× HF on uniform was
+  wrong; the kernel was already saturated by the Phase-10 SDOT
+  branch-hoist. The "AMX analog on ARM" thesis only paid off on x86.
+  SMMLA stays opt-in (no change), but Phase 15 (SMMLA branch-hoist + BF16
+  attention) is **closed out as not-worth-doing** with this data —
+  3.5% over SDOT doesn't justify the kernel work.
+
+The Linux ARM headline is **5× HF on the realistic varlen workload at
+650M, ships at install time with `pip install esm-cpp`**. No Apple
+frameworks, no per-shape artifacts, no convert-time deps. This is the
+production-cloud number — AWS Graviton + GCP C4A run the same
+binary, same kernel, same install path.
+
+### Apple Silicon
+
 Measured on **Apple M3 Pro** (12 threads), `esm-cpp-int8` (NEON SDOT) vs
 HF eager FP32 on the 256-sequence OAS-distribution dataset
 (`benchmarks/data/synthetic_varlen_v1.fasta`) and on uniform 8×100:
@@ -90,6 +129,22 @@ HF eager FP32 on the 256-sequence OAS-distribution dataset
 | 8M / varlen  | 1.02 s | 3.28 s | **3.21× HF** |
 | 35M / uniform 8×100 | 78.5 ms | 99.8 ms | 1.27× HF |
 | 8M / uniform 8×100  | 30.5 ms | 34.5 ms | 1.13× HF |
+
+**Per-host headline matrix** (650M ESM-2):
+
+| Host | Varlen OAS-shape | Uniform 8×256 | Mechanism |
+|---|---:|---:|---|
+| x86 SPR Xeon AMX-INT8 | **9.31× HF** | 4.09× HF | AMX intrinsics, default — `pip install` only |
+| Apple M3 Pro (after fetch) | 3.97× HF (SDOT) | **10.05× HF** | Whole-graph CoreML through ANE+GPU, auto-engages |
+| **Linux ARM C4A (Neoverse V2)** | **5.04× HF** | 2.30× HF | NEON SDOT default — `pip install` only |
+| Apple M3 Pro (default) | 3.97× HF | 1.79× HF | NEON SDOT, same kernel as Linux ARM |
+
+Two different "10× stories" come from two different mechanisms:
+**AMX-INT8 on Xeon** for production-cloud x86, **whole-graph CoreML
+through ANE+GPU on Apple Silicon** for uniform-shape developer
+workloads. Neither generalizes to the other shape — neither x86 nor
+Linux ARM has an ANE equivalent; Apple's whole-graph CoreML doesn't
+express cu_seqlens varlen.
 
 **Workload shape → recommended path** on Apple Silicon:
 

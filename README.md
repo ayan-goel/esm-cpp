@@ -27,13 +27,22 @@ ESM-2 at 8M, 35M, 150M, 650M, 3B. W8A8 INT8 with SmoothQuant ships for 150M and 
   | Variable-length + opt-in env vars   | 11.5 s | 115.0 s | **10.04× HF** |
   | Uniform 8-seq × 256-tokens          | 0.92 s | 3.42 s | 4.09× HF |
 
-- **Apple M3 Pro** (ANE + GPU via CoreML, ESM-2-650M, **`ESM_APPLE_ANE_GRAPH=on`**):
+- **Apple M3 Pro** (ANE + GPU via CoreML, ESM-2-650M, after `esm-cpp-fetch-artifacts`):
 
   | Workload | esm-cpp-whole-graph-fp16 | hf-eager-fp32 | Speedup |
   |---|---:|---:|---:|
   | Uniform 8-seq × 256-tokens | **459 ms** | 4617 ms | **10.05× HF** |
 
-The variable-length advantage on x86 comes from the `cu_seqlens` packed-batch forward: HuggingFace pads every sequence in a batch to `max(len)` and processes the resulting padded tensor uniformly; esm.cpp packs sequences back-to-back along the token axis and isolates per-sequence attention via `cu_seqlens`. On antibody-shaped data (mean ~120 residues, max ~250) that saves ~3× of HF's attention compute and ~2× of its FFN compute on top of the INT8/AMX baseline.
+- **Linux ARM (GCP C4A / Google Axion / Neoverse V2, 8 vCPUs)** — same wheel as Apple, Apple-only paths `#ifdef`'d out, NEON SDOT default:
+
+  | Workload | esm-cpp-int8 | hf-eager-fp32 | Speedup |
+  |---|---:|---:|---:|
+  | Variable-length 256-seq (OAS-shape) | **29.3 s** | 147.8 s | **5.04× HF** |
+  | Uniform 8-seq × 256-tokens | 2.02 s | 4.69 s | 2.30× HF |
+
+  Production-cloud Linux ARM (Graviton3/4, GCP C4A, Ampere) gets ~5× HF on the realistic varlen workload at install time — no special flags, no artifacts, just `pip install esm-cpp`. This is the second-best default-path host after x86 AMX-Xeon.
+
+The variable-length advantage on x86 + Linux ARM comes from the `cu_seqlens` packed-batch forward: HuggingFace pads every sequence in a batch to `max(len)` and processes the resulting padded tensor uniformly; esm.cpp packs sequences back-to-back along the token axis and isolates per-sequence attention via `cu_seqlens`. On antibody-shaped data (mean ~120 residues, max ~250) that saves ~3× of HF's attention compute and ~2× of its FFN compute on top of the INT8 baseline.
 
 The Apple M3 uniform-shape win comes from compiling the entire ESM-2 forward (33 encoder layers + LM head) into ONE CoreML `.mlmodelc` at convert time and routing it through a small Obj-C++ MLModel bridge — keeping one op-fused fp16 graph hot on ANE/GPU instead of the per-Linear pattern that thrashes the ANE compiled-state cache. The path is opt-in (the default is unchanged) and only engages on uniform-length batches with a registered shape; varlen / mixed-length falls through to the Phase-11 AMX-fp16 path. See `docs/benchmarks.md` for the full path table and reproduction.
 
