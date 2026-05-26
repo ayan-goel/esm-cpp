@@ -51,10 +51,9 @@ _HF_ID_FOR_SHORTHAND: dict[str, str] = {
 }
 
 # `esm-cpp` GitHub repo for fetching artifacts. Override with --repo at
-# install time / per-invocation when mirroring. The placeholder value is
-# clearly not a real org — by the time we publish, T8 / a maintainer
-# updates this to the real "owner/name".
-_DEFAULT_REPO = "esmcpp/esm-cpp"
+# install time / per-invocation when mirroring a release for an internal
+# audience.
+_DEFAULT_REPO = "ayan-goel/esm-cpp"
 
 def _cache_key_for_hf(hf_id: str) -> str:
     """Mirror ArtifactCache::CacheKeyFor in src/artifact_cache.cpp.

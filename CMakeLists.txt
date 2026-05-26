@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(esm_cpp LANGUAGES CXX VERSION 0.2.0)
+project(esm_cpp LANGUAGES CXX VERSION 0.2.1)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

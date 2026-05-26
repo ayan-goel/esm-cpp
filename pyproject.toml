@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "esm-cpp"
-version = "0.2.0"
+version = "0.2.1"
 description = "CPU-first C++ inference engine for ESM-2 protein language models"
 readme = "README.md"
 requires-python = ">=3.9"

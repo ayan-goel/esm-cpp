@@ -222,9 +222,9 @@ def main() -> int:
     ap.add_argument("--tag", default=None,
                     help="Release tag to upload to (e.g., v0.2.0). "
                           "Required with --push.")
-    ap.add_argument("--repo", default="esmcpp/esm-cpp",
+    ap.add_argument("--repo", default="ayan-goel/esm-cpp",
                     help="Target <owner>/<repo> for --push. Default: "
-                          "esmcpp/esm-cpp")
+                          "ayan-goel/esm-cpp")
     ap.add_argument("--skip-amx", action="store_true",
                     help="Skip the per-Linear AMX build (whole-graph only).")
     ap.add_argument("--skip-whole-graph", action="store_true",
