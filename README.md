@@ -1,70 +1,81 @@
 # esm.cpp
 
-A CPU-first C++ inference engine for ESM-2 protein language models, with Python bindings. Built for production throughput on commodity x86 CPUs.
+A CPU-first C++ inference engine for ESM-2 protein language models, with
+Python bindings. Production throughput on commodity hardware, no GPU required.
 
-## What it does
+## Why
 
-esm.cpp runs ESM-2 forward passes on CPU. The defensible niche is the intersection no existing project occupies: **production-grade CPU inference + ahead-of-time W8A8 quantization + variable-length packed-batch scheduling** for encoder-only PLMs.
+ESM-2 is the backbone of modern protein ML, but the reference stack is
+PyTorch + CUDA. That's the wrong shape for several real workloads:
 
-Target workloads:
+- **Deep mutational scanning** (10⁴–10⁷ variants per protein) — embarrassingly
+  parallel scoring across millions of mutants. CPU throughput matters more
+  than per-call latency.
+- **Antibody developability screening** (10⁵–10⁶ candidates) — rank by PLM
+  likelihood for aggregation, solubility, immunogenicity prefiltering.
+  Nightly batch jobs on lab CPUs.
+- **Embedding extraction at corpus scale** — per-residue or per-sequence
+  vectors for downstream classifiers, alignment, or retrieval.
+- **On-prem / regulated environments** — clinical, compliance-restricted,
+  or air-gapped pipelines that cannot reach a cloud GPU.
 
-- **Deep mutational scanning** (10⁴–10⁷ variants per protein) — zero-shot fitness or masked-marginal scoring across millions of mutants.
-- **Antibody developability screening** (10⁵–10⁶ candidates) — rank by PLM likelihood for aggregation / solubility / immunogenicity prefiltering.
-- **Embedding extraction at corpus scale** — per-residue or per-sequence vectors for downstream classifiers, alignment, or retrieval.
-- **On-prem / regulated environments** — runs on CPU without cloud GPU access. Useful for clinical, compliance-restricted, or air-gapped pipelines.
+The defensible niche is the intersection no existing project occupies:
+**production-grade CPU inference + ahead-of-time W8A8 quantization +
+variable-length packed-batch scheduling** for encoder-only PLMs. esm.cpp
+targets it. v0.2 ships ESM-2 at 8M, 35M, 150M, 650M, and 3B, with W8A8
+INT8 (SmoothQuant) for 150M and above and FP32 for the smaller two.
 
-## Status: v0.2
+## Performance
 
-ESM-2 at 8M, 35M, 150M, 650M, 3B. W8A8 INT8 with SmoothQuant ships for 150M and above; smaller models stay FP32. Both safetensors (HF native) and GGUF (esm.cpp native) load paths.
+ESM-2-650M, esm.cpp vs HuggingFace eager FP32, p50 over 5 runs:
 
-**Headline performance**:
+| Host | Varlen 256-seq (OAS) | Uniform 8 × 256 | Mechanism |
+|---|---:|---:|---|
+| Intel Xeon 8481C Sapphire Rapids (22 vCPU) | **9.31× HF** (12.4 s) | 4.09× HF (0.92 s) | AMX-INT8, default |
+| Apple M3 Pro (after one fetch step) | 3.97× HF (37.8 s) | **10.05× HF** (459 ms) | Whole-graph CoreML → ANE + GPU |
+| GCP C4A / Neoverse V2 (8 vCPU, Graviton-class) | **5.04× HF** (29.3 s) | 2.30× HF (2.02 s) | NEON SDOT, default |
+| Apple M3 Pro (default, no fetch) | 3.97× HF (37.8 s) | 1.79× HF (2.17 s) | NEON SDOT, default |
 
-- **Intel Xeon 8481C Sapphire Rapids** (AMX-INT8, 22 vCPUs, ESM-2-650M):
+Two structural wins drive these numbers.
 
-  | Workload | esm-cpp-int8 | hf-eager-fp32 | Speedup |
-  |---|---:|---:|---:|
-  | Variable-length 256-seq (OAS-shape) | **12.4 s** | 115.1 s | **9.31× HF** |
-  | Variable-length + opt-in env vars   | 11.5 s | 115.0 s | **10.04× HF** |
-  | Uniform 8-seq × 256-tokens          | 0.92 s | 3.42 s | 4.09× HF |
+**Variable-length packed-batch scheduling** (the x86 + Linux ARM headline).
+HuggingFace pads every sequence in a batch to `max(len)`. esm.cpp packs
+sequences back-to-back along the token axis and isolates per-sequence
+attention via `cu_seqlens`. On antibody-shaped data (mean ~120 residues,
+max ~250) that saves roughly 3× of HF's attention compute and 2× of its
+FFN compute on top of the INT8 baseline.
 
-- **Apple M3 Pro** (ANE + GPU via CoreML, ESM-2-650M, after `esm-cpp-fetch-artifacts`):
+**Whole-graph CoreML compilation** (the Apple uniform-shape headline).
+The entire ESM-2 forward — 33 encoder layers + LM head — is compiled into
+ONE `.mlmodelc` at convert time and dispatched through an Objective-C++
+MLModel bridge. Keeps one op-fused fp16 graph hot on the Apple Neural
+Engine + GPU instead of the per-Linear pattern that thrashes the ANE
+compiled-state cache. Logit correlation vs HF FP32 is 0.999998 at 650M
+with strict pseudo-perplexity drift below 0.001 across the holdout
+subset.
 
-  | Workload | esm-cpp-whole-graph-fp16 | hf-eager-fp32 | Speedup |
-  |---|---:|---:|---:|
-  | Uniform 8-seq × 256-tokens | **459 ms** | 4617 ms | **10.05× HF** |
+## How it works
 
-- **Linux ARM (GCP C4A / Google Axion / Neoverse V2, 8 vCPUs)** — same wheel as Apple, Apple-only paths `#ifdef`'d out, NEON SDOT default:
-
-  | Workload | esm-cpp-int8 | hf-eager-fp32 | Speedup |
-  |---|---:|---:|---:|
-  | Variable-length 256-seq (OAS-shape) | **29.3 s** | 147.8 s | **5.04× HF** |
-  | Uniform 8-seq × 256-tokens | 2.02 s | 4.69 s | 2.30× HF |
-
-  Production-cloud Linux ARM (Graviton3/4, GCP C4A, Ampere) gets ~5× HF on the realistic varlen workload at install time — no special flags, no artifacts, just `pip install esm-cpp`. This is the second-best default-path host after x86 AMX-Xeon.
-
-The variable-length advantage on x86 + Linux ARM comes from the `cu_seqlens` packed-batch forward: HuggingFace pads every sequence in a batch to `max(len)` and processes the resulting padded tensor uniformly; esm.cpp packs sequences back-to-back along the token axis and isolates per-sequence attention via `cu_seqlens`. On antibody-shaped data (mean ~120 residues, max ~250) that saves ~3× of HF's attention compute and ~2× of its FFN compute on top of the INT8 baseline.
-
-The Apple M3 uniform-shape win comes from compiling the entire ESM-2 forward (33 encoder layers + LM head) into ONE CoreML `.mlmodelc` at convert time and routing it through a small Obj-C++ MLModel bridge — keeping one op-fused fp16 graph hot on ANE/GPU instead of the per-Linear pattern that thrashes the ANE compiled-state cache. The path is opt-in (the default is unchanged) and only engages on uniform-length batches with a registered shape; varlen / mixed-length falls through to the Phase-11 AMX-fp16 path. See `docs/benchmarks.md` for the full path table and reproduction.
-
-### ARM (Apple Silicon / Linux ARM)
-
-esm.cpp also runs on AArch64 with a hand-written NEON kernel stack — FMLA FP32, SDOT INT8 (the VNNI analog), and an opt-in SMMLA/i8mm path (the AMX analog) — runtime-dispatched the same way as x86. No Apple Accelerate dependency in the default build, so it runs on Linux ARM / AWS Graviton too.
-
-**Apple M3 Pro, ESM-2, esm-cpp vs HF eager FP32:**
-
-| Workload | esm-cpp | hf-eager-fp32 | Speedup |
-|---|---:|---:|---:|
-| Uniform 8-seq × 256-tokens, 650M (with `esm-cpp-fetch-artifacts`) | **459 ms** | 4617 ms | **10.05× HF** |
-| Uniform 8-seq × 256-tokens, 650M (NEON SDOT, no fetch) | 2.17 s | 3.88 s | 1.79× HF |
-| Variable-length 256-seq (OAS-shape), 650M (SDOT, Phase-9) | **37.8 s** | 150.1 s | **3.97× HF** |
-| Variable-length 256-seq (OAS-shape), 35M | **3.20 s** | 9.46 s | **2.95× HF** |
-| Variable-length 256-seq (OAS-shape), 8M | **1.02 s** | 3.28 s | **3.21× HF** |
-| Uniform 8-seq × 100-tokens, 35M | 78.5 ms | 99.8 ms | 1.27× HF |
-| Uniform 8-seq × 100-tokens, 8M | 30.5 ms | 34.5 ms | 1.13× HF |
-
-The Phase-13 **uniform-shape headline** comes from a whole-graph CoreML path: ONE compiled `.mlmodelc` for the entire ESM-2 forward (33 encoder layers + LM head), dispatched to the Neural Engine + GPU via CoreML through a small Objective-C++ MLModel bridge. As of Phase 14, **a single `esm-cpp-fetch-artifacts --model esm2_t33_650M` download is the only setup the user needs** — Model::Load* auto-discovers the artifacts and routes through them in the forward; no env vars, no manual register calls. 650M @ uniform 8×256 hits 459 ms p50 (**10.05× HF**), with quality vs FP32 strictly better than INT8 SDOT (corr 0.999998 vs 0.99956 on 650M; PPPL drift < 0.001 across the 25-protein holdout subset).
-
-The path engages on Apple Silicon when (a) artifacts are present (sibling `<weights>.apple/` or `~/.cache/esm_cpp/<key>/`) and (b) the batch has uniform sequence length matching a registered shape. Mixed-length / varlen batches fall through to the Phase-11 AMX-fp16 path (per-Linear fp16 BNNSGraph artifacts; same fetch CLI installs them), which delivers 2.23× HF at 650M uniform and 4.53× HF at 650M varlen. Without any artifacts installed, the **NEON SDOT default** (Phase-10: branch-hoist + register-resident attention PV) gives 1.79× HF at 650M uniform / 3.97× HF at 650M varlen — and is the only path on Linux ARM / AWS Graviton (the whole AMX + ANE backends are `#ifdef`'d out on non-Apple builds — hand-written NEON / SDOT stays the default and only Linux-ARM path). The SMMLA/i8mm tier is opt-in (`ESM_NEON_I8MM=on`): on Apple M3 it does not out-throughput SDOT, but is expected to win on Graviton3-class cores. Set `ESM_APPLE_AMX=off` / `ESM_APPLE_ANE_GRAPH=off` to disable the auto-engage paths for debugging.
+- **Kernels.** Hand-written, runtime-dispatched per ISA. x86: AVX-512 +
+  VNNI + AMX-INT8. ARM: NEON FMLA + SDOT + opt-in SMMLA/i8mm. Every
+  vectorized kernel has a scalar-reference twin behind `#ifdef
+  ESM_KERNEL_REFERENCE`; the same tests cross-check both with strict
+  tolerances (FP32 `rtol/atol=1e-6`, INT8 `rtol=1e-3 atol=1`).
+- **Quantization.** Ahead-of-time W8A8 INT8 with SmoothQuant, calibrated
+  on UniRef50. Pseudo-perplexity drift < 0.1 and ProteinGym Spearman
+  drift < 0.01 are non-negotiable gates.
+- **Scheduler.** Variable-length sequences pack back-to-back along the
+  token axis; attention isolates per-sequence via `cu_seqlens`; FFNs see
+  one fused `[ΣL, d]` matmul instead of `B` padded `[L_max, d]` ones.
+- **Loaders.** Both safetensors (HF native, zero-copy mmap) and GGUF
+  (esm.cpp native, block-decoded INT8). Weight tensors are never copied
+  into RAM at load.
+- **Apple path.** On Apple Silicon, if pre-built artifacts are on disk,
+  `Model.load_*` auto-engages them: a whole-graph CoreML model for
+  registered uniform shapes, and a per-Linear AMX-fp16 BNNSGraph stack
+  for everything else. With no artifacts installed, the engine falls
+  back to the same NEON SDOT kernels Linux ARM uses. No Apple framework
+  appears in the canonical kernel stack itself.
 
 ## Install
 
@@ -72,30 +83,35 @@ The path engages on Apple Silicon when (a) artifacts are present (sibling `<weig
 pip install esm-cpp
 ```
 
-On Apple Silicon, one extra step gets you the 10× headline:
+That's the whole install on Linux x86, Linux ARM, and as a working
+baseline on Apple Silicon. On Apple Silicon, one extra step pulls the
+pre-built whole-graph + AMX artifacts that unlock the 10× headline:
 
 ```bash
-# Pulls pre-built whole-graph + AMX artifacts (~5 GB for 650M) from
-# the GitHub release matching your esm-cpp version. Zero coremltools,
-# torch, or transformers install required at user time.
 esm-cpp-fetch-artifacts --model esm2_t33_650M
 ```
 
-The artifacts land in `~/.cache/esm_cpp/<model>/` and `Model.load_*`
-auto-discovers them on every load. Linux ARM / AWS Graviton skip this
-step — the runtime uses the same wheel and gets the NEON SDOT path
-(no Apple frameworks required).
+The artifacts land in `~/.cache/esm_cpp/<model>/` (~5 GB for 650M) and
+`Model.load_*` auto-discovers them on every load. The fetch CLI is pure
+stdlib — no coremltools, torch, or transformers needed at user time.
+
+| OS / arch | What `pip install esm-cpp` gets you | Extra step for headline |
+|---|---|---|
+| Linux x86_64 (Sapphire Rapids+) | AMX-INT8 → 9.31× HF varlen, 4.09× HF uniform | none |
+| Linux x86_64 (Cascade Lake / Ice Lake) | AVX-512 + VNNI INT8 baseline | none |
+| Linux ARM64 (Graviton 3/4, Axion, Ampere) | NEON SDOT → 5.04× HF varlen, 2.30× HF uniform | none |
+| Apple Silicon (M1 / M2 / M3) | NEON SDOT → 3.97× HF varlen, 1.79× HF uniform | `esm-cpp-fetch-artifacts` → **10.05× HF uniform** |
 
 ## Quick start
 
 ```python
 import esm_cpp
 
-# Load FP32 weights from a HF safetensors file. On Apple Silicon, if
-# you ran `esm-cpp-fetch-artifacts`, this auto-engages the whole-graph
-# CoreML path — no env vars, no register calls.
+# Load FP32 weights from a HF safetensors file. On Apple Silicon, if you
+# ran esm-cpp-fetch-artifacts, this auto-engages the whole-graph CoreML
+# path — no env vars, no register calls.
 model = esm_cpp.Model.load_from_safetensors(
-    "/path/to/esm2_t6_8M_UR50D/model.safetensors")
+    "/path/to/esm2_t33_650M_UR50D/model.safetensors")
 tokenizer = esm_cpp.Tokenizer()
 
 # Single sequence.
@@ -107,21 +123,20 @@ seqs = ["MKTGVA", "MAGAASPCANGCGPSAPS", "MSEEKRGGQATKLP"]
 batch_ids = [tokenizer.encode(s) for s in seqs]
 batch_logits = model.forward_scheduled(batch_ids)
 # returns list of [L_i, vocab_size] arrays in input order
-
-# Diagnose which Apple paths auto-engaged (empty strings = nothing loaded):
-print("whole-graph shapes :", model.whole_graph_shapes)
-print("amx artifacts dir  :", model.amx_artifacts_path)
 ```
+
+The same `Model.load_from_safetensors` (or `Model.load_from_gguf` for the
+quantized artifact) is the entry point on every supported OS; the
+correct kernel path is selected at load time from `cpu_features` plus
+whatever Apple artifacts are present.
 
 ## Convert + quantize
 
-Convert an HF checkpoint to GGUF and quantize:
-
 ```bash
-# 1. Convert HF safetensors -> esm-cpp GGUF (FP32).
+# 1. HF safetensors -> esm-cpp GGUF (FP32).
 esm-cpp-convert --hf facebook/esm2_t30_150M_UR50D --out weights/esm2_150m.gguf
 
-# 2. Calibrate on UniRef50 sequences.
+# 2. Calibrate on UniRef50.
 esm-cpp-quantize --calibrate \
     --model esm2_t30_150M \
     --calib data/uniref50_calib_v1.fasta \
@@ -151,3 +166,17 @@ esm-cpp-bench \
     --modes esm-cpp-fp32,hf-eager-fp32 \
     --output benchmarks/results/my_run.json
 ```
+
+`--modes` accepts any subset of `esm-cpp-fp32`, `esm-cpp-int8`,
+`hf-eager-fp32`, `hf-sdpa-fp32`. The harness reports p50 / p90 /
+throughput on uniform and varlen workloads and writes a JSON record per
+run for tracking.
+
+## Scope
+
+Inference only. No training, no LoRA, no backward pass — those belong
+upstream. Hardware targets are x86_64 (AVX-512 / VNNI / AMX) and AArch64
+(NEON / SDOT / SMMLA, plus opt-in Apple ANE/AMX via CoreML artifacts on
+Apple Silicon). GPU, ARM SVE2, and RISC-V are out of scope for v0.x.
+ESM-2-15B is bandwidth-bound on CPU at FP32/INT8 and needs W4 quant
+before it makes sense; that's v2 work.
