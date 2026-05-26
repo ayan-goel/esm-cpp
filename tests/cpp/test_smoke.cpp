@@ -1,13 +1,21 @@
 #include <gtest/gtest.h>
 
+#include <cstdio>
+
 #include "esm_cpp/status.h"
 #include "esm_cpp/version.h"
 
 TEST(Smoke, VersionStringMatchesComponents) {
-  EXPECT_EQ(esm::kVersionMajor, 0);
-  EXPECT_EQ(esm::kVersionMinor, 1);
-  EXPECT_EQ(esm::kVersionPatch, 0);
-  EXPECT_STREQ(esm::kVersionString, "0.1.0");
+  // The literal version values live in include/esm_cpp/version.h. This test
+  // guards against drift between the int triple and the formatted string —
+  // bumping one without the other is the common slip-up.
+  char expected[32];
+  std::snprintf(expected, sizeof(expected), "%d.%d.%d",
+                esm::kVersionMajor, esm::kVersionMinor, esm::kVersionPatch);
+  EXPECT_STREQ(esm::kVersionString, expected);
+  // Sanity: not all zero (catches the case where someone accidentally
+  // zeroed out the constants).
+  EXPECT_GE(esm::kVersionMajor + esm::kVersionMinor + esm::kVersionPatch, 1);
 }
 
 TEST(Smoke, DefaultStatusIsOk) {
